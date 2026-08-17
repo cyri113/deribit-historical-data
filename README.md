@@ -68,8 +68,11 @@ bun src/cli/index.ts fetch-trades BTC --months 6 --concurrency 5
 #### Fetch Delivery Prices
 
 ```bash
-# Single index
+# Single index (all history)
 bun src/cli/index.ts fetch-deliveries btc_usd
+
+# Filtered by date range
+bun src/cli/index.ts fetch-deliveries btc_usd --start-date 2024-01-01 --end-date 2024-12-31
 
 # Multiple indices
 bun src/cli/index.ts fetch-deliveries btc_usd eth_usd sol_usd
@@ -78,7 +81,11 @@ bun src/cli/index.ts fetch-deliveries btc_usd eth_usd sol_usd
 bun src/cli/index.ts fetch-deliveries btc_usd eth_usd --concurrency 4
 ```
 
+Fetches delivery (settlement) prices for expired options/futures contracts. By default fetches all historical data. Use date filters to limit the range.
+
 **Options:**
+- `--start-date <date>` - Start date filter (YYYY-MM-DD or ISO8601)
+- `--end-date <date>` - End date filter (YYYY-MM-DD or ISO8601)
 - `--concurrency <n>` - Parallel fetches (default: 2)
 - `--batch-size <n>` - API batch size (default: 100)
 - `--db-batch-size <n>` - DB batch size (default: 1000)

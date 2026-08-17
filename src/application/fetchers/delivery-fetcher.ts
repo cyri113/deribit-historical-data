@@ -39,11 +39,15 @@ export class DeliveryFetcher {
    * Fetch and store all delivery prices for an index
    *
    * @param indexName - e.g., "btc_usd", "eth_usd"
+   * @param startDate - Optional start date filter (timestamp)
+   * @param endDate - Optional end date filter (timestamp)
    * @param onProgress - Optional progress callback
    * @returns Fetch progress info
    */
   async fetchDeliveryPrices(
     indexName: string,
+    startDate?: number,
+    endDate?: number,
     onProgress?: (progress: DeliveryFetchProgress) => void
   ): Promise<DeliveryFetchProgress> {
     const progress: DeliveryFetchProgress = {
@@ -63,11 +67,18 @@ export class DeliveryFetcher {
 
       for await (const deribitPrices of generator) {
         // Convert to domain models
-        const deliveryPrices: DeliveryPrice[] = deribitPrices.map((dp) => ({
-          indexName,
-          date: new Date(dp.date).getTime(), // Convert YYYY-MM-DD string to timestamp
-          deliveryPrice: dp.delivery_price,
-        }));
+        const deliveryPrices: DeliveryPrice[] = deribitPrices
+          .map((dp) => ({
+            indexName,
+            date: new Date(dp.date).getTime(), // Convert YYYY-MM-DD string to timestamp
+            deliveryPrice: dp.delivery_price,
+          }))
+          .filter((dp) => {
+            // Apply date filtering if specified
+            if (startDate && dp.date < startDate) return false;
+            if (endDate && dp.date > endDate) return false;
+            return true;
+          });
 
         deliveryBuffer.push(...deliveryPrices);
         progress.totalRecords += deliveryPrices.length;
@@ -110,12 +121,16 @@ export class DeliveryFetcher {
    * Fetch delivery prices for multiple indices in parallel
    *
    * @param indices - Array of index names (e.g., ["btc_usd", "eth_usd"])
+   * @param startDate - Optional start date filter (timestamp)
+   * @param endDate - Optional end date filter (timestamp)
    * @param concurrency - Max parallel fetches (default 2)
    * @param onProgress - Optional progress callback
    * @returns Array of fetch progress for each index
    */
   async fetchMultipleIndices(
     indices: string[],
+    startDate?: number,
+    endDate?: number,
     concurrency: number = 2,
     onProgress?: (progress: DeliveryFetchProgress) => void
   ): Promise<DeliveryFetchProgress[]> {
@@ -128,7 +143,7 @@ export class DeliveryFetcher {
       while (queue.length > 0 && inProgress.size < concurrency) {
         const indexName = queue.shift()!;
 
-        const promise = this.fetchDeliveryPrices(indexName, onProgress)
+        const promise = this.fetchDeliveryPrices(indexName, startDate, endDate, onProgress)
           .then((progress) => {
             results.push(progress);
           })

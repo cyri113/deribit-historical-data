@@ -96,13 +96,18 @@ Commands:
     Fetch delivery (settlement) prices for one or more indices
 
     Options:
+      --start-date <date>    Start date filter (YYYY-MM-DD or ISO8601)
+      --end-date <date>      End date filter (YYYY-MM-DD or ISO8601)
       --concurrency <n>      Parallel fetches (default: 2)
       --batch-size <n>       API batch size (default: 100)
       --db-batch-size <n>    DB batch size (default: 1000)
 
     Examples:
-      # Single index
+      # Single index (all history)
       bun src/cli/index.ts fetch-deliveries btc_usd
+
+      # Filtered by date range
+      bun src/cli/index.ts fetch-deliveries btc_usd --start-date 2024-01-01 --end-date 2024-12-31
 
       # Multiple indices
       bun src/cli/index.ts fetch-deliveries btc_usd eth_usd sol_usd
@@ -293,6 +298,18 @@ async function fetchDeliveriesCommand(args: string[]) {
 
   const indices = parsed.positional;
 
+  // Parse date range
+  let startDate: number | undefined;
+  let endDate: number | undefined;
+
+  if (parsed.flags["start-date"]) {
+    startDate = parseDate(parsed.flags["start-date"] as string);
+  }
+
+  if (parsed.flags["end-date"]) {
+    endDate = parseDate(parsed.flags["end-date"] as string);
+  }
+
   // Parse optional flags
   const concurrency = parsed.flags["concurrency"]
     ? parseInt(parsed.flags["concurrency"] as string)
@@ -314,12 +331,16 @@ async function fetchDeliveriesCommand(args: string[]) {
   });
 
   try {
+    const dateRangeMsg = startDate || endDate
+      ? ` (${startDate ? new Date(startDate).toISOString().split('T')[0] : 'all'} to ${endDate ? new Date(endDate).toISOString().split('T')[0] : 'now'})`
+      : ' (all history)';
+
     if (indices.length === 1) {
       // Single index
       const indexName = indices[0]!;
-      console.log(`Fetching delivery prices for ${indexName}...`);
+      console.log(`Fetching delivery prices for ${indexName}${dateRangeMsg}...`);
 
-      const progress = await fetcher.fetchDeliveryPrices(indexName, (p) => {
+      const progress = await fetcher.fetchDeliveryPrices(indexName, startDate, endDate, (p) => {
         console.log(
           `Progress: ${p.totalRecords} delivery prices fetched, ${p.batchesProcessed} batches processed`
         );
@@ -333,11 +354,13 @@ async function fetchDeliveriesCommand(args: string[]) {
       );
     } else {
       // Multiple indices
-      console.log(`Fetching delivery prices for ${indices.length} indices...\n`);
-      const startTime = Date.now();
+      console.log(`Fetching delivery prices for ${indices.length} indices${dateRangeMsg}...\n`);
+      const overallStart = Date.now();
 
       const results = await fetcher.fetchMultipleIndices(
         indices,
+        startDate,
+        endDate,
         concurrency,
         (p) => {
           console.log(
@@ -355,7 +378,7 @@ async function fetchDeliveriesCommand(args: string[]) {
         );
       }
 
-      const totalDuration = (Date.now() - startTime) / 1000;
+      const totalDuration = (Date.now() - overallStart) / 1000;
       console.log(`\n=== Summary ===`);
       console.log(`Indices: ${results.length}`);
       console.log(`Total records: ${totalRecords}`);
