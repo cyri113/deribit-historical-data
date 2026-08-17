@@ -110,11 +110,21 @@ Commands:
       # With concurrency
       bun src/cli/index.ts fetch-deliveries btc_usd eth_usd --concurrency 4
 
-  compute-greeks <instrument>
-    Compute Black-76 greeks for trades of an instrument
+  compute-greeks [instrument] [options]
+    Compute Black-76 greeks for option trades
 
-    Example:
+    Options:
+      --concurrency <n>      Parallel processing (default: 3)
+
+    Examples:
+      # Compute greeks for all option instruments
+      bun src/cli/index.ts compute-greeks
+
+      # Compute greeks for specific instrument
       bun src/cli/index.ts compute-greeks BTC-18AUG26-60000-C
+
+      # Higher concurrency for faster processing
+      bun src/cli/index.ts compute-greeks --concurrency 5
 
   apply-filters <instrument> <filter-preset>
     Apply risk filters to computed greeks
@@ -357,45 +367,122 @@ async function fetchDeliveriesCommand(args: string[]) {
 }
 
 async function computeGreeksCommand(args: string[]) {
-  if (args.length < 1) {
-    console.error("Usage: compute-greeks <instrument>");
-    process.exit(1);
-  }
-
-  const [instrument] = args;
-
-  console.log(`Computing greeks for ${instrument}...`);
+  const parsed = parseArgs(args);
 
   const database = new Database();
   const calculator = new GreeksCalculator({ database });
 
   try {
-    const progress = await calculator.calculateForInstrument(
-      instrument!,
-      undefined,
-      undefined,
-      (p) => {
+    // If specific instrument provided, compute for that one only
+    if (parsed.positional.length > 0) {
+      const instrument = parsed.positional[0]!;
+      console.log(`Computing greeks for ${instrument}...`);
+
+      const progress = await calculator.calculateForInstrument(
+        instrument,
+        undefined,
+        undefined,
+        (p) => {
+          console.log(
+            `Progress: ${p.totalCalculated} greeks calculated, ${p.batchesProcessed} batches processed`
+          );
+        }
+      );
+
+      console.log(`\nCompleted!`);
+      console.log(`Total greeks calculated: ${progress.totalCalculated}`);
+      console.log(`Batches: ${progress.batchesProcessed}`);
+      console.log(
+        `Duration: ${((progress.endTime! - progress.startTime) / 1000).toFixed(2)}s`
+      );
+
+      // Show summary
+      const summary = calculator.getGreeksSummary(instrument);
+      if (summary) {
+        console.log(`\nGreeks Summary:`);
         console.log(
-          `Progress: ${p.totalCalculated} greeks calculated, ${p.batchesProcessed} batches processed`
+          `Delta: ${summary.delta.min.toFixed(4)} to ${summary.delta.max.toFixed(4)} (avg: ${summary.delta.avg.toFixed(4)})`
+        );
+        console.log(
+          `Gamma: ${summary.gamma.min.toFixed(6)} to ${summary.gamma.max.toFixed(6)} (avg: ${summary.gamma.avg.toFixed(6)})`
+        );
+        console.log(
+          `Vega: ${summary.vega.min.toFixed(4)} to ${summary.vega.max.toFixed(4)} (avg: ${summary.vega.avg.toFixed(4)})`
+        );
+        console.log(
+          `Theta: ${summary.theta.min.toFixed(4)} to ${summary.theta.max.toFixed(4)} (avg: ${summary.theta.avg.toFixed(4)})`
         );
       }
-    );
+    } else {
+      // Compute for all instruments
+      console.log(`Computing greeks for all instruments...`);
 
-    console.log(`\nCompleted!`);
-    console.log(`Total greeks calculated: ${progress.totalCalculated}`);
-    console.log(`Batches: ${progress.batchesProcessed}`);
-    console.log(
-      `Duration: ${((progress.endTime! - progress.startTime) / 1000).toFixed(2)}s`
-    );
+      const instruments = database.getDistinctInstruments();
 
-    // Show summary
-    const summary = calculator.getGreeksSummary(instrument!);
-    if (summary) {
-      console.log(`\nGreeks Summary:`);
-      console.log(`Delta: ${summary.delta.min.toFixed(4)} to ${summary.delta.max.toFixed(4)} (avg: ${summary.delta.avg.toFixed(4)})`);
-      console.log(`Gamma: ${summary.gamma.min.toFixed(6)} to ${summary.gamma.max.toFixed(6)} (avg: ${summary.gamma.avg.toFixed(6)})`);
-      console.log(`Vega: ${summary.vega.min.toFixed(4)} to ${summary.vega.max.toFixed(4)} (avg: ${summary.vega.avg.toFixed(4)})`);
-      console.log(`Theta: ${summary.theta.min.toFixed(4)} to ${summary.theta.max.toFixed(4)} (avg: ${summary.theta.avg.toFixed(4)})`);
+      // Filter to only option instruments
+      const optionInstruments = instruments.filter((name) => {
+        const parts = name.split("-");
+        return parts.length === 4; // BTC-DATE-STRIKE-TYPE format
+      });
+
+      if (optionInstruments.length === 0) {
+        console.log("No option instruments found with trade data.");
+        return;
+      }
+
+      console.log(`Found ${optionInstruments.length} option instruments\n`);
+
+      const concurrency = parsed.flags["concurrency"]
+        ? parseInt(parsed.flags["concurrency"] as string)
+        : 3;
+
+      let totalCalculated = 0;
+      let successCount = 0;
+      let failCount = 0;
+      const startTime = Date.now();
+
+      // Process in parallel batches
+      for (let i = 0; i < optionInstruments.length; i += concurrency) {
+        const batch = optionInstruments.slice(i, i + concurrency);
+
+        const promises = batch.map(async (instrument) => {
+          try {
+            console.log(
+              `[${i + batch.indexOf(instrument) + 1}/${optionInstruments.length}] Processing ${instrument}...`
+            );
+
+            const progress = await calculator.calculateForInstrument(
+              instrument,
+              undefined,
+              undefined
+            );
+
+            totalCalculated += progress.totalCalculated;
+            successCount++;
+            const duration = (progress.endTime! - progress.startTime) / 1000;
+            console.log(
+              `  ✓ ${instrument}: ${progress.totalCalculated} greeks in ${duration.toFixed(2)}s`
+            );
+          } catch (error) {
+            failCount++;
+            console.error(
+              `  ✗ ${instrument}: ${error instanceof Error ? error.message : String(error)}`
+            );
+          }
+        });
+
+        await Promise.all(promises);
+      }
+
+      const totalDuration = (Date.now() - startTime) / 1000;
+      console.log(`\n=== Summary ===`);
+      console.log(`Instruments processed: ${successCount}/${optionInstruments.length}`);
+      console.log(`Failed: ${failCount}`);
+      console.log(`Total greeks calculated: ${totalCalculated}`);
+      console.log(`Duration: ${totalDuration.toFixed(2)}s`);
+      console.log(
+        `Avg per instrument: ${(totalDuration / successCount).toFixed(2)}s`
+      );
     }
   } finally {
     database.close();

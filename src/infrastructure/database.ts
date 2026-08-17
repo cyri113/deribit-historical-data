@@ -168,6 +168,19 @@ export class Database {
   }
 
   /**
+   * Get all distinct instrument names that have trade data
+   */
+  getDistinctInstruments(): string[] {
+    const stmt = this.db.prepare(`
+      SELECT DISTINCT instrument_name
+      FROM trades
+      ORDER BY instrument_name
+    `);
+    const rows = stmt.all() as Array<{ instrument_name: string }>;
+    return rows.map((row) => row.instrument_name);
+  }
+
+  /**
    * Get trades for an instrument in a time range
    */
   getTrades(

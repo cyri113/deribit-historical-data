@@ -86,10 +86,20 @@ bun src/cli/index.ts fetch-deliveries btc_usd eth_usd --concurrency 4
 #### Compute Greeks
 
 ```bash
+# Compute greeks for all option instruments
+bun src/cli/index.ts compute-greeks
+
+# Compute greeks for specific instrument
 bun src/cli/index.ts compute-greeks BTC-18AUG26-60000-C
+
+# Higher concurrency for faster processing
+bun src/cli/index.ts compute-greeks --concurrency 5
 ```
 
-Computes Black-76 greeks from stored trades for an option.
+Computes Black-76 greeks from stored trades. If no instrument is specified, processes all option instruments in parallel.
+
+**Options:**
+- `--concurrency <n>` - Parallel processing (default: 3)
 
 #### Apply Risk Filters
 
