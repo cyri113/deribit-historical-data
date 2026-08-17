@@ -65,7 +65,7 @@ export class DeliveryFetcher {
         // Convert to domain models
         const deliveryPrices: DeliveryPrice[] = deribitPrices.map((dp) => ({
           indexName,
-          date: dp.date,
+          date: new Date(dp.date).getTime(), // Convert YYYY-MM-DD string to timestamp
           deliveryPrice: dp.delivery_price,
         }));
 

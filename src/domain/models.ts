@@ -28,7 +28,7 @@ export const DeribitTradesResponseSchema = z.object({
 });
 
 export const DeribitDeliveryPriceSchema = z.object({
-  date: z.number(),
+  date: z.string(), // YYYY-MM-DD format
   delivery_price: z.number(),
 });
 

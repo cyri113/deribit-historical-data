@@ -200,13 +200,29 @@ export class DeribitClient {
     offset: number = 0,
     count: number = 100
   ): Promise<{ data: DeribitDeliveryPrice[]; recordsTotal: number }> {
-    const response = await this.request<unknown>("get_delivery_prices", {
+    // Wait for rate limiter
+    await this.rateLimiter.acquire();
+
+    // Build query params
+    const params = new URLSearchParams({
       index_name: indexName,
-      offset,
-      count,
+      offset: String(offset),
+      count: String(count),
     });
 
-    const validated = DeribitDeliveryPricesResponseSchema.parse(response);
+    const url = `${this.baseUrl}/public/get_delivery_prices?${params}`;
+
+    const response = await fetch(url);
+
+    if (!response.ok) {
+      throw new DeribitAPIError(
+        `HTTP error: ${response.status} ${response.statusText}`,
+        response.status
+      );
+    }
+
+    const data = await response.json();
+    const validated = DeribitDeliveryPricesResponseSchema.parse(data);
     return {
       data: validated.result.data,
       recordsTotal: validated.result.records_total,
