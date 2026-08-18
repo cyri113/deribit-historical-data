@@ -28,6 +28,7 @@ export class DeribitRateLimitError extends Error {
 
 export interface DeribitClientConfig {
   baseUrl?: string;
+  historyBaseUrl?: string;
   rateLimiter?: RateLimiter;
   maxRetries?: number;
   retryDelay?: number;
@@ -41,6 +42,7 @@ export interface DeribitClientConfig {
  */
 export class DeribitClient {
   private readonly baseUrl: string;
+  private readonly historyBaseUrl: string;
   private readonly rateLimiter: RateLimiter;
   private readonly maxRetries: number;
   private readonly retryDelay: number;
@@ -48,6 +50,7 @@ export class DeribitClient {
 
   constructor(config: DeribitClientConfig = {}) {
     this.baseUrl = config.baseUrl ?? "https://www.deribit.com/api/v2";
+    this.historyBaseUrl = config.historyBaseUrl ?? "https://history.deribit.com/api/v2";
     this.rateLimiter =
       config.rateLimiter ?? new RateLimiter(15, 15); // 15 req/s
     this.maxRetries = config.maxRetries ?? 3;
@@ -336,5 +339,136 @@ export class DeribitClient {
     const data = await response.json();
     const validated = DeribitInstrumentsResponseSchema.parse(data);
     return validated.result;
+  }
+
+  /**
+   * Get the last trade_seq for an instrument (from history API)
+   * Returns null if instrument has no trades, or if API call fails after retries
+   *
+   * @param instrumentName - e.g., "BTC-PERPETUAL"
+   * @returns Last trade_seq, 0 if no trades, null if could not be determined
+   */
+  async getLastTradeSeq(instrumentName: string): Promise<number | null> {
+    try {
+      await this.rateLimiter.acquire();
+
+      // Fetch one trade in descending order to get the latest trade_seq
+      const params = new URLSearchParams({
+        instrument_name: instrumentName,
+        count: "1",
+        include_old: "true",
+      });
+
+      const url = `${this.historyBaseUrl}/public/get_last_trades_by_instrument?${params}`;
+
+      const response = await fetch(url);
+
+      if (!response.ok) {
+        if (response.status === 404) {
+          // Instrument exists but has no trades
+          return 0;
+        }
+        throw new DeribitAPIError(
+          `HTTP error: ${response.status} ${response.statusText}`,
+          response.status
+        );
+      }
+
+      const data = await response.json();
+      const validated = DeribitTradesResponseSchema.parse(data);
+
+      if (validated.result.trades.length === 0) {
+        return 0;
+      }
+
+      return validated.result.trades[0]!.trade_seq;
+    } catch (error) {
+      console.error(`Failed to get last_seq for ${instrumentName}:`, error);
+      return null;
+    }
+  }
+
+  /**
+   * Fetch trades by trade_seq range using history API
+   * Follows design decision #1: page by trade_seq, not time
+   *
+   * @param instrumentName - e.g., "BTC-PERPETUAL"
+   * @param startSeq - Starting trade_seq (inclusive)
+   * @param endSeq - Ending trade_seq (inclusive)
+   * @param count - Max trades per request (default 10000, Deribit's max)
+   * @returns Trades and hasMore flag
+   */
+  async getTradesBySeq(
+    instrumentName: string,
+    startSeq: number,
+    endSeq: number,
+    count: number = 10000
+  ): Promise<{ trades: DeribitTrade[]; hasMore: boolean }> {
+    await this.rateLimiter.acquire();
+
+    const params = new URLSearchParams({
+      instrument_name: instrumentName,
+      start_seq: String(startSeq),
+      end_seq: String(endSeq),
+      count: String(count),
+      include_old: "true",
+    });
+
+    const url = `${this.historyBaseUrl}/public/get_last_trades_by_instrument?${params}`;
+
+    const response = await fetch(url);
+
+    if (!response.ok) {
+      throw new DeribitAPIError(
+        `HTTP error: ${response.status} ${response.statusText}`,
+        response.status
+      );
+    }
+
+    const data = await response.json();
+    const validated = DeribitTradesResponseSchema.parse(data);
+
+    return {
+      trades: validated.result.trades,
+      hasMore: validated.result.has_more,
+    };
+  }
+
+  /**
+   * Fetch all trades in a seq range (handles pagination)
+   * Generator that yields batches of trades
+   *
+   * @param instrumentName - e.g., "BTC-PERPETUAL"
+   * @param startSeq - Starting trade_seq (inclusive)
+   * @param endSeq - Ending trade_seq (inclusive)
+   * @param batchSize - Trades per request (default 10000)
+   */
+  async *getAllTradesBySeq(
+    instrumentName: string,
+    startSeq: number,
+    endSeq: number,
+    batchSize: number = 10000
+  ): AsyncGenerator<DeribitTrade[]> {
+    let currentSeq = startSeq;
+
+    while (currentSeq <= endSeq) {
+      const { trades, hasMore } = await this.getTradesBySeq(
+        instrumentName,
+        currentSeq,
+        endSeq,
+        batchSize
+      );
+
+      if (trades.length > 0) {
+        yield trades;
+        // Move to next seq after the last trade
+        currentSeq = trades[trades.length - 1]!.trade_seq + 1;
+      }
+
+      // hasMore means "more within requested range", not "beyond it"
+      if (!hasMore) {
+        break;
+      }
+    }
   }
 }

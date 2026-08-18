@@ -110,6 +110,82 @@ export class Database {
       CREATE INDEX IF NOT EXISTS idx_checkpoints_status
       ON checkpoints(status)
     `);
+
+    // ========================================
+    // New schema for seq-based fetching
+    // ========================================
+
+    // Instruments table - store metadata fetched from get_instruments
+    this.db.run(`
+      CREATE TABLE IF NOT EXISTS instruments (
+        instrument_name TEXT PRIMARY KEY,
+        kind TEXT NOT NULL,
+        base_currency TEXT NOT NULL,
+        expiration_timestamp INTEGER,
+        strike REAL,
+        option_type TEXT,
+        is_active INTEGER NOT NULL,
+        settlement_period TEXT,
+        last_seq INTEGER,
+        fetched_at INTEGER DEFAULT (unixepoch() * 1000)
+      )
+    `);
+
+    this.db.run(`
+      CREATE INDEX IF NOT EXISTS idx_instruments_currency_kind
+      ON instruments(base_currency, kind)
+    `);
+
+    this.db.run(`
+      CREATE INDEX IF NOT EXISTS idx_instruments_active
+      ON instruments(is_active)
+    `);
+
+    // Future chunks table - track per-chunk progress for futures
+    // Design Decision #2: Pre-allocated chunks for futures
+    this.db.run(`
+      CREATE TABLE IF NOT EXISTS future_chunks (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        instrument_name TEXT NOT NULL,
+        chunk_start_seq INTEGER NOT NULL,
+        chunk_end_seq INTEGER NOT NULL,
+        is_done INTEGER NOT NULL DEFAULT 0,
+        jsonl_path TEXT,
+        trade_count INTEGER DEFAULT 0,
+        created_at INTEGER DEFAULT (unixepoch() * 1000),
+        updated_at INTEGER DEFAULT (unixepoch() * 1000),
+        UNIQUE(instrument_name, chunk_start_seq, chunk_end_seq)
+      )
+    `);
+
+    this.db.run(`
+      CREATE INDEX IF NOT EXISTS idx_future_chunks_instrument
+      ON future_chunks(instrument_name)
+    `);
+
+    this.db.run(`
+      CREATE INDEX IF NOT EXISTS idx_future_chunks_done
+      ON future_chunks(is_done)
+    `);
+
+    // Option progress table - track streaming progress for options
+    // Design Decision #2: Streaming/lazy progress for options
+    this.db.run(`
+      CREATE TABLE IF NOT EXISTS option_progress (
+        instrument_name TEXT PRIMARY KEY,
+        last_no INTEGER NOT NULL DEFAULT 0,
+        status TEXT NOT NULL DEFAULT 'in_progress',
+        jsonl_path TEXT,
+        trade_count INTEGER DEFAULT 0,
+        created_at INTEGER DEFAULT (unixepoch() * 1000),
+        updated_at INTEGER DEFAULT (unixepoch() * 1000)
+      )
+    `);
+
+    this.db.run(`
+      CREATE INDEX IF NOT EXISTS idx_option_progress_status
+      ON option_progress(status)
+    `);
   }
 
   /**
@@ -628,6 +704,338 @@ export class Database {
     results.sort((a, b) => b.expiration - a.expiration);
 
     return results;
+  }
+
+  // ========================================
+  // Instrument Repository Methods
+  // ========================================
+
+  /**
+   * Insert or update instruments from get_instruments API
+   */
+  upsertInstruments(instruments: Array<{
+    instrument_name: string;
+    kind: string;
+    base_currency: string;
+    expiration_timestamp?: number;
+    strike?: number;
+    option_type?: string;
+    is_active: boolean;
+    settlement_period?: string;
+    last_seq?: number;
+  }>): void {
+    if (instruments.length === 0) return;
+
+    const stmt = this.db.prepare(`
+      INSERT OR REPLACE INTO instruments (
+        instrument_name, kind, base_currency, expiration_timestamp,
+        strike, option_type, is_active, settlement_period, last_seq
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+
+    const upsertMany = this.db.transaction((instruments: typeof instruments) => {
+      for (const inst of instruments) {
+        stmt.run(
+          inst.instrument_name,
+          inst.kind,
+          inst.base_currency,
+          inst.expiration_timestamp ?? null,
+          inst.strike ?? null,
+          inst.option_type ?? null,
+          inst.is_active ? 1 : 0,
+          inst.settlement_period ?? null,
+          inst.last_seq ?? null
+        );
+      }
+    });
+
+    upsertMany(instruments);
+  }
+
+  /**
+   * Update last_seq for an instrument
+   */
+  updateInstrumentLastSeq(instrumentName: string, lastSeq: number): void {
+    const stmt = this.db.prepare(`
+      UPDATE instruments SET last_seq = ? WHERE instrument_name = ?
+    `);
+    stmt.run(lastSeq, instrumentName);
+  }
+
+  /**
+   * Get instruments by currency and kind
+   */
+  getInstruments(currency: string, kind?: string, expired?: boolean): Array<{
+    instrument_name: string;
+    kind: string;
+    base_currency: string;
+    expiration_timestamp?: number;
+    strike?: number;
+    option_type?: string;
+    is_active: boolean;
+    settlement_period?: string;
+    last_seq?: number;
+  }> {
+    let query = `SELECT * FROM instruments WHERE base_currency = ?`;
+    const params: any[] = [currency];
+
+    if (kind) {
+      query += ` AND kind = ?`;
+      params.push(kind);
+    }
+
+    if (expired !== undefined) {
+      query += ` AND is_active = ?`;
+      params.push(expired ? 0 : 1);
+    }
+
+    const stmt = this.db.prepare(query);
+    const rows = stmt.all(...params) as any[];
+
+    return rows.map((row) => ({
+      instrument_name: row.instrument_name,
+      kind: row.kind,
+      base_currency: row.base_currency,
+      expiration_timestamp: row.expiration_timestamp,
+      strike: row.strike,
+      option_type: row.option_type,
+      is_active: row.is_active === 1,
+      settlement_period: row.settlement_period,
+      last_seq: row.last_seq,
+    }));
+  }
+
+  /**
+   * Get a single instrument by name
+   */
+  getInstrument(instrumentName: string): {
+    instrument_name: string;
+    kind: string;
+    base_currency: string;
+    expiration_timestamp?: number;
+    strike?: number;
+    option_type?: string;
+    is_active: boolean;
+    settlement_period?: string;
+    last_seq?: number;
+  } | null {
+    const stmt = this.db.prepare(`
+      SELECT * FROM instruments WHERE instrument_name = ?
+    `);
+    const row = stmt.get(instrumentName) as any;
+
+    if (!row) return null;
+
+    return {
+      instrument_name: row.instrument_name,
+      kind: row.kind,
+      base_currency: row.base_currency,
+      expiration_timestamp: row.expiration_timestamp,
+      strike: row.strike,
+      option_type: row.option_type,
+      is_active: row.is_active === 1,
+      settlement_period: row.settlement_period,
+      last_seq: row.last_seq,
+    };
+  }
+
+  // ========================================
+  // Future Chunks Repository Methods
+  // ========================================
+
+  /**
+   * Create chunks for a future instrument
+   */
+  createFutureChunks(
+    instrumentName: string,
+    lastSeq: number,
+    chunkSize: number = 10000
+  ): void {
+    const chunks: Array<{ start: number; end: number }> = [];
+
+    // Partition [1, lastSeq] into chunks of chunkSize
+    for (let start = 1; start <= lastSeq; start += chunkSize) {
+      const end = Math.min(start + chunkSize - 1, lastSeq);
+      chunks.push({ start, end });
+    }
+
+    if (chunks.length === 0) return;
+
+    const stmt = this.db.prepare(`
+      INSERT OR IGNORE INTO future_chunks (
+        instrument_name, chunk_start_seq, chunk_end_seq
+      ) VALUES (?, ?, ?)
+    `);
+
+    const insertMany = this.db.transaction((chunks: typeof chunks) => {
+      for (const chunk of chunks) {
+        stmt.run(instrumentName, chunk.start, chunk.end);
+      }
+    });
+
+    insertMany(chunks);
+  }
+
+  /**
+   * Get incomplete chunks for a future instrument
+   */
+  getIncompleteFutureChunks(instrumentName: string): Array<{
+    id: number;
+    chunk_start_seq: number;
+    chunk_end_seq: number;
+  }> {
+    const stmt = this.db.prepare(`
+      SELECT id, chunk_start_seq, chunk_end_seq
+      FROM future_chunks
+      WHERE instrument_name = ? AND is_done = 0
+      ORDER BY chunk_start_seq ASC
+    `);
+
+    const rows = stmt.all(instrumentName) as any[];
+
+    return rows.map((row) => ({
+      id: row.id,
+      chunk_start_seq: row.chunk_start_seq,
+      chunk_end_seq: row.chunk_end_seq,
+    }));
+  }
+
+  /**
+   * Mark a future chunk as complete
+   */
+  markFutureChunkDone(
+    instrumentName: string,
+    chunkStartSeq: number,
+    chunkEndSeq: number,
+    tradeCount: number,
+    jsonlPath: string
+  ): void {
+    const stmt = this.db.prepare(`
+      UPDATE future_chunks
+      SET is_done = 1, trade_count = ?, jsonl_path = ?, updated_at = ?
+      WHERE instrument_name = ? AND chunk_start_seq = ? AND chunk_end_seq = ?
+    `);
+
+    stmt.run(
+      tradeCount,
+      jsonlPath,
+      Date.now(),
+      instrumentName,
+      chunkStartSeq,
+      chunkEndSeq
+    );
+  }
+
+  /**
+   * Get future chunk stats for an instrument
+   */
+  getFutureChunkStats(instrumentName: string): {
+    total: number;
+    done: number;
+    pending: number;
+  } {
+    const stmt = this.db.prepare(`
+      SELECT
+        COUNT(*) as total,
+        SUM(CASE WHEN is_done = 1 THEN 1 ELSE 0 END) as done,
+        SUM(CASE WHEN is_done = 0 THEN 1 ELSE 0 END) as pending
+      FROM future_chunks
+      WHERE instrument_name = ?
+    `);
+
+    const row = stmt.get(instrumentName) as any;
+
+    return {
+      total: row.total || 0,
+      done: row.done || 0,
+      pending: row.pending || 0,
+    };
+  }
+
+  // ========================================
+  // Option Progress Repository Methods
+  // ========================================
+
+  /**
+   * Get or create option progress record
+   */
+  getOptionProgress(instrumentName: string): {
+    last_no: number;
+    status: string;
+    trade_count: number;
+  } {
+    const stmt = this.db.prepare(`
+      SELECT last_no, status, trade_count
+      FROM option_progress
+      WHERE instrument_name = ?
+    `);
+
+    let row = stmt.get(instrumentName) as any;
+
+    if (!row) {
+      // Create initial record
+      const insertStmt = this.db.prepare(`
+        INSERT INTO option_progress (instrument_name, last_no, status)
+        VALUES (?, 0, 'in_progress')
+      `);
+      insertStmt.run(instrumentName);
+
+      return { last_no: 0, status: "in_progress", trade_count: 0 };
+    }
+
+    return {
+      last_no: row.last_no,
+      status: row.status,
+      trade_count: row.trade_count || 0,
+    };
+  }
+
+  /**
+   * Update option progress (Design Decision #5: MAX guard to prevent rollback)
+   */
+  updateOptionProgress(
+    instrumentName: string,
+    lastNo: number,
+    tradeCount: number,
+    jsonlPath: string
+  ): void {
+    const stmt = this.db.prepare(`
+      UPDATE option_progress
+      SET last_no = MAX(last_no, ?), trade_count = ?, jsonl_path = ?, updated_at = ?
+      WHERE instrument_name = ?
+    `);
+
+    stmt.run(lastNo, tradeCount, jsonlPath, Date.now(), instrumentName);
+  }
+
+  /**
+   * Mark option as complete
+   */
+  markOptionComplete(instrumentName: string): void {
+    const stmt = this.db.prepare(`
+      UPDATE option_progress
+      SET status = 'completed', updated_at = ?
+      WHERE instrument_name = ?
+    `);
+
+    stmt.run(Date.now(), instrumentName);
+  }
+
+  /**
+   * Get all incomplete options
+   */
+  getIncompleteOptions(currency: string): string[] {
+    const stmt = this.db.prepare(`
+      SELECT i.instrument_name
+      FROM instruments i
+      LEFT JOIN option_progress op ON i.instrument_name = op.instrument_name
+      WHERE i.base_currency = ?
+        AND i.kind = 'option'
+        AND (op.status IS NULL OR op.status != 'completed')
+    `);
+
+    const rows = stmt.all(currency) as any[];
+    return rows.map((row) => row.instrument_name);
   }
 
   /**
