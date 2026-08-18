@@ -1,3 +1,20 @@
+/**
+ * Data Associations Tests (Legacy SQLite-Based Architecture)
+ *
+ * ⚠️ NOTE: These tests verify the legacy SQLite-based data associations.
+ * In production, Greeks and moneyness are now computed on-the-fly during
+ * JSONL → Parquet merge and stored together with trades in Parquet files.
+ *
+ * This test suite is maintained to:
+ * 1. Verify SQLite database schema integrity
+ * 2. Document historical data relationships
+ * 3. Test database JOIN queries for backwards compatibility
+ *
+ * For modern Parquet-based tests, see:
+ * - tests/integration/parquet-writer.test.ts
+ * - tests/integration/parquet-merger.test.ts
+ */
+
 import { test, expect, beforeAll, afterAll } from "bun:test";
 import { Database } from "../../src/infrastructure/database.ts";
 import { calculateGreeks } from "../../src/domain/black76.ts";
