@@ -1,0 +1,52 @@
+{
+  "hooks": {
+    "user-prompt-submit-hook": "./.claude/hooks/pre-write-orchestrator.sh",
+    "tool-call-hook": "./.claude/hooks/test-before-write.sh",
+    "pre-commit-hook": "./.claude/hooks/pre-commit-orchestrator.sh"
+  },
+  "tdd": {
+    "enabled": true,
+    "require_tests_first": true,
+    "block_on_failure": true,
+    "test_patterns": {
+      "unit": "tests/unit/**/*.test.ts",
+      "integration": "tests/integration/**/*.test.ts",
+      "e2e": "tests/e2e/**/*.test.ts"
+    },
+    "source_to_test_mapping": {
+      "src/domain/": "tests/unit/",
+      "src/infrastructure/": "tests/integration/",
+      "src/application/": "tests/integration/",
+      "src/cli/": "tests/e2e/"
+    }
+  },
+  "documentation": {
+    "enforce_updates": true,
+    "block_on_missing": true,
+    "critical_files": {
+      "src/cli/index.ts": ["docs/operations.md", "docs/api-reference.md"],
+      "src/infrastructure/database.ts": ["docs/data-model.md"],
+      "src/infrastructure/deribit-client.ts": ["docs/deribit-api.md"],
+      "src/infrastructure/jsonl-storage.ts": ["docs/data-model.md", "docs/design-decisions.md"],
+      "src/infrastructure/parquet-writer.ts": ["docs/data-model.md", "docs/architecture.md"],
+      "src/application/fetchers/*.ts": ["docs/architecture.md", "docs/design-decisions.md"],
+      "src/domain/*.ts": ["docs/api-reference.md"]
+    }
+  },
+  "coverage": {
+    "enabled": true,
+    "minimum_percent": 60,
+    "warn_below_percent": 80,
+    "block_on_decrease": false
+  },
+  "permissions": {
+    "allow": [
+      "WebFetch(domain:github.com)",
+      "Bash(curl -s \"https://history.deribit.com/api/v2/public/get_last_settlement_by_currency?currency=BTC&type=delivery\")",
+      "Bash(bun *)",
+      "Bash(sqlite3 *)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}
