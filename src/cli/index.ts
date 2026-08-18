@@ -316,7 +316,17 @@ async function fetchDeliveriesCommand(args: string[]) {
   try {
     console.log(`\nFetching delivery prices for ${indices.length} indices...\n`);
 
-    const results = await fetcher.fetchMultipleIndices(indices, undefined, undefined, concurrency);
+    const results = await fetcher.fetchMultipleIndices(
+      indices,
+      undefined,
+      undefined,
+      concurrency,
+      (progress) => {
+        // Show progress updates as batches are processed
+        const duration = ((Date.now() - progress.startTime) / 1000).toFixed(1);
+        console.log(`  ${progress.indexName}: ${progress.totalRecords} records (${progress.batchesProcessed} batches) [${duration}s]`);
+      }
+    );
 
     const totalRecords = results.reduce((sum, r) => sum + r.totalRecords, 0);
 
