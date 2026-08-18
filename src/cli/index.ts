@@ -67,30 +67,39 @@ Commands:
     Fetch historical trades for one or more instruments
 
     Options:
-      --months <n>           Lookback period in months (required if no dates)
-      --start-date <date>    Start date (YYYY-MM-DD or ISO8601)
+      --months <n>           Lookback period in months (required for regular mode)
+      --start-date <date>    Start date (YYYY-MM-DD or ISO8601, required for regular mode)
       --end-date <date>      End date (YYYY-MM-DD or ISO8601, default: now)
       --kind <type>          Filter by: option, future, or spot (currency only)
-      --expired              Include expired instruments (currency only)
+      --expired              Include expired instruments (currency only, regular mode)
+      --historical           Fetch ALL expired instruments from Deribit (currency only)
+      --trade-lookback <n>   Days of trades before expiration (default: 30, historical mode only)
       --concurrency <n>      Parallel fetches (default: 3)
       --batch-size <n>       API batch size (default: 1000)
       --db-batch-size <n>    DB batch size (default: 5000)
 
-    Examples:
+    Examples (Regular Mode):
       # Single perpetual future with 3-month lookback
       bun src/cli/index.ts fetch-trades BTC-PERPETUAL --months 3
 
       # Single option with specific date range
       bun src/cli/index.ts fetch-trades BTC-18AUG26-60000-C --start-date 2026-05-01 --end-date 2026-08-01
 
-      # All BTC instruments (options and futures)
-      bun src/cli/index.ts fetch-trades BTC --months 3
-
-      # All BTC options only
+      # All currently active BTC options
       bun src/cli/index.ts fetch-trades BTC --months 3 --kind option
 
-      # Faster parallel fetching for all instruments
+      # Faster parallel fetching
       bun src/cli/index.ts fetch-trades BTC --months 6 --concurrency 5
+
+    Examples (Historical Mode - Fetch ALL Expired Instruments):
+      # Fetch ALL expired BTC options with 30 days of trade history each
+      bun src/cli/index.ts fetch-trades BTC --historical --kind option
+
+      # Longer trade history (60 days before expiration for each instrument)
+      bun src/cli/index.ts fetch-trades BTC --historical --kind option --trade-lookback 60
+
+      # Higher concurrency for faster processing
+      bun src/cli/index.ts fetch-trades BTC --historical --kind option --concurrency 5
 
   fetch-deliveries <index>... [options]
     Fetch delivery (settlement) prices for one or more indices
@@ -199,26 +208,35 @@ async function fetchTradesCommand(args: string[]) {
   const target = parsed.positional[0]!;
   const isCurrency = isCurrencyCode(target);
 
-  // Parse time range
+  // Parse time range (optional for historical mode)
   let startTimestamp: number;
   let endTimestamp: number;
 
-  if (parsed.flags["start-date"]) {
-    startTimestamp = parseDate(parsed.flags["start-date"] as string);
-    endTimestamp = parsed.flags["end-date"]
-      ? parseDate(parsed.flags["end-date"] as string)
-      : Date.now();
-  } else if (parsed.flags["months"]) {
-    const months = parseInt(parsed.flags["months"] as string);
-    if (isNaN(months) || months <= 0) {
-      console.error("Error: --months must be a positive number");
+  const historical = parsed.flags["historical"] === true;
+
+  // Historical mode doesn't require date parameters
+  if (!historical) {
+    if (parsed.flags["start-date"]) {
+      startTimestamp = parseDate(parsed.flags["start-date"] as string);
+      endTimestamp = parsed.flags["end-date"]
+        ? parseDate(parsed.flags["end-date"] as string)
+        : Date.now();
+    } else if (parsed.flags["months"]) {
+      const months = parseInt(parsed.flags["months"] as string);
+      if (isNaN(months) || months <= 0) {
+        console.error("Error: --months must be a positive number");
+        process.exit(1);
+      }
+      endTimestamp = Date.now();
+      startTimestamp = endTimestamp - months * 30 * 24 * 60 * 60 * 1000;
+    } else {
+      console.error("Error: Must specify either --months or --start-date");
       process.exit(1);
     }
-    endTimestamp = Date.now();
-    startTimestamp = endTimestamp - months * 30 * 24 * 60 * 60 * 1000;
   } else {
-    console.error("Error: Must specify either --months or --start-date");
-    process.exit(1);
+    // Historical mode: dates are optional, just for reference
+    startTimestamp = 0;
+    endTimestamp = Date.now();
   }
 
   // Parse optional flags
@@ -229,6 +247,9 @@ async function fetchTradesCommand(args: string[]) {
   }
 
   const expired = parsed.flags["expired"] === true;
+  const tradeLookbackDays = parsed.flags["trade-lookback"]
+    ? parseInt(parsed.flags["trade-lookback"] as string)
+    : 30;
   const concurrency = parsed.flags["concurrency"]
     ? parseInt(parsed.flags["concurrency"] as string)
     : 3;
@@ -250,57 +271,126 @@ async function fetchTradesCommand(args: string[]) {
 
   try {
     if (isCurrency) {
-      // Fetch all instruments for currency
-      console.log(`Fetching ${target} instruments...`);
-      const instruments = await client.getInstruments(target, kind, expired);
-      const activeInstruments = instruments.filter((i) => i.is_active || expired);
+      // Historical mode: fetch ALL expired instruments available from Deribit
+      if (historical) {
+        console.log(`Fetching all expired ${target} ${kind || "all"} instruments from Deribit...`);
+        const expiredInstruments = await client.getInstruments(target, kind, true);
 
-      console.log(`Found ${activeInstruments.length} instruments`);
-      console.log(
-        `Fetching trades from ${new Date(startTimestamp).toISOString()} to ${new Date(endTimestamp).toISOString()}...\n`
-      );
+        console.log(`Found ${expiredInstruments.length} expired instruments`);
 
-      let totalInstruments = 0;
-      let totalTrades = 0;
-      const overallStart = Date.now();
+        if (expiredInstruments.length === 0) {
+          console.log("\nNo expired instruments available from Deribit API.");
+          return;
+        }
 
-      // Process in batches with concurrency
-      for (let i = 0; i < activeInstruments.length; i += concurrency) {
-        const batch = activeInstruments.slice(i, i + concurrency);
-        const instrumentNames = batch.map((inst) => inst.instrument_name);
+        let totalInstruments = 0;
+        let totalTrades = 0;
+        const overallStart = Date.now();
 
-        console.log(
-          `\nProcessing batch ${Math.floor(i / concurrency) + 1}/${Math.ceil(activeInstruments.length / concurrency)}: ${instrumentNames.join(", ")}`
-        );
+        // For each expired instrument, fetch trades from lookback period before expiration
+        for (let i = 0; i < expiredInstruments.length; i += concurrency) {
+          const batch = expiredInstruments.slice(i, i + concurrency);
+          const instrumentNames = batch.map((inst) => inst.instrument_name);
 
-        const results = await fetcher.fetchMultipleInstruments(
-          instrumentNames,
-          startTimestamp,
-          endTimestamp,
-          concurrency,
-          (p) => {
-            process.stdout.write(
-              `\r  ${p.instrument}: ${p.totalTrades} trades, ${p.batchesProcessed} batches`
+          console.log(
+            `\nProcessing batch ${Math.floor(i / concurrency) + 1}/${Math.ceil(expiredInstruments.length / concurrency)}: ${instrumentNames.join(", ")}`
+          );
+
+          // Fetch trades for each instrument with custom date ranges (lookback before expiration)
+          const promises = batch.map(async (inst) => {
+            const expiration = inst.expiration_timestamp!;
+            const tradeStart = expiration - (tradeLookbackDays * 24 * 60 * 60 * 1000);
+            const tradeEnd = expiration;
+
+            console.log(`  ${inst.instrument_name}: fetching trades from ${new Date(tradeStart).toISOString().split('T')[0]} to ${new Date(tradeEnd).toISOString().split('T')[0]}`);
+
+            return fetcher.fetchTrades(
+              inst.instrument_name,
+              tradeStart,
+              tradeEnd,
+              (p) => {
+                process.stdout.write(
+                  `\r  ${p.instrument}: ${p.totalTrades} trades, ${p.batchesProcessed} batches`
+                );
+              }
+            );
+          });
+
+          const results = await Promise.all(promises);
+
+          for (const result of results) {
+            totalTrades += result.totalTrades;
+            totalInstruments++;
+            console.log(
+              `  ✓ ${result.instrument}: ${result.totalTrades} trades in ${((result.endTime! - result.startTime) / 1000).toFixed(2)}s\n`
             );
           }
+        }
+
+        const overallEnd = Date.now();
+        const overallDuration = ((overallEnd - overallStart) / 1000).toFixed(2);
+
+        console.log(`\n=== Historical Fetch Complete ===`);
+        console.log(`Total instruments: ${totalInstruments}`);
+        console.log(`Total trades: ${totalTrades}`);
+        console.log(`Duration: ${overallDuration}s`);
+        console.log(`\nNext steps:`);
+        console.log(`1. Compute greeks: bun src/cli/index.ts compute-greeks --concurrency 5`);
+        console.log(`2. Export historical data: bun src/cli/index.ts export-historical ${target} --format csv`);
+
+      } else {
+        // Regular mode: fetch currently active instruments (or expired if --expired flag)
+        console.log(`Fetching ${target} instruments...`);
+        const instruments = await client.getInstruments(target, kind, expired);
+        const activeInstruments = instruments.filter((i) => i.is_active || expired);
+
+        console.log(`Found ${activeInstruments.length} instruments`);
+        console.log(
+          `Fetching trades from ${new Date(startTimestamp).toISOString()} to ${new Date(endTimestamp).toISOString()}...\n`
         );
 
-        for (const result of results) {
-          totalTrades += result.totalTrades;
-          totalInstruments++;
-          const duration = (result.endTime! - result.startTime) / 1000;
-          console.log(
-            `\n  ✓ ${result.instrument}: ${result.totalTrades} trades in ${duration.toFixed(2)}s`
-          );
-        }
-      }
+        let totalInstruments = 0;
+        let totalTrades = 0;
+        const overallStart = Date.now();
 
-      const totalDuration = (Date.now() - overallStart) / 1000;
-      console.log(`\n\n=== Summary ===`);
-      console.log(`Instruments: ${totalInstruments}/${activeInstruments.length}`);
-      console.log(`Total trades: ${totalTrades}`);
-      console.log(`Duration: ${totalDuration.toFixed(2)}s`);
-      console.log(`Avg per instrument: ${(totalDuration / totalInstruments).toFixed(2)}s`);
+        // Process in batches with concurrency
+        for (let i = 0; i < activeInstruments.length; i += concurrency) {
+          const batch = activeInstruments.slice(i, i + concurrency);
+          const instrumentNames = batch.map((inst) => inst.instrument_name);
+
+          console.log(
+            `\nProcessing batch ${Math.floor(i / concurrency) + 1}/${Math.ceil(activeInstruments.length / concurrency)}: ${instrumentNames.join(", ")}`
+          );
+
+          const results = await fetcher.fetchMultipleInstruments(
+            instrumentNames,
+            startTimestamp,
+            endTimestamp,
+            concurrency,
+            (p) => {
+              process.stdout.write(
+                `\r  ${p.instrument}: ${p.totalTrades} trades, ${p.batchesProcessed} batches`
+              );
+            }
+          );
+
+          for (const result of results) {
+            totalTrades += result.totalTrades;
+            totalInstruments++;
+            const duration = (result.endTime! - result.startTime) / 1000;
+            console.log(
+              `\n  ✓ ${result.instrument}: ${result.totalTrades} trades in ${duration.toFixed(2)}s`
+            );
+          }
+        }
+
+        const totalDuration = (Date.now() - overallStart) / 1000;
+        console.log(`\n\n=== Summary ===`);
+        console.log(`Instruments: ${totalInstruments}/${activeInstruments.length}`);
+        console.log(`Total trades: ${totalTrades}`);
+        console.log(`Duration: ${totalDuration.toFixed(2)}s`);
+        console.log(`Avg per instrument: ${(totalDuration / totalInstruments).toFixed(2)}s`);
+      }
     } else {
       // Fetch single instrument
       console.log(

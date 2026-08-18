@@ -38,6 +38,8 @@ bun install
 
 #### Fetch Historical Trades
 
+**Regular Mode** - Fetch trades for currently active instruments:
+
 ```bash
 # Single perpetual future with 3-month lookback
 bun src/cli/index.ts fetch-trades BTC-PERPETUAL --months 3
@@ -55,15 +57,34 @@ bun src/cli/index.ts fetch-trades BTC --months 3 --kind option
 bun src/cli/index.ts fetch-trades BTC --months 6 --concurrency 5
 ```
 
+**Historical Mode** - Fetch ALL expired instruments available from Deribit:
+
+```bash
+# Fetch ALL expired BTC options with 30 days of trade history per instrument
+bun src/cli/index.ts fetch-trades BTC --historical --kind option
+
+# Fetch with longer trade history (60 days before expiration for each)
+bun src/cli/index.ts fetch-trades BTC --historical --kind option --trade-lookback 60
+
+# Higher concurrency for faster processing
+bun src/cli/index.ts fetch-trades BTC --historical --kind option --concurrency 5
+```
+
+**Note**: Historical mode fetches ALL expired instruments that Deribit's API returns (no date filtering). For each instrument, it fetches trades from `--trade-lookback` days before that instrument's expiration. This gives you the complete historical dataset available from Deribit.
+
 **Options:**
-- `--months <n>` - Lookback period in months (required if no dates)
-- `--start-date <date>` - Start date (YYYY-MM-DD or ISO8601)
-- `--end-date <date>` - End date (default: now)
+- `--historical` - Enable historical mode (fetches all expired instruments)
 - `--kind <type>` - Filter by: option, future, or spot (currency only)
-- `--expired` - Include expired instruments (currency only)
+- `--trade-lookback <n>` - Days of trades before expiration per instrument (default: 30)
 - `--concurrency <n>` - Parallel fetches (default: 3)
 - `--batch-size <n>` - API batch size (default: 1000)
 - `--db-batch-size <n>` - DB batch size (default: 5000)
+
+**Regular Mode Options** (for currently active instruments):
+- `--months <n>` - Lookback period in months (required for regular mode)
+- `--start-date <date>` - Start date (YYYY-MM-DD or ISO8601)
+- `--end-date <date>` - End date (default: now)
+- `--expired` - Include expired instruments (regular mode only)
 
 #### Fetch Delivery Prices
 
