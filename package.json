@@ -10,6 +10,7 @@
     "typescript": "^5"
   },
   "dependencies": {
+    "parquetjs": "^0.11.2",
     "zod": "^4.4.3"
   }
 }

@@ -6,8 +6,9 @@ import { JSONLStorage } from "../infrastructure/jsonl-storage.ts";
 import { FutureFetcher } from "../application/fetchers/future-fetcher.ts";
 import { OptionFetcher } from "../application/fetchers/option-fetcher.ts";
 import { DeliveryFetcher } from "../application/fetchers/delivery-fetcher.ts";
+import { ParquetMerger } from "../application/analytics/parquet-merger.ts";
 
-const COMMANDS = ["fetch-instruments", "fetch-trades", "fetch-deliveries", "fetch-all", "stats", "help"] as const;
+const COMMANDS = ["fetch-instruments", "fetch-trades", "fetch-deliveries", "fetch-all", "merge-to-parquet", "stats", "help"] as const;
 type Command = typeof COMMANDS[number];
 
 // Argument parsing
@@ -141,6 +142,24 @@ Commands:
       bun src/cli/index.ts fetch-all ETH --kind option --concurrency 5
       bun src/cli/index.ts fetch-all BTC --kind option --min-expiration 3m
       bun src/cli/index.ts fetch-all BTC --min-expiration 2024-06-01 --max-expiration 2024-08-31
+
+  merge-to-parquet <currency> [--min-expiration <date>] [--max-expiration <date>]
+    Convert JSONL trades to enriched Parquet files
+    Computes Greeks, moneyness, and merges with delivery prices
+
+    Options:
+      --min-expiration <date> Only merge options expiring after date (e.g., 3m, 6m, 2024-01-01)
+      --max-expiration <date> Only merge options expiring before date
+      --output-dir <path>     Output directory for Parquet files (default: ./data/parquet)
+
+    Date formats:
+      Relative: 3d (3 days ago), 3m (3 months ago), 1y (1 year ago)
+      Absolute: 2024-01-01, 2024-06-15
+
+    Examples:
+      bun src/cli/index.ts merge-to-parquet BTC
+      bun src/cli/index.ts merge-to-parquet BTC --min-expiration 3m
+      bun src/cli/index.ts merge-to-parquet ETH --min-expiration 2024-01-01 --max-expiration 2024-12-31
 
   stats [currency]
     Show download statistics
@@ -394,6 +413,65 @@ async function fetchAllCommand(args: string[]) {
   console.log(`━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`);
 }
 
+async function mergeToParquetCommand(args: string[]) {
+  const parsed = parseArgs(args);
+
+  if (parsed.positional.length < 1) {
+    console.error("Usage: merge-to-parquet <currency> [--min-expiration <date>] [--max-expiration <date>] [--output-dir <path>]");
+    process.exit(1);
+  }
+
+  const currency = parsed.positional[0]!.toUpperCase();
+  const outputDir = parsed.flags["output-dir"] as string | undefined;
+
+  // Parse date filters
+  let minExpiration: number | undefined;
+  let maxExpiration: number | undefined;
+
+  if (parsed.flags["min-expiration"]) {
+    try {
+      minExpiration = parseDate(parsed.flags["min-expiration"] as string);
+    } catch (error) {
+      console.error(`Invalid --min-expiration: ${error instanceof Error ? error.message : String(error)}`);
+      process.exit(1);
+    }
+  }
+
+  if (parsed.flags["max-expiration"]) {
+    try {
+      maxExpiration = parseDate(parsed.flags["max-expiration"] as string);
+    } catch (error) {
+      console.error(`Invalid --max-expiration: ${error instanceof Error ? error.message : String(error)}`);
+      process.exit(1);
+    }
+  }
+
+  const database = new Database();
+  const storage = new JSONLStorage();
+
+  try {
+    const merger = new ParquetMerger({
+      database,
+      jsonlStorage: storage,
+      outputDir,
+    });
+
+    await merger.mergeCurrency(
+      currency,
+      (progress) => {
+        // Show progress updates every 1000 trades
+        const duration = ((Date.now() - progress.startTime) / 1000).toFixed(1);
+        console.log(`  ${progress.instrumentName}: ${progress.enrichedTrades}/${progress.totalTrades} trades [${duration}s]`);
+      },
+      minExpiration,
+      maxExpiration
+    );
+  } finally {
+    database.close();
+    await storage.closeAll();
+  }
+}
+
 async function statsCommand(args: string[]) {
   const parsed = parseArgs(args);
   const currency = parsed.positional[0]?.toUpperCase();
@@ -462,6 +540,9 @@ async function main() {
       break;
     case "fetch-all":
       await fetchAllCommand(commandArgs);
+      break;
+    case "merge-to-parquet":
+      await mergeToParquetCommand(commandArgs);
       break;
     case "stats":
       await statsCommand(commandArgs);

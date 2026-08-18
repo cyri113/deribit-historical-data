@@ -1032,6 +1032,45 @@ export class Database {
   }
 
   /**
+   * Get all completed options for a currency
+   *
+   * @param currency - Base currency (BTC, ETH, etc.)
+   * @param minExpiration - Optional minimum expiration timestamp (ms)
+   * @param maxExpiration - Optional maximum expiration timestamp (ms)
+   */
+  getCompletedOptions(
+    currency: string,
+    minExpiration?: number,
+    maxExpiration?: number
+  ): string[] {
+    let query = `
+      SELECT i.instrument_name
+      FROM instruments i
+      INNER JOIN option_progress op ON i.instrument_name = op.instrument_name
+      WHERE i.base_currency = ?
+        AND i.kind = 'option'
+        AND op.status = 'completed'
+    `;
+
+    const params: any[] = [currency];
+
+    // Add expiration filters if provided
+    if (minExpiration !== undefined) {
+      query += ` AND (i.expiration_timestamp >= ? OR i.expiration_timestamp IS NULL)`;
+      params.push(minExpiration);
+    }
+
+    if (maxExpiration !== undefined) {
+      query += ` AND (i.expiration_timestamp <= ? OR i.expiration_timestamp IS NULL)`;
+      params.push(maxExpiration);
+    }
+
+    const stmt = this.db.prepare(query);
+    const rows = stmt.all(...params) as any[];
+    return rows.map((row) => row.instrument_name);
+  }
+
+  /**
    * Close database connection
    */
   close(): void {
