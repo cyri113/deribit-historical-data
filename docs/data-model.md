@@ -223,9 +223,11 @@ WHERE index_name = 'btc_usd'
 ORDER BY date;
 ```
 
-### Table: `greeks`
+### Table: `greeks` ⚠️ DEPRECATED
 
-Stores computed Black-76 Greeks (optional, derived from trades).
+> **Note:** This table is deprecated in favor of the Parquet analytics pipeline. Greeks are now computed on-the-fly during JSONL → Parquet merge and stored together with trades in Parquet files.
+
+Stores computed Black-76 Greeks (legacy, optional, derived from trades).
 
 ```sql
 CREATE TABLE greeks (
@@ -377,6 +379,167 @@ grep '"trade_seq":123456' data/jsonl/BTC/BTC-PERPETUAL.jsonl
 
 # Extract all buy trades
 jq 'select(.direction == "buy")' data/jsonl/BTC/BTC-PERPETUAL.jsonl
+```
+
+---
+
+## Parquet File Format (Analytics)
+
+Enriched trade data with computed Greeks and moneyness, generated via `merge-to-parquet` command.
+
+### Schema
+
+24 fields per trade (trade data + Greeks + moneyness):
+
+```typescript
+interface EnrichedTrade {
+  // Trade Data (from JSONL)
+  trade_id: string;
+  trade_seq: number;
+  instrument_name: string;
+  timestamp: number;                    // Unix milliseconds
+  price: number;
+  amount: number;
+  direction: "buy" | "sell";
+  tick_direction: number;
+  index_price: number;
+  mark_price?: number;
+  implied_volatility?: number;
+
+  // Instrument Metadata
+  strike: number;
+  expiration_timestamp: number;         // Unix milliseconds
+  option_type: "call" | "put";
+  time_to_expiry_years: number;
+
+  // Computed Greeks (Black-76)
+  delta?: number;                       // Rate of change w.r.t. underlying
+  gamma?: number;                       // Rate of change of delta
+  vega?: number;                        // Sensitivity to volatility (per 1%)
+  theta?: number;                       // Time decay (per day)
+  theoretical_price?: number;           // Black-76 fair value
+
+  // Moneyness (at Expiration)
+  delivery_price?: number;              // Settlement price
+  moneyness?: "ITM" | "ATM" | "OTM";   // Classification
+  intrinsic_value?: number;             // max(0, delivery - strike) for calls
+  moneyness_percentage?: number;        // % ITM/OTM
+}
+```
+
+### File Organization
+
+```
+data/parquet/
+├── BTC/
+│   ├── BTC-10AUG26-65000-C.parquet
+│   ├── BTC-10AUG26-65000-P.parquet
+│   └── ...
+├── ETH/
+│   ├── ETH-10AUG26-3000-C.parquet
+│   └── ...
+└── SOL/
+    └── ...
+```
+
+### Example Record
+
+```json
+{
+  "trade_id": "440015020",
+  "trade_seq": 185,
+  "instrument_name": "BTC-10AUG26-65000-C",
+  "timestamp": 1723273270387,
+  "price": 0.0024,
+  "amount": 0.4,
+  "direction": "buy",
+  "tick_direction": 1,
+  "index_price": 65150.66,
+  "mark_price": 0.00246951,
+  "implied_volatility": 19.06,
+  "strike": 65000,
+  "expiration_timestamp": 1723276800000,
+  "option_type": "call",
+  "time_to_expiry_years": 0.00014987,
+  "delta": 0.5504,
+  "gamma": 0.000026,
+  "vega": 3.1565,
+  "theta": -54990.58,
+  "theoretical_price": 6119.67,
+  "delivery_price": 65240.61,
+  "moneyness": "ATM",
+  "intrinsic_value": 240.61,
+  "moneyness_percentage": 0.37
+}
+```
+
+### Generation Process
+
+```bash
+# 1. Fetch trades (stored in JSONL)
+bun src/cli/index.ts fetch-all BTC
+
+# 2. Fetch delivery prices (stored in SQLite)
+# (done automatically by fetch-all)
+
+# 3. Merge to Parquet (compute Greeks + moneyness)
+bun src/cli/index.ts merge-to-parquet BTC
+```
+
+**What happens during merge:**
+1. Read trades from JSONL files
+2. For each trade with IV: compute Greeks using Black-76
+3. Join with delivery price from SQLite (by instrument + expiration)
+4. Calculate moneyness if delivery price exists
+5. Write enriched record to Parquet
+
+### Performance
+
+- **Generation:** ~1500-2000 trades/second
+- **Query speed:** 10-100x faster than JSONL
+- **Compression:** ~10x smaller than JSONL
+- **Deduplication:** Handled automatically
+
+### Querying Examples
+
+**DuckDB:**
+```sql
+-- High delta OTM calls (speculative trades)
+SELECT instrument_name, AVG(delta) as avg_delta, COUNT(*) as trades
+FROM 'data/parquet/BTC/*.parquet'
+WHERE option_type = 'call' AND moneyness = 'OTM' AND delta > 0.3
+GROUP BY instrument_name
+ORDER BY avg_delta DESC;
+```
+
+**Python (pandas):**
+```python
+import pandas as pd
+
+# Read all BTC options
+df = pd.read_parquet('data/parquet/BTC/')
+
+# Filter profitable ITM calls
+profitable = df[
+    (df['option_type'] == 'call') &
+    (df['moneyness'] == 'ITM') &
+    (df['intrinsic_value'] > 1000)
+]
+
+# Analyze Greeks distribution
+profitable[['delta', 'gamma', 'vega', 'theta']].describe()
+```
+
+### Regeneration
+
+Parquet files can be regenerated anytime from JSONL source:
+
+```bash
+# Remove old analytics
+rm -rf data/parquet/BTC/
+
+# Regenerate from JSONL
+bun src/cli/index.ts merge-to-parquet BTC
 ```
 
 ---

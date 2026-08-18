@@ -27,7 +27,8 @@ The Deribit Historical Data Pipeline follows a layered architecture with clear s
 │  └─────────────────────────────────────────────────────┘   │
 │  ┌─────────────────────────────────────────────────────┐   │
 │  │  Analytics                                          │   │
-│  │  • GreeksCalculator (Black-76 computations)         │   │
+│  │  • GreeksCalculator (deprecated - SQLite-based)     │   │
+│  │  • ParquetMerger    (JSONL → Parquet pipeline)     │   │
 │  └─────────────────────────────────────────────────────┘   │
 │  ┌─────────────────────────────────────────────────────┐   │
 │  │  Filters                                            │   │
@@ -55,15 +56,17 @@ The Deribit Historical Data Pipeline follows a layered architecture with clear s
 │  │  External I/O                                       │   │
 │  │  • deribit-client.ts  (HTTP + rate limiting)        │   │
 │  │  • database.ts        (SQLite operations)           │   │
-│  │  • jsonl-storage.ts   (file I/O)                    │   │
+│  │  • jsonl-storage.ts   (JSONL file I/O)              │   │
+│  │  • parquet-writer.ts  (Parquet enrichment)          │   │
 │  │  • rate-limiter.ts    (token bucket)                │   │
 │  └─────────────────────────────────────────────────────┘   │
 └────────────────────────┬────────────────────────────────────┘
                          │
                          ▼
 ┌─────────────────────────────────────────────────────────────┐
-│                      Storage                                │
-│  • data/jsonl/BTC/*.jsonl    (trade data, append-only)      │
+│                 Storage (Two-Layer)                         │
+│  • data/jsonl/BTC/*.jsonl    (source: crash-safe trades)    │
+│  • data/parquet/BTC/*.parquet (analytics: enriched data)    │
 │  • deribit-data.db           (metadata + checkpoints)       │
 └─────────────────────────────────────────────────────────────┘
 ```
@@ -109,10 +112,14 @@ The Deribit Historical Data Pipeline follows a layered architecture with clear s
   - Stores in `delivery_prices` table
 
 #### Analytics (`src/application/analytics/`)
-- **GreeksCalculator:** Computes Black-76 Greeks
-  - Reads trades from JSONL
-  - Applies domain functions
-  - Stores results in `greeks` table
+- **ParquetMerger:** Orchestrates JSONL → Parquet pipeline
+  - Coordinates ParquetWriter with database/storage
+  - Batch processing with date filtering
+  - Progress tracking and error handling
+
+- **GreeksCalculator (deprecated):** Legacy SQLite-based Greeks
+  - Previously computed Greeks to SQLite
+  - Replaced by on-the-fly computation during Parquet merge
 
 #### Filters (`src/application/filters/`)
 - **RiskFilters:** Greek-based filtering
@@ -174,6 +181,14 @@ The Deribit Historical Data Pipeline follows a layered architecture with clear s
 - Per-instrument JSONL files
 - Crash-safe flush operations
 - File handle management
+
+#### ParquetWriter (`parquet-writer.ts`)
+- Reads trades from JSONL
+- Computes Greeks on-the-fly (Black-76)
+- Joins with delivery prices
+- Calculates moneyness (ITM/ATM/OTM)
+- Writes enriched Parquet files
+- ~10x compression vs JSONL
 
 #### RateLimiter (`rate-limiter.ts`)
 - Token bucket algorithm

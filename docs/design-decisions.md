@@ -288,24 +288,36 @@ BTC-PERPETUAL (300M trades):
 - SQLite: ~30 GB
 ```
 
-### Conversion Strategy
+### Conversion Strategy ✅ IMPLEMENTED
 
-JSONL serves as the **source of truth**. Convert to Parquet for analytics:
+JSONL serves as the **source of truth**. Convert to Parquet for analytics using built-in pipeline:
 
 ```bash
-# Using DuckDB
-duckdb -c "
-  COPY (
-    SELECT DISTINCT ON (instrument_name, trade_seq) *
-    FROM read_json_auto('data/jsonl/**/*.jsonl')
-  ) TO 'trades.parquet' (FORMAT PARQUET, COMPRESSION ZSTD);
-"
+# Fetch trades to JSONL (source of truth)
+bun src/cli/index.ts fetch-all BTC
+
+# Convert to enriched Parquet (analytics)
+bun src/cli/index.ts merge-to-parquet BTC
 ```
+
+**How it works:**
+1. **Read** trades from JSONL files (one per instrument)
+2. **Compute** Greeks on-the-fly using Black-76 model
+3. **Join** with delivery prices from SQLite
+4. **Calculate** moneyness (ITM/ATM/OTM) at expiration
+5. **Write** enriched data to Parquet with full schema
+
+**Enrichment during merge:**
+- Delta, gamma, vega, theta (Black-76)
+- Moneyness classification (ITM/ATM/OTM)
+- Intrinsic value and percentage
+- Theoretical vs actual price comparison
 
 **Benefits of two-stage pipeline:**
 1. **Reliability:** JSONL ensures no data loss during fetch
-2. **Performance:** Parquet optimized for analytics
+2. **Performance:** Parquet optimized for analytics (10-100x faster)
 3. **Flexibility:** Can regenerate Parquet anytime from JSONL
+4. **Enrichment:** Greeks computed during merge (not pre-stored)
 
 ### Alternatives Considered
 
