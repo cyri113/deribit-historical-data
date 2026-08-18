@@ -338,5 +338,37 @@ describe("Black-76 Option Pricing", () => {
 
       expect(combined.delta).toBeCloseTo(individualDelta, 6);
     });
+
+    test("Volatility must be in decimal format, not percentage", () => {
+      // Common mistake: passing 80 instead of 0.8 for 80% volatility
+
+      // CORRECT: 80% volatility as 0.8 (decimal)
+      const correctVolatility = 0.8;
+      const correctResult = calculateGreeks(
+        50000, // forwardPrice
+        50000, // strike (ATM)
+        0.25,  // 3 months
+        correctVolatility,
+        "call"
+      );
+
+      // Theoretical price should be reasonable (thousands for BTC options)
+      expect(correctResult.price).toBeGreaterThan(1000);
+      expect(correctResult.price).toBeLessThan(10000);
+
+      // WRONG: 80% volatility as 80 (percentage) - would give absurd results
+      const wrongVolatility = 80; // This means 8000% volatility!
+      const wrongResult = calculateGreeks(
+        50000,
+        50000,
+        0.25,
+        wrongVolatility,
+        "call"
+      );
+
+      // This would give completely unrealistic values
+      expect(wrongResult.price).toBeGreaterThan(40000); // Absurdly high
+      expect(wrongResult.price / correctResult.price).toBeGreaterThan(5); // >5x difference
+    });
   });
 });

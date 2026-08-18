@@ -316,13 +316,13 @@ Each line in a JSONL file is a complete trade record:
   "trade_id": "ETH-12345-67890",
   "timestamp": 1692355200000,
   "tick_direction": 1,
-  "price": 62500.5,
-  "mark_price": 62501.0,
+  "price": 0.002,
+  "mark_price": 0.00195,
   "instrument_name": "BTC-27DEC24-60000-C",
   "index_price": 62000.0,
   "direction": "buy",
   "amount": 1.5,
-  "iv": 0.65
+  "iv": 65
 }
 ```
 
@@ -334,13 +334,41 @@ Each line in a JSONL file is a complete trade record:
 | `trade_id` | string | Unique trade identifier from Deribit |
 | `timestamp` | number | Unix milliseconds |
 | `tick_direction` | number | Price direction: 0=same, 1=up, 2=down, 3=zero-plus |
-| `price` | number | Execution price |
-| `mark_price` | number | Mark price at execution time |
+| `price` | number | Execution price (in BTC for BTC options) |
+| `mark_price` | number | Mark price at execution time (in BTC for BTC options) |
 | `instrument_name` | string | Full instrument name |
-| `index_price` | number | Underlying index/spot price |
+| `index_price` | number | Underlying index/spot price (in USD) |
 | `direction` | string | "buy" or "sell" |
 | `amount` | number | Contract quantity |
-| `iv` | number | Implied volatility (0-1 scale, e.g., 0.65 = 65%) |
+| `iv` | number | **Implied volatility in percentage format** (e.g., 65 = 65%) |
+
+⚠️ **Important: Implied Volatility Format**
+
+Deribit API returns implied volatility (`iv`) in **percentage format**:
+- `iv: 65` means **65% volatility**, not 0.65
+- `iv: 19.06` means **19.06% volatility**, not 0.1906
+- `iv: 80` means **80% volatility**, not 0.80
+
+When calculating Greeks using Black-76 formula, **the IV must be converted to decimal format by dividing by 100**:
+```typescript
+// CORRECT: Convert percentage to decimal
+const greeks = calculateGreeks(
+  trade.index_price,
+  strike,
+  timeToExpiry,
+  trade.iv / 100,  // 65 → 0.65 (65%)
+  optionType
+);
+
+// WRONG: Using percentage directly
+const greeks = calculateGreeks(
+  ...,
+  trade.iv,  // ❌ Would interpret 65 as 6500% volatility!
+  ...
+);
+```
+
+This conversion is handled automatically in `parquet-writer.ts` when enriching trades with Greeks.
 
 **Validation (Zod Schema):**
 ```typescript

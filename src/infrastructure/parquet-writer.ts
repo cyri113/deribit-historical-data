@@ -151,7 +151,7 @@ export class ParquetWriter {
           trade.index_price, // Forward price = index price for crypto
           strike,
           timeToExpiry,
-          trade.iv,
+          trade.iv / 100, // Convert percentage to decimal (e.g., 19.06% → 0.1906)
           optionType
         );
 
@@ -159,7 +159,8 @@ export class ParquetWriter {
         enriched.gamma = greeks.gamma;
         enriched.vega = greeks.vega;
         enriched.theta = greeks.theta;
-        enriched.theoretical_price = greeks.price;
+        // Convert theoretical price from USD to BTC (Deribit quotes options in BTC)
+        enriched.theoretical_price = greeks.price / trade.index_price;
       } catch (error) {
         // Greeks calculation failed (e.g., invalid inputs)
         enriched.delta = null;

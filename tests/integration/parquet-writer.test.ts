@@ -134,13 +134,27 @@ describe("ParquetWriter Integration Tests", () => {
     expect(firstRow.option_type).toBe("call");
     expect(firstRow.expiration_timestamp).toBeDefined();
 
-    // Verify: Greeks computed
+    // Verify: Greeks computed with realistic ranges
     expect(firstRow.delta).toBeDefined();
     expect(typeof firstRow.delta).toBe("number");
+    expect(firstRow.delta).toBeGreaterThan(0); // Calls have positive delta
+    expect(firstRow.delta).toBeLessThan(1); // Delta is between 0 and 1
+
     expect(firstRow.gamma).toBeDefined();
+    expect(firstRow.gamma).toBeGreaterThan(0); // Gamma is always positive
+
     expect(firstRow.vega).toBeDefined();
+    expect(firstRow.vega).toBeGreaterThan(0); // Vega is always positive
+
     expect(firstRow.theta).toBeDefined();
+    expect(firstRow.theta).toBeLessThan(0); // Theta is negative (time decay)
+    expect(firstRow.theta).toBeGreaterThan(-100); // Reasonable daily decay
+
     expect(firstRow.theoretical_price).toBeDefined();
+    expect(firstRow.theoretical_price).toBeGreaterThan(0);
+    // Theoretical price in BTC (2-year ATM option ~10% of underlying)
+    expect(firstRow.theoretical_price).toBeGreaterThan(0.05); // > 5% of 1 BTC
+    expect(firstRow.theoretical_price).toBeLessThan(0.20);   // < 20% of 1 BTC
 
     // Verify: Moneyness calculated
     expect(firstRow.delivery_price).toBe(65240.61);

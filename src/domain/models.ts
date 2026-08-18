@@ -15,7 +15,7 @@ export const DeribitTradeSchema = z.object({
   index_price: z.number(),
   direction: z.enum(["buy", "sell"]),
   amount: z.number(),
-  iv: z.number().nullish(), // Implied volatility
+  iv: z.number().nullish(), // Implied volatility (percentage format: 19.06 = 19.06%)
 });
 
 export const DeribitTradesResponseSchema = z.object({
