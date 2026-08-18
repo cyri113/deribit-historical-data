@@ -193,10 +193,17 @@ export class OptionFetcher {
 
   /**
    * Fetch all incomplete options for a currency
+   *
+   * @param currency - Base currency (e.g., "BTC", "ETH")
+   * @param onProgress - Optional progress callback
+   * @param minExpiration - Optional minimum expiration timestamp (ms)
+   * @param maxExpiration - Optional maximum expiration timestamp (ms)
    */
   async fetchAllOptions(
     currency: string,
-    onProgress?: (progress: OptionFetchProgress) => void
+    onProgress?: (progress: OptionFetchProgress) => void,
+    minExpiration?: number,
+    maxExpiration?: number
   ): Promise<{
     total: number;
     fetched: number;
@@ -205,12 +212,28 @@ export class OptionFetcher {
   }> {
     console.log(`\n━━━ Fetching ${currency} Options ━━━\n`);
 
-    // Get incomplete options from DB
-    const instrumentNames = this.database.getIncompleteOptions(currency);
+    // Get incomplete options from DB with optional date filtering
+    const instrumentNames = this.database.getIncompleteOptions(
+      currency,
+      minExpiration,
+      maxExpiration
+    );
 
     if (instrumentNames.length === 0) {
       console.log(`No incomplete options found. All done!`);
       return { total: 0, fetched: 0, completed: 0, totalTrades: 0 };
+    }
+
+    // Show date filter info if provided
+    if (minExpiration || maxExpiration) {
+      const formatDate = (ts: number) => new Date(ts).toISOString().split('T')[0];
+      if (minExpiration && maxExpiration) {
+        console.log(`Filtering: ${formatDate(minExpiration!)} to ${formatDate(maxExpiration!)}`);
+      } else if (minExpiration) {
+        console.log(`Filtering: expiring after ${formatDate(minExpiration!)}`);
+      } else if (maxExpiration) {
+        console.log(`Filtering: expiring before ${formatDate(maxExpiration!)}`);
+      }
     }
 
     console.log(`Found ${instrumentNames.length} incomplete options\n`);

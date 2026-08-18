@@ -994,18 +994,40 @@ export class Database {
 
   /**
    * Get all incomplete options
+   *
+   * @param currency - Base currency (e.g., "BTC", "ETH")
+   * @param minExpiration - Optional minimum expiration timestamp (ms) - only options expiring after this
+   * @param maxExpiration - Optional maximum expiration timestamp (ms) - only options expiring before this
    */
-  getIncompleteOptions(currency: string): string[] {
-    const stmt = this.db.prepare(`
+  getIncompleteOptions(
+    currency: string,
+    minExpiration?: number,
+    maxExpiration?: number
+  ): string[] {
+    let query = `
       SELECT i.instrument_name
       FROM instruments i
       LEFT JOIN option_progress op ON i.instrument_name = op.instrument_name
       WHERE i.base_currency = ?
         AND i.kind = 'option'
         AND (op.status IS NULL OR op.status != 'completed')
-    `);
+    `;
 
-    const rows = stmt.all(currency) as any[];
+    const params: any[] = [currency];
+
+    // Add expiration filters if provided
+    if (minExpiration !== undefined) {
+      query += ` AND (i.expiration_timestamp >= ? OR i.expiration_timestamp IS NULL)`;
+      params.push(minExpiration);
+    }
+
+    if (maxExpiration !== undefined) {
+      query += ` AND (i.expiration_timestamp <= ? OR i.expiration_timestamp IS NULL)`;
+      params.push(maxExpiration);
+    }
+
+    const stmt = this.db.prepare(query);
+    const rows = stmt.all(...params) as any[];
     return rows.map((row) => row.instrument_name);
   }
 

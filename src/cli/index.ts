@@ -41,6 +41,43 @@ function parseArgs(args: string[]): ParsedArgs {
   return { positional, flags };
 }
 
+/**
+ * Parse date string to Unix timestamp (milliseconds)
+ * Supports:
+ * - Relative: "3m" (3 months ago), "6m", "1y"
+ * - Absolute: "2024-01-01" (ISO date)
+ */
+function parseDate(dateStr: string): number {
+  // Relative date format: <number><unit>
+  const relativeMatch = dateStr.match(/^(\d+)([mdy])$/);
+  if (relativeMatch) {
+    const amount = parseInt(relativeMatch[1]!);
+    const unit = relativeMatch[2]!;
+
+    const now = Date.now();
+    const msPerDay = 24 * 60 * 60 * 1000;
+
+    switch (unit) {
+      case 'd': // days
+        return now - (amount * msPerDay);
+      case 'm': // months (approximate as 30 days)
+        return now - (amount * 30 * msPerDay);
+      case 'y': // years (approximate as 365 days)
+        return now - (amount * 365 * msPerDay);
+      default:
+        throw new Error(`Invalid date unit: ${unit}`);
+    }
+  }
+
+  // Absolute date format: ISO date string
+  const timestamp = Date.parse(dateStr);
+  if (isNaN(timestamp)) {
+    throw new Error(`Invalid date format: ${dateStr}. Use ISO date (2024-01-01) or relative (3m, 6m, 1y)`);
+  }
+
+  return timestamp;
+}
+
 function printHelp() {
   console.log(`
 Deribit Historical Data Fetcher (Seq-Based Architecture)
@@ -61,19 +98,26 @@ Commands:
       bun src/cli/index.ts fetch-instruments BTC --kind option
       bun src/cli/index.ts fetch-instruments ETH --kind future
 
-  fetch-trades <currency> [--kind <type>] [--concurrency <n>]
+  fetch-trades <currency> [--kind <type>] [--concurrency <n>] [--min-expiration <date>]
     Fetch trades using seq-based pagination
     Auto-detects futures (concurrent chunks) vs options (streaming)
 
     Options:
-      --kind <type>        Filter by: option, future (default: both)
-      --concurrency <n>    Parallel fetches (default: 3)
-      --chunk-size <n>     Chunk size (default: 10000)
+      --kind <type>           Filter by: option, future (default: both)
+      --concurrency <n>       Parallel fetches (default: 3)
+      --chunk-size <n>        Chunk size (default: 10000)
+      --min-expiration <date> Only fetch options expiring after date (e.g., 3m, 6m, 2024-01-01)
+      --max-expiration <date> Only fetch options expiring before date
+
+    Date formats:
+      Relative: 3d (3 days ago), 3m (3 months ago), 1y (1 year ago)
+      Absolute: 2024-01-01, 2024-06-15
 
     Examples:
       bun src/cli/index.ts fetch-trades BTC
       bun src/cli/index.ts fetch-trades BTC --kind future --concurrency 5
-      bun src/cli/index.ts fetch-trades ETH --kind option
+      bun src/cli/index.ts fetch-trades BTC --kind option --min-expiration 3m
+      bun src/cli/index.ts fetch-trades ETH --kind option --min-expiration 2024-01-01
 
   fetch-deliveries <index>... [--start-date <date>] [--end-date <date>]
     Fetch delivery (settlement) prices
@@ -86,13 +130,17 @@ Commands:
     Complete pipeline: instruments → trades → deliveries
 
     Options:
-      --kind <type>        Filter by: option, future (default: both)
-      --concurrency <n>    Parallel fetches (default: 3)
-      --skip-deliveries    Skip delivery price fetching
+      --kind <type>           Filter by: option, future (default: both)
+      --concurrency <n>       Parallel fetches (default: 3)
+      --skip-deliveries       Skip delivery price fetching
+      --min-expiration <date> Only fetch options expiring after date (e.g., 3m, 6m, 2024-01-01)
+      --max-expiration <date> Only fetch options expiring before date
 
     Examples:
       bun src/cli/index.ts fetch-all BTC
       bun src/cli/index.ts fetch-all ETH --kind option --concurrency 5
+      bun src/cli/index.ts fetch-all BTC --kind option --min-expiration 3m
+      bun src/cli/index.ts fetch-all BTC --min-expiration 2024-06-01 --max-expiration 2024-08-31
 
   stats [currency]
     Show download statistics
@@ -163,7 +211,7 @@ async function fetchTradesCommand(args: string[]) {
   const parsed = parseArgs(args);
 
   if (parsed.positional.length < 1) {
-    console.error("Usage: fetch-trades <currency> [--kind <type>] [--concurrency <n>]");
+    console.error("Usage: fetch-trades <currency> [--kind <type>] [--concurrency <n>] [--min-expiration <date>] [--max-expiration <date>]");
     process.exit(1);
   }
 
@@ -171,6 +219,28 @@ async function fetchTradesCommand(args: string[]) {
   const kindFilter = parsed.flags["kind"] as "option" | "future" | undefined;
   const concurrency = parsed.flags["concurrency"] ? parseInt(parsed.flags["concurrency"] as string) : 3;
   const chunkSize = parsed.flags["chunk-size"] ? parseInt(parsed.flags["chunk-size"] as string) : 10000;
+
+  // Parse expiration date filters
+  let minExpiration: number | undefined;
+  let maxExpiration: number | undefined;
+
+  if (parsed.flags["min-expiration"]) {
+    try {
+      minExpiration = parseDate(parsed.flags["min-expiration"] as string);
+    } catch (error) {
+      console.error(`Error parsing --min-expiration: ${(error as Error).message}`);
+      process.exit(1);
+    }
+  }
+
+  if (parsed.flags["max-expiration"]) {
+    try {
+      maxExpiration = parseDate(parsed.flags["max-expiration"] as string);
+    } catch (error) {
+      console.error(`Error parsing --max-expiration: ${(error as Error).message}`);
+      process.exit(1);
+    }
+  }
 
   const client = new DeribitClient();
   const database = new Database();
@@ -204,7 +274,12 @@ async function fetchTradesCommand(args: string[]) {
         concurrency,
       });
 
-      const optionResult = await optionFetcher.fetchAllOptions(currency);
+      const optionResult = await optionFetcher.fetchAllOptions(
+        currency,
+        undefined,
+        minExpiration,
+        maxExpiration
+      );
 
       console.log(`\n✓ Options: ${optionResult.totalTrades} trades from ${optionResult.fetched} instruments (${optionResult.completed} completed)\n`);
     }
@@ -255,7 +330,7 @@ async function fetchAllCommand(args: string[]) {
   const parsed = parseArgs(args);
 
   if (parsed.positional.length < 1) {
-    console.error("Usage: fetch-all <currency> [--kind <type>] [--concurrency <n>]");
+    console.error("Usage: fetch-all <currency> [--kind <type>] [--concurrency <n>] [--min-expiration <date>] [--max-expiration <date>]");
     process.exit(1);
   }
 
@@ -263,6 +338,8 @@ async function fetchAllCommand(args: string[]) {
   const kindFilter = parsed.flags["kind"] as "option" | "future" | undefined;
   const concurrency = parsed.flags["concurrency"] ? parseInt(parsed.flags["concurrency"] as string) : 3;
   const skipDeliveries = parsed.flags["skip-deliveries"] === true;
+  const minExpiration = parsed.flags["min-expiration"] as string | undefined;
+  const maxExpiration = parsed.flags["max-expiration"] as string | undefined;
 
   console.log(`\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`);
   console.log(`  Complete ${currency} Historical Data Fetch`);
@@ -276,7 +353,14 @@ async function fetchAllCommand(args: string[]) {
 
   // Step 2: Fetch trades
   console.log(`\n[2/3] Fetching trades...`);
-  await fetchTradesCommand([currency, ...(kindFilter ? [`--kind`, kindFilter] : []), `--concurrency`, String(concurrency)]);
+  const tradeArgs = [
+    currency,
+    ...(kindFilter ? [`--kind`, kindFilter] : []),
+    `--concurrency`, String(concurrency),
+    ...(minExpiration ? [`--min-expiration`, minExpiration] : []),
+    ...(maxExpiration ? [`--max-expiration`, maxExpiration] : []),
+  ];
+  await fetchTradesCommand(tradeArgs);
 
   // Step 3: Fetch deliveries
   if (!skipDeliveries) {
