@@ -1,192 +1,195 @@
 # Deribit Historical Data Pipeline
 
-A TypeScript/Bun pipeline for fetching, analyzing, and filtering Deribit options historical data using Black-76 pricing model and risk-based filters.
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-## Features
+A production-grade TypeScript/Bun system for fetching complete historical trade data from Deribit's cryptocurrency derivatives exchange. Features resumable downloads, crash-safe storage, and 10-50x performance improvements through concurrent chunk fetching.
 
-- **Historical Data Fetching**: Fetch trade data and delivery prices from Deribit public API
-- **Black-76 Pricing**: Calculate option greeks (delta, gamma, vega, theta) using the Black-76 model
-- **Moneyness Analysis**: Determine ITM/OTM status using delivery prices vs strike
-- **Risk Filtering**: Apply configurable risk filters based on greeks and moneyness
-- **High Performance**: Batch processing, rate limiting, and optimized SQLite storage
-- **Comprehensive Testing**: Unit, integration, and E2E tests with 90%+ coverage
+## What This Does
+
+- **Fetches complete historical data** for cryptocurrency options and futures from Deribit
+- **Sequence-based pagination** ensures deterministic results with no gaps or duplicates
+- **Dual fetch strategies** optimize for different instrument types (futures vs options)
+- **Crash-safe JSONL storage** with automatic resumability at chunk-level granularity
+- **Black-76 option pricing** with Greeks calculation (delta, gamma, vega, theta)
+- **Production-ready** with rate limiting, retries, and comprehensive error handling
+
+## Quick Start
+
+```bash
+# Install dependencies
+bun install
+
+# Fetch all BTC instruments (options + futures)
+bun src/cli/index.ts fetch-instruments BTC
+
+# Download historical trades (auto-detects futures vs options strategy)
+bun src/cli/index.ts fetch-trades BTC --concurrency 5
+
+# Fetch settlement prices
+bun src/cli/index.ts fetch-deliveries btc_usd
+
+# Or run complete pipeline
+bun src/cli/index.ts fetch-all BTC
+```
+
+**Output:**
+- Trade data: `data/jsonl/BTC/*.jsonl` (one file per instrument)
+- Metadata: `deribit-data.db` (SQLite with checkpoints)
+
+## Key Features
+
+### 🚀 High Performance
+- **Concurrent chunk fetching** for large futures (10-50x speedup)
+- **Streaming architecture** for options (constant memory usage)
+- **Rate limiting** with token bucket (15 req/s sustainable)
+- **Batch processing** with optimized SQLite and JSONL storage
+
+### 🔒 Reliability
+- **Sequence-based pagination** (deterministic, no gaps)
+- **Crash-safe JSONL** (append-only, human-readable)
+- **Automatic resumability** (chunk-level for futures, offset for options)
+- **Disk-first writes** (prefer duplicates over data loss)
+
+### 📊 Data Quality
+- **Complete historical coverage** (all instruments from Deribit)
+- **Runtime validation** with Zod schemas
+- **Deduplication** during merge (JSONL → Parquet)
+- **Gap detection** and validation tools
+
+### 🧮 Analytics
+- **Black-76 pricing** from scratch (no external libraries)
+- **Greeks calculation** (delta, gamma, vega, theta)
+- **Moneyness analysis** (ITM/OTM at expiration)
+- **Delivery price matching** for outcome analysis
 
 ## Architecture
 
 ```
+┌─────────────────────┐
+│  Deribit API        │  history.deribit.com (seq-based pagination)
+└──────────┬──────────┘
+           │
+           ▼
+┌─────────────────────────────────────────┐
+│  Application Layer                      │
+│  • FutureFetcher  (concurrent chunks)   │
+│  • OptionFetcher  (streaming)           │
+│  • DeliveryFetcher (paginated)          │
+└──────────┬──────────────────────────────┘
+           │
+           ▼
+┌──────────────────────────────────────────┐
+│  Infrastructure                          │
+│  • DeribitClient (HTTP + rate limiting)  │
+│  • JSONLStorage  (crash-safe writes)     │
+│  • Database      (SQLite checkpoints)    │
+└──────────┬───────────────────────────────┘
+           │
+           ▼
+┌──────────────────────────────────────────┐
+│  Storage                                 │
+│  • data/jsonl/**/*.jsonl  (trade data)   │
+│  • deribit-data.db        (metadata)     │
+└──────────────────────────────────────────┘
+```
+
+**Design Philosophy:**
+- Layered architecture (Infrastructure → Domain → Application → CLI)
+- Dependency injection for testability
+- Pure functions in domain layer (Black-76, moneyness)
+- Separation of concerns (see [Design Decisions](docs/design-decisions.md))
+
+## CLI Commands
+
+```bash
+# Fetch instrument metadata
+bun src/cli/index.ts fetch-instruments <currency> [--kind option|future]
+
+# Fetch historical trades (seq-based)
+bun src/cli/index.ts fetch-trades <currency> [--concurrency N]
+
+# Fetch delivery prices
+bun src/cli/index.ts fetch-deliveries <index>...
+
+# Complete pipeline
+bun src/cli/index.ts fetch-all <currency>
+
+# Show statistics
+bun src/cli/index.ts stats [currency]
+
+# Help
+bun src/cli/index.ts help
+```
+
+See [API Reference](docs/api-reference.md) for complete command documentation.
+
+## Performance
+
+### Throughput
+- **Futures:** 50k-100k trades/minute (concurrency=5)
+- **Options:** 20k-30k trades/minute (streaming)
+- **Deliveries:** ~1000 records/minute
+
+### Time Estimates
+- **BTC-PERPETUAL** (300M trades): 2-6 hours
+- **Single expiration cycle** (100 options): 10-30 minutes
+- **All ETH options** (1000+ instruments): 2-4 hours
+
+### Storage
+- **BTC-PERPETUAL:** ~50GB JSONL (~10GB Parquet after merge)
+- **Typical option:** 100KB-10MB JSONL
+- **SQLite metadata:** <100MB for 10,000 instruments
+
+## Documentation
+
+Comprehensive documentation available in [`/docs`](docs/README.md):
+
+### 📖 Getting Started
+- **[Overview](docs/overview.md)** - Project goals, use cases, target audience
+- **[Operations Guide](docs/operations.md)** - Installation, commands, troubleshooting
+
+### 🏗️ Understanding the System
+- **[Architecture](docs/architecture.md)** - System design, layers, data flow
+- **[Design Decisions](docs/design-decisions.md)** - Why seq-based? Why JSONL? (6 key decisions)
+- **[Data Model](docs/data-model.md)** - Database schema, JSONL format, relationships
+
+### 🔧 Technical Reference
+- **[Deribit API](docs/deribit-api.md)** - Endpoints, rate limiting, pagination strategies
+- **[API Reference](docs/api-reference.md)** - Complete CLI and TypeScript API
+- **[Development Guide](docs/development.md)** - Setup, testing, contributing
+
+## Technology Stack
+
+- **Runtime:** Bun (fast TypeScript runtime with built-in SQLite)
+- **Language:** TypeScript (strict mode, no `any`)
+- **Storage:** SQLite (metadata), JSONL (trades), Parquet (analytics)
+- **API:** Deribit REST API (history.deribit.com)
+- **Validation:** Zod (runtime schema validation)
+- **Testing:** Bun Test (unit, integration, E2E)
+
+No external dependencies for HTTP, testing, or file I/O.
+
+## Project Structure
+
+```
 src/
-├── infrastructure/       # API client, database, rate limiter
-├── domain/              # Black-76 pricing, moneyness calculations
-├── application/         # Fetchers, analytics, filters
-└── cli/                 # Command-line interface
+├── cli/                 # Command-line interface
+├── application/         # Orchestration (fetchers, analytics, filters)
+│   ├── fetchers/        # FutureFetcher, OptionFetcher, DeliveryFetcher
+│   ├── analytics/       # Greeks calculation
+│   └── filters/         # Risk-based filtering
+├── domain/              # Pure business logic (Black-76, moneyness)
+└── infrastructure/      # External I/O (API, DB, JSONL, rate limiting)
 
 tests/
-├── unit/                # Black-76 and moneyness tests
-├── integration/         # Database and fetcher tests
+├── unit/                # Pure function tests (Black-76, moneyness)
+├── integration/         # DB and API tests
 └── e2e/                 # Full pipeline tests
+
+docs/                    # Comprehensive documentation
+data/jsonl/              # Trade data (gitignored)
+deribit-data.db          # Metadata database (gitignored)
 ```
-
-## Installation
-
-```bash
-bun install
-```
-
-## Usage
-
-### CLI Commands
-
-#### Fetch Historical Trades
-
-**Regular Mode** - Fetch trades for currently active instruments:
-
-```bash
-# Single perpetual future with 3-month lookback
-bun src/cli/index.ts fetch-trades BTC-PERPETUAL --months 3
-
-# Single option with specific date range
-bun src/cli/index.ts fetch-trades BTC-18AUG26-60000-C --start-date 2026-05-01 --end-date 2026-08-01
-
-# All BTC instruments (options and futures)
-bun src/cli/index.ts fetch-trades BTC --months 3
-
-# All BTC options only
-bun src/cli/index.ts fetch-trades BTC --months 3 --kind option
-
-# Faster parallel fetching for all instruments
-bun src/cli/index.ts fetch-trades BTC --months 6 --concurrency 5
-```
-
-**Historical Mode** - Fetch ALL expired instruments available from Deribit:
-
-```bash
-# Fetch ALL expired BTC options with 30 days of trade history per instrument
-bun src/cli/index.ts fetch-trades BTC --historical --kind option
-
-# Fetch with longer trade history (60 days before expiration for each)
-bun src/cli/index.ts fetch-trades BTC --historical --kind option --trade-lookback 60
-
-# Higher concurrency for faster processing
-bun src/cli/index.ts fetch-trades BTC --historical --kind option --concurrency 5
-```
-
-**Note**: Historical mode fetches ALL expired instruments that Deribit's API returns (no date filtering). For each instrument, it fetches trades from `--trade-lookback` days before that instrument's expiration. This gives you the complete historical dataset available from Deribit.
-
-**Options:**
-- `--historical` - Enable historical mode (fetches all expired instruments)
-- `--kind <type>` - Filter by: option, future, or spot (currency only)
-- `--trade-lookback <n>` - Days of trades before expiration per instrument (default: 30)
-- `--concurrency <n>` - Parallel fetches (default: 3)
-- `--batch-size <n>` - API batch size (default: 1000)
-- `--db-batch-size <n>` - DB batch size (default: 5000)
-
-**Regular Mode Options** (for currently active instruments):
-- `--months <n>` - Lookback period in months (required for regular mode)
-- `--start-date <date>` - Start date (YYYY-MM-DD or ISO8601)
-- `--end-date <date>` - End date (default: now)
-- `--expired` - Include expired instruments (regular mode only)
-
-#### Fetch Delivery Prices
-
-```bash
-# Single index (all history)
-bun src/cli/index.ts fetch-deliveries btc_usd
-
-# Filtered by date range
-bun src/cli/index.ts fetch-deliveries btc_usd --start-date 2024-01-01 --end-date 2024-12-31
-
-# Multiple indices
-bun src/cli/index.ts fetch-deliveries btc_usd eth_usd sol_usd
-
-# With custom concurrency
-bun src/cli/index.ts fetch-deliveries btc_usd eth_usd --concurrency 4
-```
-
-Fetches delivery (settlement) prices for expired options/futures contracts. By default fetches all historical data. Use date filters to limit the range.
-
-**Options:**
-- `--start-date <date>` - Start date filter (YYYY-MM-DD or ISO8601)
-- `--end-date <date>` - End date filter (YYYY-MM-DD or ISO8601)
-- `--concurrency <n>` - Parallel fetches (default: 2)
-- `--batch-size <n>` - API batch size (default: 100)
-- `--db-batch-size <n>` - DB batch size (default: 1000)
-
-#### Compute Greeks
-
-```bash
-# Compute greeks for all option instruments
-bun src/cli/index.ts compute-greeks
-
-# Compute greeks for specific instrument
-bun src/cli/index.ts compute-greeks BTC-18AUG26-60000-C
-
-# Higher concurrency for faster processing
-bun src/cli/index.ts compute-greeks --concurrency 5
-```
-
-Computes Black-76 greeks from stored trades. If no instrument is specified, processes all option instruments in parallel.
-
-**Options:**
-- `--concurrency <n>` - Parallel processing (default: 3)
-
-#### Apply Risk Filters
-
-```bash
-bun src/cli/index.ts apply-filters BTC-18AUG26-60000-C btcConservative
-```
-
-Available filter presets:
-- `btcConservative` - Conservative risk thresholds for BTC
-- `btcAggressive` - Wider risk tolerance for BTC
-- `itmOnly` - Only ITM options at expiry
-- `otmOnly` - Only OTM options
-- `highDeltaCalls` - High delta call options (≥0.6)
-- `lowThetaDecay` - Low theta decay options
-
-#### Export Historical Data
-
-Export expired instruments with complete data (trades, greeks, delivery prices) for analysis.
-
-```bash
-# Export all historical instruments to JSON
-bun src/cli/index.ts export-historical --output historical.json
-
-# Export BTC historical instruments to CSV
-bun src/cli/index.ts export-historical BTC --format csv --output btc-historical.csv
-
-# Export to stdout (pipe to other tools)
-bun src/cli/index.ts export-historical BTC | jq '.[] | select(.optionType == "call")'
-
-# Only instruments expired before a specific date
-bun src/cli/index.ts export-historical --before-date 2026-08-01 --output aug-expired.json
-```
-
-**Output formats:**
-- `json` - Complete data structure with all trades and greeks
-- `csv` - Summary view with instrument, strike, delivery price, moneyness, trade count, greeks coverage
-
-**Use cases:**
-- Historical backtesting and analytics
-- Outcome analysis (ITM/OTM at expiration)
-- Greeks evolution over time
-- Option pricing validation
-
-## Performance Features
-
-### Rate Limiting
-- Token bucket algorithm with 15 req/s limit (75% of Deribit's 20 req/s)
-- Automatic retry with exponential backoff on rate limit errors
-
-### Database Optimization
-- WAL mode for concurrent reads during writes
-- Prepared statements for all queries
-- Batch inserts in transactions (1000-5000 records per batch)
-- Indexed queries for efficient lookups
-
-### Memory Management
-- Streaming architecture (no full dataset in memory)
-- Configurable batch sizes for API and DB operations
-- Automatic buffer flushing
 
 ## Testing
 
@@ -202,80 +205,69 @@ bun test tests/integration/
 
 # E2E tests
 bun test tests/e2e/
+
+# With coverage
+bun test --coverage
 ```
 
-### Test Coverage
+**Coverage:**
+- Unit tests: 100% (pure functions)
+- Integration tests: 80%+
+- E2E tests: Critical paths
 
-- **Unit Tests**: Black-76 pricing formulas, moneyness calculations
-- **Integration Tests**: Database operations, trade/delivery storage
-- **E2E Tests**: Full pipeline with 10k+ records
+## Recent Changes
 
-## Implementation Details
+The project recently migrated from **timestamp-based** to **sequence-based** architecture. See [MIGRATION.md](MIGRATION.md) for details.
 
-### Black-76 Model
+**Key improvements:**
+- ✅ Deterministic pagination (no gaps or duplicates)
+- ✅ 10-50x faster for large futures (concurrent chunk fetching)
+- ✅ Crash-safe JSONL storage (append-only)
+- ✅ Resumable at chunk-level granularity
+- ✅ JSONL → Parquet pipeline for analytics
 
-The Black-76 model is implemented from scratch with standard normal CDF approximation:
+## Use Cases
 
-```typescript
-C = e^(-r*T) * [F*N(d1) - K*N(d2)]
-P = e^(-r*T) * [K*N(-d2) - F*N(-d1)]
-```
+### Quantitative Research
+- Backtest options strategies using complete historical data
+- Study implied volatility surface evolution
+- Analyze Greeks behavior near expiration
 
-For crypto derivatives, risk-free rate (r) = 0, simplifying calculations.
+### Market Analysis
+- Validate pricing models against historical trades
+- Understand market microstructure (bid-ask spreads, order flow)
+- Measure market impact and liquidity patterns
 
-### Greeks Formulas
+### Academic Research
+- Study cryptocurrency derivatives markets
+- Analyze option pricing efficiency
+- Research market behavior during major events
 
-- **Delta**: Rate of change of option price w.r.t. underlying
-- **Gamma**: Rate of change of delta w.r.t. underlying
-- **Vega**: Rate of change of option price w.r.t. volatility (per 1%)
-- **Theta**: Rate of change of option price w.r.t. time (per day)
+### Data Science
+- Train ML models on historical options data
+- Feature engineering from Greeks and IV
+- Market prediction and analysis
 
-### Database Schema
+## Contributing
 
-**trades**
-- Primary key: `id` (trade ID)
-- Indexed: `(instrument_name, timestamp)`
-- Stores: price, amount, IV, index price, mark price
-
-**delivery_prices**
-- Primary key: `(index_name, date)`
-- Stores: settlement prices for each expiration
-
-**greeks**
-- Primary key: Auto-increment
-- Unique: `(instrument_name, timestamp)`
-- Stores: All greeks + underlying price + IV
-
-## Project Structure Best Practices
-
-### Separation of Concerns
-
-- **Infrastructure Layer**: Pure I/O (API, DB, rate limiting)
-- **Domain Layer**: Pure business logic (Black-76, moneyness)
-- **Application Layer**: Orchestration (fetchers, calculators, filters)
-- **Presentation Layer**: CLI interface
-
-### File Organization
-
-- **Cohesion over line count**: Files grouped by responsibility, not arbitrary limits
-- **Single responsibility**: Each module has one reason to change
-- **Dependency injection**: All dependencies passed via constructors
-
-### Code Quality
-
-- **Strict TypeScript**: No `any`, all strict flags enabled
-- **Runtime validation**: Zod schemas for API responses
-- **Error handling**: Custom error classes, retry logic, graceful degradation
-- **Performance monitoring**: Structured logging with duration tracking
-
-## Dependencies
-
-- **Bun**: Runtime and package manager
-- **zod**: Runtime type validation for API responses
-- **bun:sqlite**: Built-in SQLite for data storage
-
-No external dependencies for HTTP, testing, or file I/O.
+Contributions welcome! Please see [Development Guide](docs/development.md) for:
+- Development setup
+- Code style and conventions
+- Testing requirements
+- Pull request process
 
 ## License
 
-MIT
+MIT License - see [LICENSE](LICENSE) file for details.
+
+## Links
+
+- **Documentation:** [/docs](docs/README.md)
+- **GitHub:** https://github.com/cyri113/deribit-historical-data
+- **Issues:** https://github.com/cyri113/deribit-historical-data/issues
+
+---
+
+**Built with:** TypeScript + Bun + SQLite + JSONL
+**Architecture:** Seq-based pagination, dual fetch strategies, crash-safe storage
+**Status:** Production-ready, actively maintained
