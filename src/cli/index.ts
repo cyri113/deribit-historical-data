@@ -7,7 +7,7 @@ import { DeliveryFetcher } from "../application/fetchers/delivery-fetcher.ts";
 import { GreeksCalculator } from "../application/analytics/greeks-calculator.ts";
 import { RiskFilters, PresetFilters } from "../application/filters/risk-filters.ts";
 
-const COMMANDS = ["fetch-trades", "fetch-deliveries", "compute-greeks", "apply-filters", "help"] as const;
+const COMMANDS = ["fetch-trades", "fetch-deliveries", "compute-greeks", "apply-filters", "analyze-options", "export-historical", "help"] as const;
 type Command = typeof COMMANDS[number];
 
 // Argument parsing utilities
@@ -137,6 +137,50 @@ Commands:
 
     Example:
       bun src/cli/index.ts apply-filters BTC-18AUG26-60000-C btcConservative
+
+  analyze-options [instrument] [options]
+    Show complete analysis with trades, greeks, and delivery price
+    Demonstrates the associations: Instrument → Trades (1:many), Trade → Greeks (1:1),
+    Instrument → DeliveryPrice (1:1)
+
+    If no instrument specified, analyzes all option instruments in parallel.
+
+    Options:
+      --start-date <date>    Start date filter (YYYY-MM-DD or ISO8601)
+      --end-date <date>      End date filter (YYYY-MM-DD or ISO8601)
+      --concurrency <n>      Parallel processing (default: 3, for all instruments mode)
+
+    Examples:
+      # Single instrument with detailed output
+      bun src/cli/index.ts analyze-options BTC-18AUG26-60000-C
+
+      # All instruments with compact output
+      bun src/cli/index.ts analyze-options
+
+      # All instruments with higher concurrency
+      bun src/cli/index.ts analyze-options --concurrency 5
+
+  export-historical [underlying] [options]
+    Export historical (expired) instruments with complete data
+    Only includes instruments that have expired and have delivery prices
+
+    Options:
+      --format <type>        Output format: json or csv (default: json)
+      --output <path>        Output file path (default: stdout)
+      --before-date <date>   Only instruments expired before this date
+
+    Examples:
+      # Export all historical instruments to JSON
+      bun src/cli/index.ts export-historical --output historical.json
+
+      # Export BTC historical instruments to CSV
+      bun src/cli/index.ts export-historical BTC --format csv --output btc-historical.csv
+
+      # Export to stdout (pipe to other tools)
+      bun src/cli/index.ts export-historical BTC | jq '.[] | select(.optionType == "call")'
+
+      # Only instruments expired before a specific date
+      bun src/cli/index.ts export-historical --before-date 2026-08-01 --output aug-expired.json
 
   help
     Show this help message
@@ -562,6 +606,281 @@ async function applyFiltersCommand(args: string[]) {
   }
 }
 
+async function analyzeOptionsCommand(args: string[]) {
+  const { positional, flags } = parseArgs(args);
+
+  const startTimestamp = flags["start-date"] ? parseDate(flags["start-date"] as string) : undefined;
+  const endTimestamp = flags["end-date"] ? parseDate(flags["end-date"] as string) : undefined;
+
+  const database = new Database();
+
+  try {
+    // If specific instrument provided, analyze that one only with detailed output
+    if (positional.length > 0) {
+      const instrument = positional[0]!;
+      console.log(`Analyzing ${instrument}...`);
+
+      const analysis = database.getCompleteAnalysis(
+        instrument,
+        startTimestamp,
+        endTimestamp
+      );
+
+      console.log(`\nInstrument: ${analysis.instrumentName}`);
+
+      if (analysis.deliveryPrice) {
+        console.log(`\nDelivery Price (at expiration):`);
+        console.log(`  Date: ${new Date(analysis.deliveryPrice.date).toISOString()}`);
+        console.log(`  Price: ${analysis.deliveryPrice.deliveryPrice}`);
+      } else {
+        console.log(`\nDelivery Price: Not available (non-option or not expired)`);
+      }
+
+      console.log(`\nTrades: ${analysis.trades.length}`);
+
+      const tradesWithGreeks = analysis.trades.filter(t => t.greeks);
+      console.log(`Trades with Greeks: ${tradesWithGreeks.length}`);
+
+      if (analysis.trades.length > 0) {
+        console.log(`\nSample Trades (first 5):`);
+
+        for (const trade of analysis.trades.slice(0, 5)) {
+          console.log(`\n  Trade ID: ${trade.id}`);
+          console.log(`  Timestamp: ${new Date(trade.timestamp).toISOString()}`);
+          console.log(`  Price: ${trade.price}`);
+          console.log(`  Amount: ${trade.amount}`);
+          console.log(`  Direction: ${trade.direction}`);
+          console.log(`  Index Price: ${trade.indexPrice}`);
+
+          if (trade.greeks) {
+            console.log(`  Greeks:`);
+            console.log(`    Delta: ${trade.greeks.delta.toFixed(4)}`);
+            console.log(`    Gamma: ${trade.greeks.gamma.toFixed(6)}`);
+            console.log(`    Vega: ${trade.greeks.vega.toFixed(4)}`);
+            console.log(`    Theta: ${trade.greeks.theta.toFixed(4)}`);
+          } else {
+            console.log(`  Greeks: Not calculated`);
+          }
+        }
+      }
+
+      console.log(`\nSummary:`);
+      console.log(`  Total trades: ${analysis.trades.length}`);
+      console.log(`  Trades with greeks: ${tradesWithGreeks.length}`);
+      console.log(`  Coverage: ${analysis.trades.length > 0 ? ((tradesWithGreeks.length / analysis.trades.length) * 100).toFixed(2) : 0}%`);
+    } else {
+      // Analyze all instruments with compact output
+      console.log(`Analyzing all instruments...`);
+
+      const instruments = database.getDistinctInstruments();
+
+      // Filter to only option instruments
+      const optionInstruments = instruments.filter((name) => {
+        const parts = name.split("-");
+        return parts.length === 4; // BTC-DATE-STRIKE-TYPE format
+      });
+
+      if (optionInstruments.length === 0) {
+        console.log("No option instruments found with trade data.");
+        return;
+      }
+
+      console.log(`Found ${optionInstruments.length} option instruments\n`);
+
+      const concurrency = flags["concurrency"]
+        ? parseInt(flags["concurrency"] as string)
+        : 3;
+
+      let totalTrades = 0;
+      let totalTradesWithGreeks = 0;
+      let totalInstrumentsWithDelivery = 0;
+      let successCount = 0;
+      let failCount = 0;
+      const startTime = Date.now();
+
+      // Process in parallel batches
+      for (let i = 0; i < optionInstruments.length; i += concurrency) {
+        const batch = optionInstruments.slice(i, i + concurrency);
+
+        const promises = batch.map(async (instrument) => {
+          try {
+            const analysis = database.getCompleteAnalysis(
+              instrument,
+              startTimestamp,
+              endTimestamp
+            );
+
+            const tradesWithGreeks = analysis.trades.filter(t => t.greeks);
+            const coverage = analysis.trades.length > 0
+              ? ((tradesWithGreeks.length / analysis.trades.length) * 100).toFixed(0)
+              : 0;
+
+            console.log(
+              `[${i + batch.indexOf(instrument) + 1}/${optionInstruments.length}] ${instrument}: ${analysis.trades.length} trades, ${coverage}% greeks coverage${analysis.deliveryPrice ? ', has delivery' : ''}`
+            );
+
+            return {
+              success: true,
+              trades: analysis.trades.length,
+              tradesWithGreeks: tradesWithGreeks.length,
+              hasDelivery: analysis.deliveryPrice !== null,
+            };
+          } catch (error) {
+            console.error(`[${i + batch.indexOf(instrument) + 1}/${optionInstruments.length}] ${instrument}: Error - ${error}`);
+            return { success: false, trades: 0, tradesWithGreeks: 0, hasDelivery: false };
+          }
+        });
+
+        const results = await Promise.all(promises);
+
+        for (const result of results) {
+          if (result.success) {
+            successCount++;
+            totalTrades += result.trades;
+            totalTradesWithGreeks += result.tradesWithGreeks;
+            if (result.hasDelivery) totalInstrumentsWithDelivery++;
+          } else {
+            failCount++;
+          }
+        }
+      }
+
+      const endTime = Date.now();
+      const duration = ((endTime - startTime) / 1000).toFixed(2);
+
+      console.log(`\n=== Analysis Complete ===`);
+      console.log(`Duration: ${duration}s`);
+      console.log(`Instruments analyzed: ${successCount}`);
+      console.log(`Instruments failed: ${failCount}`);
+      console.log(`Total trades: ${totalTrades}`);
+      console.log(`Trades with greeks: ${totalTradesWithGreeks}`);
+      console.log(`Overall greeks coverage: ${totalTrades > 0 ? ((totalTradesWithGreeks / totalTrades) * 100).toFixed(2) : 0}%`);
+      console.log(`Instruments with delivery prices: ${totalInstrumentsWithDelivery}`);
+    }
+  } finally {
+    database.close();
+  }
+}
+
+async function exportHistoricalCommand(args: string[]) {
+  const { positional, flags } = parseArgs(args);
+
+  const underlying = positional.length > 0 ? positional[0] : undefined;
+  const format = flags["format"] ? (flags["format"] as string) : "json";
+  const outputPath = flags["output"] ? (flags["output"] as string) : undefined;
+  const beforeDate = flags["before-date"] ? parseDate(flags["before-date"] as string) : undefined;
+
+  if (!["json", "csv"].includes(format)) {
+    console.error(`Invalid format: ${format}. Supported formats: json, csv`);
+    process.exit(1);
+  }
+
+  const database = new Database();
+
+  try {
+    console.log(`Fetching historical ${underlying || "all"} instruments...`);
+    const startTime = Date.now();
+
+    const data = database.getHistoricalInstrumentsWithData(underlying, beforeDate);
+
+    const endTime = Date.now();
+    const duration = ((endTime - startTime) / 1000).toFixed(2);
+
+    console.log(`\nFound ${data.length} expired instruments with complete data`);
+    console.log(`Fetch time: ${duration}s`);
+
+    if (data.length === 0) {
+      console.log("\nNo historical data found. Make sure you have:");
+      console.log("1. Fetched trades for expired instruments");
+      console.log("2. Fetched delivery prices");
+      console.log("3. Computed greeks");
+      return;
+    }
+
+    // Calculate statistics
+    const totalTrades = data.reduce((sum, inst) => sum + inst.trades.length, 0);
+    const totalTradesWithGreeks = data.reduce(
+      (sum, inst) => sum + inst.trades.filter((t) => t.greeks).length,
+      0
+    );
+    const greeksCoverage = totalTrades > 0 ? ((totalTradesWithGreeks / totalTrades) * 100).toFixed(2) : "0.00";
+
+    console.log(`\nStatistics:`);
+    console.log(`  Total instruments: ${data.length}`);
+    console.log(`  Total trades: ${totalTrades}`);
+    console.log(`  Trades with greeks: ${totalTradesWithGreeks}`);
+    console.log(`  Greeks coverage: ${greeksCoverage}%`);
+    console.log(`  Date range: ${new Date(data[data.length - 1]!.expiration).toISOString()} to ${new Date(data[0]!.expiration).toISOString()}`);
+
+    // Export data
+    if (format === "json") {
+      const jsonOutput = JSON.stringify(data, null, 2);
+
+      if (outputPath) {
+        await Bun.write(outputPath, jsonOutput);
+        console.log(`\nExported to ${outputPath}`);
+      } else {
+        console.log("\n" + jsonOutput);
+      }
+    } else if (format === "csv") {
+      // Flatten data for CSV export
+      const csvRows: string[] = [];
+
+      // Header
+      csvRows.push([
+        "instrument_name",
+        "strike",
+        "expiration",
+        "option_type",
+        "delivery_price",
+        "moneyness",
+        "trade_count",
+        "greeks_coverage",
+      ].join(","));
+
+      // Data rows
+      for (const inst of data) {
+        const tradesWithGreeks = inst.trades.filter((t) => t.greeks).length;
+        const coverage = inst.trades.length > 0
+          ? ((tradesWithGreeks / inst.trades.length) * 100).toFixed(2)
+          : "0.00";
+
+        // Calculate moneyness
+        const deliveryPrice = inst.deliveryPrice.deliveryPrice;
+        const strike = inst.strike;
+        let moneyness = "ATM";
+        if (inst.optionType === "call") {
+          moneyness = deliveryPrice > strike ? "ITM" : deliveryPrice < strike ? "OTM" : "ATM";
+        } else {
+          moneyness = deliveryPrice < strike ? "ITM" : deliveryPrice > strike ? "OTM" : "ATM";
+        }
+
+        csvRows.push([
+          inst.instrumentName,
+          inst.strike.toString(),
+          new Date(inst.expiration).toISOString(),
+          inst.optionType,
+          inst.deliveryPrice.deliveryPrice.toString(),
+          moneyness,
+          inst.trades.length.toString(),
+          coverage,
+        ].join(","));
+      }
+
+      const csvOutput = csvRows.join("\n");
+
+      if (outputPath) {
+        await Bun.write(outputPath, csvOutput);
+        console.log(`\nExported to ${outputPath}`);
+      } else {
+        console.log("\n" + csvOutput);
+      }
+    }
+  } finally {
+    database.close();
+  }
+}
+
 async function main() {
   const args = process.argv.slice(2);
 
@@ -585,6 +904,12 @@ async function main() {
       break;
     case "apply-filters":
       await applyFiltersCommand(commandArgs);
+      break;
+    case "analyze-options":
+      await analyzeOptionsCommand(commandArgs);
+      break;
+    case "export-historical":
+      await exportHistoricalCommand(commandArgs);
       break;
     case "help":
       printHelp();

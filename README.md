@@ -122,6 +122,34 @@ Available filter presets:
 - `highDeltaCalls` - High delta call options (≥0.6)
 - `lowThetaDecay` - Low theta decay options
 
+#### Export Historical Data
+
+Export expired instruments with complete data (trades, greeks, delivery prices) for analysis.
+
+```bash
+# Export all historical instruments to JSON
+bun src/cli/index.ts export-historical --output historical.json
+
+# Export BTC historical instruments to CSV
+bun src/cli/index.ts export-historical BTC --format csv --output btc-historical.csv
+
+# Export to stdout (pipe to other tools)
+bun src/cli/index.ts export-historical BTC | jq '.[] | select(.optionType == "call")'
+
+# Only instruments expired before a specific date
+bun src/cli/index.ts export-historical --before-date 2026-08-01 --output aug-expired.json
+```
+
+**Output formats:**
+- `json` - Complete data structure with all trades and greeks
+- `csv` - Summary view with instrument, strike, delivery price, moneyness, trade count, greeks coverage
+
+**Use cases:**
+- Historical backtesting and analytics
+- Outcome analysis (ITM/OTM at expiration)
+- Greeks evolution over time
+- Option pricing validation
+
 ## Performance Features
 
 ### Rate Limiting
