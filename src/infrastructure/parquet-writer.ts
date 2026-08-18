@@ -235,8 +235,9 @@ export class ParquetWriter {
     }
 
     // Get delivery price (if expired)
-    const indexName = `${instrument.underlying.toLowerCase()}_usd`;
-    const deliveryPrice = this.database.getDeliveryPrice(indexName, instrument.expiration)?.deliveryPrice;
+    // Use getDeliveryPriceForInstrument which handles date normalization
+    // (options expire at 08:00 UTC but delivery prices are stored at midnight UTC)
+    const deliveryPrice = this.database.getDeliveryPriceForInstrument(instrumentName)?.deliveryPrice;
 
     // Create output file
     const outputPath = this.getOutputPath(instrumentName);
