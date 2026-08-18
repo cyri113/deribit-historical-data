@@ -146,51 +146,6 @@ export class DeribitClient {
   }
 
   /**
-   * Fetch historical trades for an instrument within a time range
-   *
-   * @param instrumentName - e.g., "BTC-29MAR24-50000-C"
-   * @param startTimestamp - Start time in milliseconds
-   * @param endTimestamp - End time in milliseconds
-   * @param count - Max number of trades to return (default 1000)
-   * @returns Array of trades and hasMore flag
-   */
-  async getLastTradesByInstrumentAndTime(
-    instrumentName: string,
-    startTimestamp: number,
-    endTimestamp: number,
-    count: number = 1000
-  ): Promise<{ trades: DeribitTrade[]; hasMore: boolean }> {
-    // Wait for rate limiter
-    await this.rateLimiter.acquire();
-
-    // Build query params
-    const params = new URLSearchParams({
-      instrument_name: instrumentName,
-      start_timestamp: String(startTimestamp),
-      end_timestamp: String(endTimestamp),
-      count: String(count),
-    });
-
-    const url = `${this.baseUrl}/public/get_last_trades_by_instrument_and_time?${params}`;
-
-    const response = await fetch(url);
-
-    if (!response.ok) {
-      throw new DeribitAPIError(
-        `HTTP error: ${response.status} ${response.statusText}`,
-        response.status
-      );
-    }
-
-    const data = await response.json();
-    const validated = DeribitTradesResponseSchema.parse(data);
-    return {
-      trades: validated.result.trades,
-      hasMore: validated.result.has_more,
-    };
-  }
-
-  /**
    * Fetch historical delivery prices for an index
    *
    * @param indexName - e.g., "btc_usd"
@@ -263,43 +218,6 @@ export class DeribitClient {
   }
 
   /**
-   * Fetch all trades for an instrument in a time range (handles pagination)
-   *
-   * @param instrumentName - e.g., "BTC-29MAR24-50000-C"
-   * @param startTimestamp - Start time in milliseconds
-   * @param endTimestamp - End time in milliseconds
-   * @param batchSize - Trades per request (default 1000)
-   * @returns Generator yielding batches of trades
-   */
-  async *getAllTrades(
-    instrumentName: string,
-    startTimestamp: number,
-    endTimestamp: number,
-    batchSize: number = 1000
-  ): AsyncGenerator<DeribitTrade[]> {
-    let currentStart = startTimestamp;
-    let hasMore = true;
-
-    while (hasMore && currentStart < endTimestamp) {
-      const { trades, hasMore: more } =
-        await this.getLastTradesByInstrumentAndTime(
-          instrumentName,
-          currentStart,
-          endTimestamp,
-          batchSize
-        );
-
-      if (trades.length > 0) {
-        yield trades;
-        // Update start to last trade timestamp + 1
-        currentStart = trades[trades.length - 1]!.timestamp + 1;
-      }
-
-      hasMore = more;
-    }
-  }
-
-  /**
    * Fetch all instruments for a currency
    *
    * @param currency - e.g., "BTC", "ETH"
@@ -325,7 +243,7 @@ export class DeribitClient {
       params.set("kind", kind);
     }
 
-    const url = `${this.baseUrl}/public/get_instruments?${params}`;
+    const url = `${this.historyBaseUrl}/public/get_instruments?${params}`;
 
     const response = await fetch(url);
 
