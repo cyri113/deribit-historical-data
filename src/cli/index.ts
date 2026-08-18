@@ -7,7 +7,7 @@ import { DeliveryFetcher } from "../application/fetchers/delivery-fetcher.ts";
 import { GreeksCalculator } from "../application/analytics/greeks-calculator.ts";
 import { RiskFilters, PresetFilters } from "../application/filters/risk-filters.ts";
 
-const COMMANDS = ["fetch-trades", "fetch-deliveries", "compute-greeks", "apply-filters", "analyze-options", "export-historical", "help"] as const;
+const COMMANDS = ["fetch-all", "fetch-trades", "fetch-deliveries", "compute-greeks", "apply-filters", "analyze-options", "export-historical", "help"] as const;
 type Command = typeof COMMANDS[number];
 
 // Argument parsing utilities
@@ -62,6 +62,31 @@ Deribit Historical Data Pipeline
 Usage: bun src/cli/index.ts <command> [options]
 
 Commands:
+
+  fetch-all <asset> [options]
+    Download complete historical data for an asset (instruments, trades, deliveries, greeks)
+    Uses checkpoints for resumable downloads - if interrupted, re-run to resume
+
+    Options:
+      --kind <type>          Filter by: option, future, or spot (default: option)
+      --trade-lookback <n>   Days of trades before expiration (default: 30)
+      --concurrency <n>      Parallel fetches (default: 3)
+      --skip-greeks          Skip Greeks computation
+      --batch-size <n>       API batch size (default: 1000)
+      --db-batch-size <n>    DB batch size (default: 5000)
+
+    Examples:
+      # Download all BTC option history (one simple command!)
+      bun src/cli/index.ts fetch-all BTC
+
+      # With custom lookback and concurrency
+      bun src/cli/index.ts fetch-all BTC --trade-lookback 60 --concurrency 5
+
+      # If interrupted, just re-run - it will resume from checkpoints
+      bun src/cli/index.ts fetch-all BTC
+
+      # Download futures instead of options
+      bun src/cli/index.ts fetch-all BTC --kind future
 
   fetch-trades <instrument-or-currency> [options]
     Fetch historical trades for one or more instruments
@@ -971,6 +996,261 @@ async function exportHistoricalCommand(args: string[]) {
   }
 }
 
+async function fetchAllCommand(args: string[]) {
+  const parsed = parseArgs(args);
+
+  if (parsed.positional.length < 1) {
+    console.error("Usage: fetch-all <asset> [options]");
+    console.error("Example: fetch-all BTC");
+    console.error("Run 'bun src/cli/index.ts help' for more information");
+    process.exit(1);
+  }
+
+  const asset = parsed.positional[0]!.toUpperCase();
+
+  if (!isCurrencyCode(asset)) {
+    console.error(`Error: ${asset} does not appear to be a valid currency code (e.g., BTC, ETH, SOL)`);
+    process.exit(1);
+  }
+
+  // Parse flags
+  const kind = (parsed.flags["kind"] as "option" | "future" | "spot" | undefined) ?? "option";
+  if (!["option", "future", "spot"].includes(kind)) {
+    console.error("Error: --kind must be one of: option, future, spot");
+    process.exit(1);
+  }
+
+  const tradeLookbackDays = parsed.flags["trade-lookback"]
+    ? parseInt(parsed.flags["trade-lookback"] as string)
+    : 30;
+  const concurrency = parsed.flags["concurrency"]
+    ? parseInt(parsed.flags["concurrency"] as string)
+    : 3;
+  const skipGreeks = parsed.flags["skip-greeks"] === true;
+  const batchSize = parsed.flags["batch-size"]
+    ? parseInt(parsed.flags["batch-size"] as string)
+    : 1000;
+  const dbBatchSize = parsed.flags["db-batch-size"]
+    ? parseInt(parsed.flags["db-batch-size"] as string)
+    : 5000;
+
+  const client = new DeribitClient();
+  const database = new Database();
+  const tradeFetcher = new TradeFetcher({
+    client,
+    database,
+    batchSize,
+    dbBatchSize,
+  });
+  const deliveryFetcher = new DeliveryFetcher({
+    client,
+    database,
+    batchSize: 100,
+    dbBatchSize: 1000,
+  });
+  const greeksCalculator = new GreeksCalculator({ database });
+
+  console.log(`\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`);
+  console.log(`  Downloading Complete ${asset} ${kind.toUpperCase()} History`);
+  console.log(`━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`);
+
+  try {
+    const overallStartTime = Date.now();
+
+    // ========================================
+    // STEP 1: Fetch instruments
+    // ========================================
+    console.log(`[1/4] Fetching ${asset} ${kind} instruments...`);
+    const instruments = await client.getInstruments(asset, kind, true);
+
+    if (instruments.length === 0) {
+      console.log(`\n❌ No expired ${kind} instruments found for ${asset}`);
+      return;
+    }
+
+    console.log(`✓ Found ${instruments.length} expired instruments\n`);
+
+    // ========================================
+    // STEP 2: Fetch trades with checkpoint resume
+    // ========================================
+    console.log(`[2/4] Fetching trades for ${instruments.length} instruments...`);
+    console.log(`      Trade lookback: ${tradeLookbackDays} days before expiration`);
+    console.log(`      Concurrency: ${concurrency}\n`);
+
+    let totalTrades = 0;
+    let instrumentsProcessed = 0;
+    let instrumentsSkipped = 0;
+    let instrumentsFailed = 0;
+
+    const tradesStartTime = Date.now();
+
+    // Process in batches with concurrency
+    for (let i = 0; i < instruments.length; i += concurrency) {
+      const batch = instruments.slice(i, i + concurrency);
+
+      const promises = batch.map(async (inst) => {
+        try {
+          // Check if this instrument is already completed via checkpoint
+          const checkpoint = database.checkpoints.getLastCheckpoint(inst.instrument_name);
+          if (checkpoint && checkpoint.status === "completed") {
+            console.log(
+              `  [${i + batch.indexOf(inst) + 1}/${instruments.length}] ⏭️  ${inst.instrument_name} - already completed (checkpoint)`
+            );
+            instrumentsSkipped++;
+            return { success: true, trades: 0, skipped: true };
+          }
+
+          const expiration = inst.expiration_timestamp!;
+          const tradeStart = expiration - (tradeLookbackDays * 24 * 60 * 60 * 1000);
+          const tradeEnd = expiration;
+
+          console.log(
+            `  [${i + batch.indexOf(inst) + 1}/${instruments.length}] 📥 ${inst.instrument_name} - fetching...`
+          );
+
+          const progress = await tradeFetcher.fetchTrades(
+            inst.instrument_name,
+            tradeStart,
+            tradeEnd
+          );
+
+          // Mark as completed in checkpoint
+          database.checkpoints.markInstrumentComplete(
+            inst.instrument_name,
+            progress.totalTrades,
+            tradeEnd
+          );
+
+          console.log(
+            `  [${i + batch.indexOf(inst) + 1}/${instruments.length}] ✓ ${inst.instrument_name} - ${progress.totalTrades} trades`
+          );
+
+          instrumentsProcessed++;
+          return { success: true, trades: progress.totalTrades, skipped: false };
+        } catch (error) {
+          console.error(
+            `  [${i + batch.indexOf(inst) + 1}/${instruments.length}] ✗ ${inst.instrument_name} - ${error instanceof Error ? error.message : String(error)}`
+          );
+          instrumentsFailed++;
+          return { success: false, trades: 0, skipped: false };
+        }
+      });
+
+      const results = await Promise.all(promises);
+      totalTrades += results.reduce((sum, r) => sum + r.trades, 0);
+    }
+
+    const tradesDuration = ((Date.now() - tradesStartTime) / 1000).toFixed(2);
+
+    console.log(`\n  📊 Trades Summary:`);
+    console.log(`     Total trades: ${totalTrades}`);
+    console.log(`     Instruments processed: ${instrumentsProcessed}`);
+    console.log(`     Instruments skipped (checkpoint): ${instrumentsSkipped}`);
+    console.log(`     Instruments failed: ${instrumentsFailed}`);
+    console.log(`     Duration: ${tradesDuration}s\n`);
+
+    // ========================================
+    // STEP 3: Fetch delivery prices
+    // ========================================
+    console.log(`[3/4] Fetching delivery prices...`);
+
+    // Determine the index name (e.g., btc_usd from BTC)
+    const indexName = `${asset.toLowerCase()}_usd`;
+
+    console.log(`      Index: ${indexName}\n`);
+
+    const deliveryStartTime = Date.now();
+
+    try {
+      const deliveryProgress = await deliveryFetcher.fetchDeliveryPrices(indexName);
+      const deliveryDuration = ((Date.now() - deliveryStartTime) / 1000).toFixed(2);
+
+      console.log(`  ✓ Fetched ${deliveryProgress.totalRecords} delivery prices`);
+      console.log(`  Duration: ${deliveryDuration}s\n`);
+    } catch (error) {
+      console.error(`  ✗ Failed to fetch delivery prices: ${error instanceof Error ? error.message : String(error)}\n`);
+    }
+
+    // ========================================
+    // STEP 4: Compute Greeks (optional)
+    // ========================================
+    if (skipGreeks) {
+      console.log(`[4/4] Skipping Greeks computation (--skip-greeks)\n`);
+    } else {
+      console.log(`[4/4] Computing Greeks...`);
+      console.log(`      Concurrency: ${concurrency}\n`);
+
+      const greeksStartTime = Date.now();
+      let totalGreeksCalculated = 0;
+      let greeksSuccessCount = 0;
+      let greeksFailCount = 0;
+
+      // Get all instruments with trades (filter to options only)
+      const instrumentsWithTrades = instruments
+        .filter((inst) => {
+          const parts = inst.instrument_name.split("-");
+          return parts.length === 4; // BTC-DATE-STRIKE-TYPE format
+        })
+        .map((inst) => inst.instrument_name);
+
+      if (instrumentsWithTrades.length === 0) {
+        console.log(`  ⚠️  No option instruments found for Greeks computation\n`);
+      } else {
+        // Process in parallel batches
+        for (let i = 0; i < instrumentsWithTrades.length; i += concurrency) {
+          const batch = instrumentsWithTrades.slice(i, i + concurrency);
+
+          const promises = batch.map(async (instrument) => {
+            try {
+              const progress = await greeksCalculator.calculateForInstrument(instrument);
+              greeksSuccessCount++;
+              totalGreeksCalculated += progress.totalCalculated;
+              console.log(
+                `  [${i + batch.indexOf(instrument) + 1}/${instrumentsWithTrades.length}] ✓ ${instrument} - ${progress.totalCalculated} greeks`
+              );
+            } catch (error) {
+              greeksFailCount++;
+              console.error(
+                `  [${i + batch.indexOf(instrument) + 1}/${instrumentsWithTrades.length}] ✗ ${instrument} - ${error instanceof Error ? error.message : String(error)}`
+              );
+            }
+          });
+
+          await Promise.all(promises);
+        }
+
+        const greeksDuration = ((Date.now() - greeksStartTime) / 1000).toFixed(2);
+
+        console.log(`\n  📊 Greeks Summary:`);
+        console.log(`     Total greeks: ${totalGreeksCalculated}`);
+        console.log(`     Instruments processed: ${greeksSuccessCount}`);
+        console.log(`     Instruments failed: ${greeksFailCount}`);
+        console.log(`     Duration: ${greeksDuration}s\n`);
+      }
+    }
+
+    // ========================================
+    // FINAL SUMMARY
+    // ========================================
+    const overallDuration = ((Date.now() - overallStartTime) / 1000).toFixed(2);
+
+    console.log(`━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`);
+    console.log(`  ✅ Download Complete!`);
+    console.log(`━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`);
+    console.log(`\n📈 Overall Summary:`);
+    console.log(`   Total duration: ${overallDuration}s`);
+    console.log(`   Instruments: ${instruments.length}`);
+    console.log(`   Trades: ${totalTrades}`);
+    console.log(`\n💡 Next Steps:`);
+    console.log(`   • Analyze options: bun src/cli/index.ts analyze-options`);
+    console.log(`   • Export data: bun src/cli/index.ts export-historical ${asset} --format csv`);
+    console.log(`   • Apply filters: bun src/cli/index.ts apply-filters <instrument> btcConservative\n`);
+
+  } finally {
+    database.close();
+  }
+}
+
 async function main() {
   const args = process.argv.slice(2);
 
@@ -983,6 +1263,9 @@ async function main() {
   const commandArgs = args.slice(1);
 
   switch (command) {
+    case "fetch-all":
+      await fetchAllCommand(commandArgs);
+      break;
     case "fetch-trades":
       await fetchTradesCommand(commandArgs);
       break;
