@@ -38,3 +38,15 @@ data/
 *.db
 *.db-shm
 *.db-wal
+
+# Exported data files (CSV, JSON outputs)
+*.csv
+historical*.json
+btc-*.json
+eth-*.json
+sol-*.json
+
+# Keep config files
+!package.json
+!tsconfig.json
+!.claude/**/*.json
