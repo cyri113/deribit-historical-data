@@ -10,7 +10,8 @@ A production-grade TypeScript/Bun system for fetching complete historical trade 
 - **Sequence-based pagination** ensures deterministic results with no gaps or duplicates
 - **Dual fetch strategies** optimize for different instrument types (futures vs options)
 - **Crash-safe JSONL storage** with automatic resumability at chunk-level granularity
-- **Black-76 option pricing** with Greeks calculation (delta, gamma, vega, theta)
+- **Analytics-ready Parquet** with enriched data (Greeks, moneyness, delivery prices)
+- **Black-76 option pricing** with on-the-fly Greeks calculation (delta, gamma, vega, theta)
 - **Production-ready** with rate limiting, retries, and comprehensive error handling
 
 ## Quick Start
@@ -30,10 +31,14 @@ bun src/cli/index.ts fetch-deliveries btc_usd
 
 # Or run complete pipeline
 bun src/cli/index.ts fetch-all BTC
+
+# Convert to analytics-ready Parquet (with Greeks + moneyness)
+bun src/cli/index.ts merge-to-parquet BTC
 ```
 
 **Output:**
-- Trade data: `data/jsonl/BTC/*.jsonl` (one file per instrument)
+- Trade data (source): `data/jsonl/BTC/*.jsonl` (one file per instrument)
+- Analytics data: `data/parquet/BTC/*.parquet` (enriched with Greeks + moneyness)
 - Metadata: `deribit-data.db` (SQLite with checkpoints)
 
 ## Key Features
@@ -57,10 +62,11 @@ bun src/cli/index.ts fetch-all BTC
 - **Gap detection** and validation tools
 
 ### 🧮 Analytics
-- **Black-76 pricing** from scratch (no external libraries)
-- **Greeks calculation** (delta, gamma, vega, theta)
-- **Moneyness analysis** (ITM/OTM at expiration)
-- **Delivery price matching** for outcome analysis
+- **JSONL → Parquet pipeline** enriches trades with computed metrics
+- **On-the-fly Greeks** calculation during merge (Black-76 model)
+- **Moneyness classification** (ITM/ATM/OTM) using delivery prices
+- **Columnar storage** for 10-100x faster queries vs JSONL
+- **~10x compression** ratio (Parquet vs raw JSONL)
 
 ## Architecture
 
@@ -83,12 +89,14 @@ bun src/cli/index.ts fetch-all BTC
 │  • DeribitClient (HTTP + rate limiting)  │
 │  • JSONLStorage  (crash-safe writes)     │
 │  • Database      (SQLite checkpoints)    │
+│  • ParquetWriter (analytics enrichment)  │
 └──────────┬───────────────────────────────┘
            │
            ▼
 ┌──────────────────────────────────────────┐
-│  Storage                                 │
-│  • data/jsonl/**/*.jsonl  (trade data)   │
+│  Storage (Two-Layer Architecture)        │
+│  • data/jsonl/**/*.jsonl  (source)       │
+│  • data/parquet/**/*.parquet (analytics) │
 │  • deribit-data.db        (metadata)     │
 └──────────────────────────────────────────┘
 ```
@@ -113,6 +121,9 @@ bun src/cli/index.ts fetch-deliveries <index>...
 
 # Complete pipeline
 bun src/cli/index.ts fetch-all <currency>
+
+# Convert JSONL to analytics-ready Parquet
+bun src/cli/index.ts merge-to-parquet <currency> [--min-expiration <date>]
 
 # Show statistics
 bun src/cli/index.ts stats [currency]

@@ -151,6 +151,93 @@ bun src/cli/index.ts fetch-all ETH --skip-deliveries
 
 ---
 
+### merge-to-parquet
+
+Convert JSONL trades to enriched Parquet files with computed Greeks and moneyness.
+
+```bash
+bun src/cli/index.ts merge-to-parquet <currency> [options]
+```
+
+**Arguments:**
+
+| Argument | Type | Description |
+|----------|------|-------------|
+| `currency` | string | Currency code (BTC, ETH, SOL) |
+
+**Options:**
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `--min-expiration` | string | none | Only merge options expiring after date (e.g., "3m", "2024-01-01") |
+| `--max-expiration` | string | none | Only merge options expiring before date |
+| `--output-dir` | string | ./data/parquet | Output directory for Parquet files |
+
+**Date Formats:**
+- Relative: `3d` (3 days ago), `3m` (3 months ago), `1y` (1 year ago)
+- Absolute: `2024-01-01`, `2024-06-15`
+
+**Examples:**
+```bash
+# Merge all completed BTC options
+bun src/cli/index.ts merge-to-parquet BTC
+
+# Merge only recent options (last 3 months)
+bun src/cli/index.ts merge-to-parquet BTC --min-expiration 3m
+
+# Merge specific date range
+bun src/cli/index.ts merge-to-parquet ETH --min-expiration 2024-01-01 --max-expiration 2024-12-31
+
+# Custom output directory
+bun src/cli/index.ts merge-to-parquet BTC --output-dir ./analytics/btc
+```
+
+**Output:**
+```
+━━━ Merging BTC Options to Parquet ━━━
+
+Filtering: expiring after 2026-05-18
+Found 1364 completed options
+
+  ✓ BTC-20JUL26-65000-C: 185 trades enriched in 0.01s
+  ✓ BTC-20JUL26-65000-P: 142 trades enriched in 0.01s
+  ...
+
+━━━ Merge Summary ━━━
+Total instruments: 1364
+Enriched instruments: 1364
+Total trades: 1,234,567
+Duration: 45.32s
+```
+
+**What It Does:**
+
+1. Reads trades from JSONL files
+2. Computes Greeks (delta, gamma, vega, theta) using Black-76 model
+3. Calculates moneyness (ITM/ATM/OTM) from delivery prices
+4. Writes enriched data to Parquet files
+
+**Enriched Fields:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `delivery_price` | double | Settlement price at expiration |
+| `moneyness` | string | "ITM", "ATM", or "OTM" |
+| `intrinsic_value` | double | max(0, delivery - strike) for calls |
+| `moneyness_percentage` | double | % by which option is ITM/OTM |
+| `delta` | double | Rate of change w.r.t. underlying |
+| `gamma` | double | Rate of change of delta |
+| `vega` | double | Sensitivity to volatility |
+| `theta` | double | Time decay per day |
+| `theoretical_price` | double | Black-76 fair value |
+
+**Performance:**
+- ~1000-2000 trades/second
+- 10-100x faster queries vs JSONL
+- ~10x compression vs JSONL
+
+---
+
 ### stats
 
 Show download statistics.
@@ -613,6 +700,121 @@ console.log(instrument);
 //   optionType: "call",
 //   instrumentType: "option"
 // }
+```
+
+---
+
+### ParquetWriter
+
+Infrastructure class for converting JSONL trades to enriched Parquet files.
+
+#### Constructor
+
+```typescript
+new ParquetWriter(config: ParquetWriterConfig)
+```
+
+**Config:**
+```typescript
+interface ParquetWriterConfig {
+  database: Database;              // Database instance for metadata + delivery prices
+  jsonlStorage: JSONLStorage;      // JSONL storage for reading trades
+  outputDir?: string;              // Default: "./data/parquet"
+}
+```
+
+#### Methods
+
+**enrichInstrument()**
+
+Convert a single instrument's trades to Parquet with computed Greeks and moneyness.
+
+```typescript
+async enrichInstrument(
+  instrumentName: string,
+  onProgress?: (progress: EnrichmentProgress) => void
+): Promise<EnrichmentProgress>
+```
+
+**Example:**
+```typescript
+const writer = new ParquetWriter({
+  database: new Database(),
+  jsonlStorage: new JSONLStorage(),
+});
+
+const result = await writer.enrichInstrument("BTC-10AUG26-65000-C");
+console.log(`Enriched ${result.enrichedTrades} trades`);
+```
+
+**enrichMultipleInstruments()**
+
+Process multiple instruments with progress tracking.
+
+```typescript
+async enrichMultipleInstruments(
+  instrumentNames: string[],
+  onProgress?: (progress: EnrichmentProgress) => void
+): Promise<EnrichmentProgress[]>
+```
+
+---
+
+### ParquetMerger
+
+Application-layer orchestrator for JSONL → Parquet pipeline.
+
+#### Constructor
+
+```typescript
+new ParquetMerger(config: ParquetMergerConfig)
+```
+
+**Config:**
+```typescript
+interface ParquetMergerConfig {
+  database: Database;
+  jsonlStorage: JSONLStorage;
+  outputDir?: string;
+}
+```
+
+#### Methods
+
+**mergeCurrency()**
+
+Merge all completed options for a currency.
+
+```typescript
+async mergeCurrency(
+  currency: string,
+  onProgress?: (progress: EnrichmentProgress) => void,
+  minExpiration?: number,
+  maxExpiration?: number
+): Promise<MergeResult>
+```
+
+**Example:**
+```typescript
+const merger = new ParquetMerger({
+  database: new Database(),
+  jsonlStorage: new JSONLStorage(),
+});
+
+const result = await merger.mergeCurrency("BTC");
+console.log(`Merged ${result.enrichedInstruments} instruments`);
+console.log(`Total trades: ${result.totalTrades}`);
+```
+
+**mergeAllCurrencies()**
+
+Merge multiple currencies in sequence.
+
+```typescript
+async mergeAllCurrencies(
+  currencies: string[],
+  onProgress?: (progress: EnrichmentProgress) => void
+): Promise<MergeResult[]>
 ```
 
 ---
