@@ -673,13 +673,11 @@ Assume API never returns duplicates.
 
 ## Decision Evolution
 
-These decisions evolved through:
-1. **Initial Implementation:** Timestamp-based, SQLite-only
-2. **Production Issues:** Gaps, crashes, slow futures
-3. **Redesign:** Seq-based, JSONL, dual strategies
-4. **Validation:** Testing with real workloads (BTC-PERPETUAL, 10k options)
-
-See [MIGRATION.md](../MIGRATION.md) for the full evolution story.
+These decisions were validated through:
+1. **Design Phase:** Analysis of timestamp vs seq-based approaches
+2. **Implementation:** Dual fetch strategies and JSONL storage
+3. **Testing:** Real workloads (BTC-PERPETUAL with 300M trades, 10k+ options)
+4. **Production:** Reliable, performant system for complete historical downloads
 
 ---
 

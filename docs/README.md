@@ -101,11 +101,11 @@ The Deribit Historical Data Pipeline:
 2. [Architecture](architecture.md) - See the layered design
 3. [Deribit API Integration](deribit-api.md) - API strategy and constraints
 
-## 🔄 Recent Changes
+## 🔄 Architecture Highlights
 
-The project recently migrated from a timestamp-based to a sequence-based architecture. See [MIGRATION.md](../MIGRATION.md) in the root directory for details on this transition.
+The system uses sequence-based architecture for superior reliability and performance:
 
-**Key improvements:**
+**Key features:**
 - Deterministic pagination (no gaps or duplicates)
 - 10-50x faster for large futures via concurrent chunk fetching
 - Crash-safe JSONL storage

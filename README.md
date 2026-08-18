@@ -215,16 +215,17 @@ bun test --coverage
 - Integration tests: 80%+
 - E2E tests: Critical paths
 
-## Recent Changes
+## Why Seq-Based Architecture?
 
-The project recently migrated from **timestamp-based** to **sequence-based** architecture. See [MIGRATION.md](MIGRATION.md) for details.
+The project uses **sequence-based pagination** instead of timestamp-based for superior reliability and performance:
 
-**Key improvements:**
-- ✅ Deterministic pagination (no gaps or duplicates)
-- ✅ 10-50x faster for large futures (concurrent chunk fetching)
-- ✅ Crash-safe JSONL storage (append-only)
-- ✅ Resumable at chunk-level granularity
-- ✅ JSONL → Parquet pipeline for analytics
+- ✅ **Deterministic pagination** - No gaps or duplicates (trade_seq is monotonic)
+- ✅ **10-50x faster** for large futures via concurrent chunk fetching
+- ✅ **Crash-safe JSONL storage** - Append-only format survives crashes
+- ✅ **Precise resumability** - Resume from exact trade_seq + 1
+- ✅ **JSONL → Parquet pipeline** - Reliable source + fast analytics
+
+See [Design Decisions](docs/design-decisions.md) for detailed rationale.
 
 ## Use Cases
 
