@@ -170,12 +170,17 @@ async function fetchInstrumentsCommand(args: string[]) {
   const database = new Database();
 
   try {
-    console.log(`\nFetching ${currency} instruments...`);
+    console.log(`\nFetching ${currency} instruments from API...`);
 
+    const apiStart = Date.now();
     const instruments = await client.getInstruments(currency, kind, expired);
+    const apiDuration = ((Date.now() - apiStart) / 1000).toFixed(1);
 
-    console.log(`✓ Found ${instruments.length} instruments`);
+    console.log(`✓ Found ${instruments.length} instruments (${apiDuration}s)\n`);
 
+    console.log(`Storing instruments in database...`);
+
+    const dbStart = Date.now();
     // Store in database
     database.upsertInstruments(instruments.map(inst => ({
       instrument_name: inst.instrument_name,
@@ -187,8 +192,9 @@ async function fetchInstrumentsCommand(args: string[]) {
       is_active: inst.is_active,
       settlement_period: inst.settlement_period,
     })));
+    const dbDuration = ((Date.now() - dbStart) / 1000).toFixed(1);
 
-    console.log(`✓ Stored ${instruments.length} instruments in database\n`);
+    console.log(`✓ Stored ${instruments.length} instruments (${dbDuration}s)\n`);
 
     // Show breakdown
     const byKind: Record<string, number> = {};
