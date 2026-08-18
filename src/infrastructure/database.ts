@@ -1,15 +1,12 @@
 import { Database as BunDatabase } from "bun:sqlite";
 import type { Trade, DeliveryPrice, Greeks } from "../domain/models.ts";
-import { CheckpointManager } from "./checkpoint.ts";
 
 export class Database {
   private db: BunDatabase;
-  public checkpoints: CheckpointManager;
 
   constructor(path: string = "deribit-data.db") {
     this.db = new BunDatabase(path);
     this.initialize();
-    this.checkpoints = new CheckpointManager(this.db);
   }
 
   /**
@@ -85,34 +82,8 @@ export class Database {
       ON greeks(instrument_name, timestamp)
     `);
 
-    // Create checkpoints table for resumable downloads
-    this.db.run(`
-      CREATE TABLE IF NOT EXISTS checkpoints (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        instrument_name TEXT NOT NULL,
-        last_trade_seq INTEGER NOT NULL,
-        last_timestamp INTEGER NOT NULL,
-        chunk_start_seq INTEGER,
-        chunk_end_seq INTEGER,
-        status TEXT NOT NULL DEFAULT 'in_progress',
-        created_at INTEGER DEFAULT (unixepoch() * 1000),
-        updated_at INTEGER DEFAULT (unixepoch() * 1000),
-        UNIQUE(instrument_name, chunk_start_seq, chunk_end_seq)
-      )
-    `);
-
-    this.db.run(`
-      CREATE INDEX IF NOT EXISTS idx_checkpoints_instrument
-      ON checkpoints(instrument_name)
-    `);
-
-    this.db.run(`
-      CREATE INDEX IF NOT EXISTS idx_checkpoints_status
-      ON checkpoints(status)
-    `);
-
     // ========================================
-    // New schema for seq-based fetching
+    // Seq-based fetching schema
     // ========================================
 
     // Instruments table - store metadata fetched from get_instruments
