@@ -291,31 +291,47 @@ describe("Database Integration Tests", () => {
   });
 
   describe("Instruments", () => {
-    test("Get distinct instruments from trades", () => {
+    test("Upsert and retrieve instruments", () => {
       const instruments = [
-        "BTC-29MAR24-50000-C",
-        "BTC-29MAR24-55000-C",
-        "ETH-29MAR24-3000-P",
+        {
+          instrument_name: "BTC-29MAR24-50000-C",
+          kind: "option",
+          base_currency: "BTC",
+          expiration_timestamp: Date.now() + 86400000,
+          strike: 50000,
+          option_type: "call",
+          is_active: true,
+        },
+        {
+          instrument_name: "BTC-29MAR24-55000-C",
+          kind: "option",
+          base_currency: "BTC",
+          expiration_timestamp: Date.now() + 86400000,
+          strike: 55000,
+          option_type: "call",
+          is_active: true,
+        },
+        {
+          instrument_name: "ETH-29MAR24-3000-P",
+          kind: "option",
+          base_currency: "ETH",
+          expiration_timestamp: Date.now() + 86400000,
+          strike: 3000,
+          option_type: "put",
+          is_active: true,
+        },
       ];
 
-      const trades: Trade[] = instruments.flatMap((inst) =>
-        Array.from({ length: 5 }, (_, i) => ({
-          id: `${inst}-${i}`,
-          instrumentName: inst,
-          price: 1000 + i,
-          amount: 1.0,
-          direction: "buy" as const,
-          timestamp: Date.now() + i,
-          indexPrice: 50000,
-        }))
-      );
+      db.upsertInstruments(instruments);
 
-      db.insertTrades(trades);
+      const btcInstruments = db.getInstruments("BTC");
+      expect(btcInstruments).toHaveLength(2);
+      expect(btcInstruments.map(i => i.instrument_name)).toContain("BTC-29MAR24-50000-C");
+      expect(btcInstruments.map(i => i.instrument_name)).toContain("BTC-29MAR24-55000-C");
 
-      const retrieved = db.getInstruments();
-      expect(retrieved).toHaveLength(3);
-      expect(retrieved).toContain("BTC-29MAR24-50000-C");
-      expect(retrieved).toContain("ETH-29MAR24-3000-P");
+      const ethInstruments = db.getInstruments("ETH");
+      expect(ethInstruments).toHaveLength(1);
+      expect(ethInstruments[0]?.instrument_name).toBe("ETH-29MAR24-3000-P");
     });
   });
 

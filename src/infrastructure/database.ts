@@ -691,7 +691,7 @@ export class Database {
     expiration_timestamp?: number;
     strike?: number;
     option_type?: string;
-    is_active: boolean;
+    is_active: boolean | null;
     settlement_period?: string;
     last_seq?: number;
   }>): void {

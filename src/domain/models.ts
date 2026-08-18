@@ -10,12 +10,12 @@ export const DeribitTradeSchema = z.object({
   timestamp: z.number(),
   tick_direction: z.number(),
   price: z.number(),
-  mark_price: z.number().optional(),
+  mark_price: z.number().nullish(),
   instrument_name: z.string(),
   index_price: z.number(),
   direction: z.enum(["buy", "sell"]),
   amount: z.number(),
-  iv: z.number().optional(), // Implied volatility
+  iv: z.number().nullish(), // Implied volatility
 });
 
 export const DeribitTradesResponseSchema = z.object({
@@ -48,7 +48,7 @@ export const DeribitInstrumentSchema = z.object({
   expiration_timestamp: z.number().optional(),
   strike: z.number().optional(),
   option_type: z.string().optional(), // Can be "call", "put"
-  is_active: z.boolean(),
+  is_active: z.boolean().nullable(),
   settlement_period: z.string().optional(),
 });
 
