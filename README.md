@@ -9,7 +9,7 @@ A production-grade TypeScript/Bun system for fetching complete historical trade 
 - **Fetches complete historical data** for cryptocurrency options and futures from Deribit
 - **Sequence-based pagination** ensures deterministic results with no gaps or duplicates
 - **Dual fetch strategies** optimize for different instrument types (futures vs options)
-- **Crash-safe JSONL storage** with automatic resumability at chunk-level granularity
+- **Hybrid JSONL→Parquet storage** with automatic conversion and cleanup on completion
 - **Analytics-ready Parquet** with enriched data (Greeks, moneyness, delivery prices)
 - **Black-76 option pricing** with on-the-fly Greeks calculation (delta, gamma, vega, theta)
 - **Production-ready** with rate limiting, retries, and comprehensive error handling
@@ -19,6 +19,10 @@ A production-grade TypeScript/Bun system for fetching complete historical trade 
 ```bash
 # Install dependencies
 bun install
+
+# Start the progress dashboard (optional)
+bun src/web/server.ts
+# Then open http://localhost:3000 in your browser
 
 # Fetch all BTC instruments (options + futures)
 bun src/cli/index.ts fetch-instruments BTC
@@ -32,13 +36,14 @@ bun src/cli/index.ts fetch-deliveries btc_usd
 # Or run complete pipeline
 bun src/cli/index.ts fetch-all BTC
 
-# Convert to analytics-ready Parquet (with Greeks + moneyness)
+# Convert to enriched analytics Parquet (with Greeks + moneyness)
 bun src/cli/index.ts merge-to-parquet BTC
 ```
 
 **Output:**
-- Trade data (source): `data/jsonl/BTC/*.jsonl` (one file per instrument)
+- Raw trade data: `data/parquet-raw/BTC/*.parquet` (auto-converted from JSONL on completion)
 - Analytics data: `data/parquet/BTC/*.parquet` (enriched with Greeks + moneyness)
+- Temporary JSONL: `data/jsonl/BTC/*.jsonl` (only for in-progress instruments, auto-deleted)
 - Metadata: `deribit-data.db` (SQLite with checkpoints)
 
 ## Key Features
@@ -51,9 +56,10 @@ bun src/cli/index.ts merge-to-parquet BTC
 
 ### 🔒 Reliability
 - **Sequence-based pagination** (deterministic, no gaps)
-- **Crash-safe JSONL** (append-only, human-readable)
+- **Crash-safe hybrid storage** (JSONL for in-progress, Parquet for completed)
 - **Automatic resumability** (chunk-level for futures, offset for options)
 - **Disk-first writes** (prefer duplicates over data loss)
+- **Auto-cleanup** (JSONL deleted after Parquet conversion)
 
 ### 📊 Data Quality
 - **Complete historical coverage** (all instruments from Deribit)
@@ -62,11 +68,19 @@ bun src/cli/index.ts merge-to-parquet BTC
 - **Gap detection** and validation tools
 
 ### 🧮 Analytics
-- **JSONL → Parquet pipeline** enriches trades with computed metrics
-- **On-the-fly Greeks** calculation during merge (Black-76 model)
+- **Hybrid storage pipeline** - JSONL (in-progress) → Parquet (completed) → Enriched Parquet (analytics)
+- **Auto-conversion** - Raw Parquet created automatically when instrument fetch completes
+- **On-the-fly Greeks** calculation during enrichment (Black-76 model)
 - **Moneyness classification** (ITM/ATM/OTM) using delivery prices
 - **Columnar storage** for 10-100x faster queries vs JSONL
 - **~10x compression** ratio (Parquet vs raw JSONL)
+
+### 📊 Real-time Progress Dashboard
+- **Web UI** - Live progress monitoring at `http://localhost:3000`
+- **100ms updates** - Near real-time WebSocket updates
+- **Instrument tracking** - Status (pending/in-progress/completed), progress bars, trade counts
+- **Filtering & pagination** - Sort by progress/name/trades, filter by type/status
+- **CLI-inspired design** - Dark theme, monospace fonts, terminal aesthetics
 
 ## Architecture
 
@@ -86,19 +100,21 @@ bun src/cli/index.ts merge-to-parquet BTC
            ▼
 ┌──────────────────────────────────────────┐
 │  Infrastructure                          │
-│  • DeribitClient (HTTP + rate limiting)  │
-│  • JSONLStorage  (crash-safe writes)     │
-│  • Database      (SQLite checkpoints)    │
-│  • ParquetWriter (analytics enrichment)  │
+│  • DeribitClient    (HTTP + rate limit)  │
+│  • JSONLStorage     (temp, in-progress)  │
+│  • ParquetStorage   (auto-conversion)    │
+│  • Database         (SQLite checkpoints) │
+│  • ParquetWriter    (analytics enrich)   │
 └──────────┬───────────────────────────────┘
            │
            ▼
-┌──────────────────────────────────────────┐
-│  Storage (Two-Layer Architecture)        │
-│  • data/jsonl/**/*.jsonl  (source)       │
-│  • data/parquet/**/*.parquet (analytics) │
-│  • deribit-data.db        (metadata)     │
-└──────────────────────────────────────────┘
+┌──────────────────────────────────────────────┐
+│  Storage (Hybrid Three-Layer)                │
+│  1. data/jsonl/*/*.jsonl (temp, deleted)     │
+│  2. data/parquet-raw/*/*.parquet (raw data)  │
+│  3. data/parquet/*/*.parquet (analytics)     │
+│  • deribit-data.db (metadata + checkpoints)  │
+└──────────────────────────────────────────────┘
 ```
 
 **Design Philosophy:**
@@ -119,10 +135,10 @@ bun src/cli/index.ts fetch-trades <currency> [--concurrency N]
 # Fetch delivery prices
 bun src/cli/index.ts fetch-deliveries <index>...
 
-# Complete pipeline
+# Complete pipeline (instruments → trades → deliveries)
 bun src/cli/index.ts fetch-all <currency>
 
-# Convert JSONL to analytics-ready Parquet
+# Enrich raw Parquet with Greeks and moneyness (optional)
 bun src/cli/index.ts merge-to-parquet <currency> [--min-expiration <date>]
 
 # Show statistics
@@ -131,6 +147,8 @@ bun src/cli/index.ts stats [currency]
 # Help
 bun src/cli/index.ts help
 ```
+
+**Note:** Raw Parquet files are created automatically when fetch completes. The `merge-to-parquet` command is optional and creates enriched analytics data with Greeks calculations.
 
 See [API Reference](docs/api-reference.md) for complete command documentation.
 
@@ -147,9 +165,10 @@ See [API Reference](docs/api-reference.md) for complete command documentation.
 - **All ETH options** (1000+ instruments): 2-4 hours
 
 ### Storage
-- **BTC-PERPETUAL:** ~50GB JSONL (~10GB Parquet after merge)
-- **Typical option:** 100KB-10MB JSONL
+- **BTC-PERPETUAL:** ~50GB JSONL (temp) → ~5GB Parquet (final)
+- **Typical option:** 100KB-10MB JSONL (temp) → 10-100KB Parquet
 - **SQLite metadata:** <100MB for 10,000 instruments
+- **Space savings:** JSONL auto-deleted after Parquet conversion (~90% reduction)
 
 ## Documentation
 
@@ -187,18 +206,26 @@ src/
 ├── cli/                 # Command-line interface
 ├── application/         # Orchestration (fetchers, analytics, filters)
 │   ├── fetchers/        # FutureFetcher, OptionFetcher, DeliveryFetcher
-│   ├── analytics/       # Greeks calculation
+│   ├── analytics/       # Greeks calculation, ParquetMerger
 │   └── filters/         # Risk-based filtering
 ├── domain/              # Pure business logic (Black-76, moneyness)
-└── infrastructure/      # External I/O (API, DB, JSONL, rate limiting)
+└── infrastructure/      # External I/O (API, DB, storage, rate limiting)
+    ├── deribit-client.ts    # HTTP + rate limiting
+    ├── database.ts          # SQLite metadata + checkpoints
+    ├── jsonl-storage.ts     # Temporary JSONL (in-progress)
+    ├── parquet-storage.ts   # Raw Parquet (auto-conversion)
+    └── parquet-writer.ts    # Analytics Parquet (enrichment)
 
 tests/
 ├── unit/                # Pure function tests (Black-76, moneyness)
-├── integration/         # DB and API tests
+├── integration/         # DB, storage, and API tests
 └── e2e/                 # Full pipeline tests
 
 docs/                    # Comprehensive documentation
-data/jsonl/              # Trade data (gitignored)
+data/
+├── jsonl/               # Temporary (in-progress instruments only)
+├── parquet-raw/         # Raw trade data (auto-converted from JSONL)
+└── parquet/             # Analytics data (enriched with Greeks)
 deribit-data.db          # Metadata database (gitignored)
 ```
 
@@ -226,15 +253,16 @@ bun test --coverage
 - Integration tests: 80%+
 - E2E tests: Critical paths
 
-## Why Seq-Based Architecture?
+## Why Seq-Based + Hybrid Storage?
 
-The project uses **sequence-based pagination** instead of timestamp-based for superior reliability and performance:
+The project uses **sequence-based pagination** with **hybrid JSONL→Parquet storage** for superior reliability and performance:
 
 - ✅ **Deterministic pagination** - No gaps or duplicates (trade_seq is monotonic)
 - ✅ **10-50x faster** for large futures via concurrent chunk fetching
-- ✅ **Crash-safe JSONL storage** - Append-only format survives crashes
+- ✅ **Crash-safe hybrid storage** - JSONL for speed, Parquet for efficiency
 - ✅ **Precise resumability** - Resume from exact trade_seq + 1
-- ✅ **JSONL → Parquet pipeline** - Reliable source + fast analytics
+- ✅ **Auto-cleanup** - JSONL deleted after Parquet conversion (~90% space savings)
+- ✅ **Best of both worlds** - Fast appends (JSONL) + efficient storage (Parquet)
 
 See [Design Decisions](docs/design-decisions.md) for detailed rationale.
 
@@ -280,6 +308,6 @@ MIT License - see [LICENSE](LICENSE) file for details.
 
 ---
 
-**Built with:** TypeScript + Bun + SQLite + JSONL
-**Architecture:** Seq-based pagination, dual fetch strategies, crash-safe storage
+**Built with:** TypeScript + Bun + SQLite + Hybrid JSONL→Parquet
+**Architecture:** Seq-based pagination, dual fetch strategies, hybrid storage with auto-conversion
 **Status:** Production-ready, actively maintained

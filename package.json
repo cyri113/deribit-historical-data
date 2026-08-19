@@ -10,7 +10,15 @@
     "typescript": "^5"
   },
   "dependencies": {
+    "@duckdb/duckdb-wasm": "^1.33.1-dev57.0",
+    "@types/cli-progress": "^3.11.6",
+    "@types/react": "^18.2.48",
+    "@types/react-dom": "^18.2.18",
+    "cli-progress": "^3.12.0",
+    "cli-table3": "^0.6.5",
     "parquetjs": "^0.11.2",
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0",
     "zod": "^4.4.3"
   }
 }
