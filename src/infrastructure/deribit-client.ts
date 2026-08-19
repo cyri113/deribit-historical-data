@@ -86,6 +86,7 @@ export class DeribitClient {
             "Content-Type": "application/json",
           },
           body: JSON.stringify(payload),
+          signal: AbortSignal.timeout(60000), // 60 second timeout
         });
 
         if (!response.ok) {
@@ -170,7 +171,9 @@ export class DeribitClient {
 
     const url = `${this.baseUrl}/public/get_delivery_prices?${params}`;
 
-    const response = await fetch(url);
+    const response = await fetch(url, {
+      signal: AbortSignal.timeout(60000), // 60 second timeout
+    });
 
     if (!response.ok) {
       throw new DeribitAPIError(
@@ -245,7 +248,9 @@ export class DeribitClient {
 
     const url = `${this.historyBaseUrl}/public/get_instruments?${params}`;
 
-    const response = await fetch(url);
+    const response = await fetch(url, {
+      signal: AbortSignal.timeout(60000), // 60 second timeout
+    });
 
     if (!response.ok) {
       throw new DeribitAPIError(
@@ -279,7 +284,9 @@ export class DeribitClient {
 
       const url = `${this.historyBaseUrl}/public/get_last_trades_by_instrument?${params}`;
 
-      const response = await fetch(url);
+      const response = await fetch(url, {
+        signal: AbortSignal.timeout(60000), // 60 second timeout
+      });
 
       if (!response.ok) {
         if (response.status === 404) {
@@ -334,7 +341,11 @@ export class DeribitClient {
 
     const url = `${this.historyBaseUrl}/public/get_last_trades_by_instrument?${params}`;
 
-    const response = await fetch(url);
+    console.log(`📡 API Request: ${url}`);
+
+    const response = await fetch(url, {
+      signal: AbortSignal.timeout(60000), // 60 second timeout
+    });
 
     if (!response.ok) {
       throw new DeribitAPIError(
@@ -345,6 +356,11 @@ export class DeribitClient {
 
     const data = await response.json();
     const validated = DeribitTradesResponseSchema.parse(data);
+
+    const firstSeq = validated.result.trades.length > 0 ? validated.result.trades[0].trade_seq : null;
+    const lastSeq = validated.result.trades.length > 0 ? validated.result.trades[validated.result.trades.length - 1].trade_seq : null;
+
+    console.log(`📨 API Response: ${instrumentName} | received ${validated.result.trades.length} trades | first_seq=${firstSeq} | last_seq=${lastSeq} | has_more=${validated.result.has_more}`);
 
     return {
       trades: validated.result.trades,

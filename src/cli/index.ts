@@ -2,13 +2,17 @@
 
 import { DeribitClient } from "../infrastructure/deribit-client.ts";
 import { Database } from "../infrastructure/database.ts";
-import { JSONLStorage } from "../infrastructure/jsonl-storage.ts";
+import { ParquetStorage } from "../infrastructure/parquet-storage.ts";
+import { JSONLStorage } from "../infrastructure/jsonl-storage.ts"; // Still needed for stats on legacy JSONL files
 import { FutureFetcher } from "../application/fetchers/future-fetcher.ts";
 import { OptionFetcher } from "../application/fetchers/option-fetcher.ts";
 import { DeliveryFetcher } from "../application/fetchers/delivery-fetcher.ts";
 import { ParquetMerger } from "../application/analytics/parquet-merger.ts";
+import { ParquetConverter } from "../application/converters/parquet-converter.ts";
+import cliProgress from "cli-progress";
+import Table from "cli-table3";
 
-const COMMANDS = ["fetch-instruments", "fetch-trades", "fetch-deliveries", "fetch-all", "merge-to-parquet", "stats", "help"] as const;
+const COMMANDS = ["fetch-instruments", "fetch-trades", "fetch-deliveries", "fetch-all", "convert-to-raw-parquet", "merge-to-parquet", "stats", "help"] as const;
 type Command = typeof COMMANDS[number];
 
 // Argument parsing
@@ -109,6 +113,7 @@ Commands:
       --chunk-size <n>        Chunk size (default: 10000)
       --min-expiration <date> Only fetch options expiring after date (e.g., 3m, 6m, 2024-01-01)
       --max-expiration <date> Only fetch options expiring before date
+      --max-seq <n>           Skip instruments with more than N trades (default: no limit)
 
     Date formats:
       Relative: 3d (3 days ago), 3m (3 months ago), 1y (1 year ago)
@@ -118,7 +123,7 @@ Commands:
       bun src/cli/index.ts fetch-trades BTC
       bun src/cli/index.ts fetch-trades BTC --kind future --concurrency 5
       bun src/cli/index.ts fetch-trades BTC --kind option --min-expiration 3m
-      bun src/cli/index.ts fetch-trades ETH --kind option --min-expiration 2024-01-01
+      bun src/cli/index.ts fetch-trades BTC --max-seq 10000000
 
   fetch-deliveries <index>... [--start-date <date>] [--end-date <date>]
     Fetch delivery (settlement) prices
@@ -143,8 +148,19 @@ Commands:
       bun src/cli/index.ts fetch-all BTC --kind option --min-expiration 3m
       bun src/cli/index.ts fetch-all BTC --min-expiration 2024-06-01 --max-expiration 2024-08-31
 
+  convert-to-raw-parquet <currency>
+    Convert JSONL to raw Parquet (Silver layer - no enrichment)
+    Stage 2 of medallion architecture: Bronze → Silver
+
+    Options:
+      --output-dir <path>     Output directory for raw Parquet files (default: ./data/parquet-raw)
+
+    Examples:
+      bun src/cli/index.ts convert-to-raw-parquet BTC
+      bun src/cli/index.ts convert-to-raw-parquet ETH --output-dir ./output/silver
+
   merge-to-parquet <currency> [--min-expiration <date>] [--max-expiration <date>]
-    Convert JSONL trades to enriched Parquet files
+    Convert JSONL trades to enriched Parquet files (Gold layer)
     Computes Greeks, moneyness, and merges with delivery prices
 
     Options:
@@ -177,73 +193,13 @@ async function fetchInstrumentsCommand(args: string[]) {
   const parsed = parseArgs(args);
 
   if (parsed.positional.length < 1) {
-    console.error("Usage: fetch-instruments <currency> [--kind <type>] [--expired]");
+    console.error("Usage: fetch-instruments <currency> [--kind <type>] [--expired] [--min-expiration <date>] [--max-expiration <date>]");
     process.exit(1);
   }
 
   const currency = parsed.positional[0]!.toUpperCase();
   const kind = parsed.flags["kind"] as "option" | "future" | "spot" | undefined;
   const expired = parsed.flags["expired"] !== false; // Default true
-
-  const client = new DeribitClient();
-  const database = new Database();
-
-  try {
-    console.log(`\nFetching ${currency} instruments from API...`);
-
-    const apiStart = Date.now();
-    const instruments = await client.getInstruments(currency, kind, expired);
-    const apiDuration = ((Date.now() - apiStart) / 1000).toFixed(1);
-
-    console.log(`✓ Found ${instruments.length} instruments (${apiDuration}s)\n`);
-
-    console.log(`Storing instruments in database...`);
-
-    const dbStart = Date.now();
-    // Store in database
-    database.upsertInstruments(instruments.map(inst => ({
-      instrument_name: inst.instrument_name,
-      kind: inst.kind,
-      base_currency: inst.base_currency,
-      expiration_timestamp: inst.expiration_timestamp,
-      strike: inst.strike,
-      option_type: inst.option_type,
-      is_active: inst.is_active,
-      settlement_period: inst.settlement_period,
-    })));
-    const dbDuration = ((Date.now() - dbStart) / 1000).toFixed(1);
-
-    console.log(`✓ Stored ${instruments.length} instruments (${dbDuration}s)\n`);
-
-    // Show breakdown
-    const byKind: Record<string, number> = {};
-    for (const inst of instruments) {
-      byKind[inst.kind] = (byKind[inst.kind] || 0) + 1;
-    }
-
-    console.log("Breakdown:");
-    for (const [kind, count] of Object.entries(byKind)) {
-      console.log(`  ${kind}: ${count}`);
-    }
-
-    console.log(`\nNext: bun src/cli/index.ts fetch-trades ${currency}`);
-  } finally {
-    database.close();
-  }
-}
-
-async function fetchTradesCommand(args: string[]) {
-  const parsed = parseArgs(args);
-
-  if (parsed.positional.length < 1) {
-    console.error("Usage: fetch-trades <currency> [--kind <type>] [--concurrency <n>] [--min-expiration <date>] [--max-expiration <date>]");
-    process.exit(1);
-  }
-
-  const currency = parsed.positional[0]!.toUpperCase();
-  const kindFilter = parsed.flags["kind"] as "option" | "future" | undefined;
-  const concurrency = parsed.flags["concurrency"] ? parseInt(parsed.flags["concurrency"] as string) : 3;
-  const chunkSize = parsed.flags["chunk-size"] ? parseInt(parsed.flags["chunk-size"] as string) : 10000;
 
   // Parse expiration date filters
   let minExpiration: number | undefined;
@@ -269,7 +225,137 @@ async function fetchTradesCommand(args: string[]) {
 
   const client = new DeribitClient();
   const database = new Database();
-  const storage = new JSONLStorage();
+  const storage = new ParquetStorage();
+
+  try {
+    console.log(`\nFetching ${currency} instruments from API...`);
+
+    const apiStart = Date.now();
+    let instruments = await client.getInstruments(currency, kind, expired);
+    const apiDuration = ((Date.now() - apiStart) / 1000).toFixed(1);
+
+    console.log(`✓ Found ${instruments.length} instruments (${apiDuration}s)\n`);
+
+    // Filter by expiration date if provided
+    if (minExpiration !== undefined || maxExpiration !== undefined) {
+      const beforeFilter = instruments.length;
+
+      instruments = instruments.filter((inst) => {
+        // Only filter instruments with expiration timestamps (options, futures)
+        if (!inst.expiration_timestamp) {
+          return true; // Keep perpetuals/spot
+        }
+
+        if (minExpiration !== undefined && inst.expiration_timestamp < minExpiration) {
+          return false;
+        }
+
+        if (maxExpiration !== undefined && inst.expiration_timestamp > maxExpiration) {
+          return false;
+        }
+
+        return true;
+      });
+
+      const formatDate = (ts: number) => new Date(ts).toISOString().split('T')[0];
+      console.log(`📅 Filtered by expiration date:`);
+      if (minExpiration && maxExpiration) {
+        console.log(`   ${formatDate(minExpiration)} to ${formatDate(maxExpiration)}`);
+      } else if (minExpiration) {
+        console.log(`   Expiring after ${formatDate(minExpiration)}`);
+      } else if (maxExpiration) {
+        console.log(`   Expiring before ${formatDate(maxExpiration!)}`);
+      }
+      console.log(`   ${beforeFilter} → ${instruments.length} instruments\n`);
+    }
+
+    console.log(`Writing instruments to storage...`);
+
+    const writeStart = Date.now();
+
+    // Write to Parquet file (archival/export format)
+    await storage.writeInstruments(currency, instruments);
+
+    // Clean up stale instruments from SQLite (remove instruments not in the latest fetch)
+    const instrumentNames = instruments.map(i => i.instrument_name);
+    const deletedCount = database.deleteInstrumentsNotIn(currency, kind, instrumentNames);
+    if (deletedCount > 0) {
+      console.log(`🧹 Cleaned up ${deletedCount} stale instruments from database`);
+    }
+
+    // Write new instruments to SQLite (for fast querying by fetchers)
+    database.upsertInstruments(instruments.map(inst => ({
+      instrument_name: inst.instrument_name,
+      kind: inst.kind,
+      base_currency: inst.base_currency,
+      expiration_timestamp: inst.expiration_timestamp,
+      strike: inst.strike,
+      option_type: inst.option_type,
+      is_active: inst.is_active,
+      settlement_period: inst.settlement_period,
+    })));
+
+    const writeDuration = ((Date.now() - writeStart) / 1000).toFixed(1);
+
+    console.log(`✓ Wrote ${instruments.length} instruments to Parquet and SQLite (${writeDuration}s)\n`);
+
+    // Show breakdown
+    const byKind: Record<string, number> = {};
+    for (const inst of instruments) {
+      byKind[inst.kind] = (byKind[inst.kind] || 0) + 1;
+    }
+
+    console.log("Breakdown:");
+    for (const [kind, count] of Object.entries(byKind)) {
+      console.log(`  ${kind}: ${count}`);
+    }
+
+    console.log(`\nNext: bun src/cli/index.ts fetch-trades ${currency}`);
+  } finally {
+    database.close();
+  }
+}
+
+async function fetchTradesCommand(args: string[]) {
+  const parsed = parseArgs(args);
+
+  if (parsed.positional.length < 1) {
+    console.error("Usage: fetch-trades <currency> [--kind <type>] [--concurrency <n>] [--min-expiration <date>] [--max-expiration <date>] [--max-seq <n>]");
+    process.exit(1);
+  }
+
+  const currency = parsed.positional[0]!.toUpperCase();
+  const kindFilter = parsed.flags["kind"] as "option" | "future" | undefined;
+  const concurrency = parsed.flags["concurrency"] ? parseInt(parsed.flags["concurrency"] as string) : 3;
+  const chunkSize = parsed.flags["chunk-size"] ? parseInt(parsed.flags["chunk-size"] as string) : 10000;
+  const maxSeq = parsed.flags["max-seq"] ? parseInt(parsed.flags["max-seq"] as string) : undefined;
+
+  // Parse expiration date filters
+  let minExpiration: number | undefined;
+  let maxExpiration: number | undefined;
+
+  if (parsed.flags["min-expiration"]) {
+    try {
+      minExpiration = parseDate(parsed.flags["min-expiration"] as string);
+    } catch (error) {
+      console.error(`Error parsing --min-expiration: ${(error as Error).message}`);
+      process.exit(1);
+    }
+  }
+
+  if (parsed.flags["max-expiration"]) {
+    try {
+      maxExpiration = parseDate(parsed.flags["max-expiration"] as string);
+    } catch (error) {
+      console.error(`Error parsing --max-expiration: ${(error as Error).message}`);
+      process.exit(1);
+    }
+  }
+
+  const client = new DeribitClient();
+  const database = new Database();
+  const jsonlStorage = new JSONLStorage();
+  const parquetStorage = new ParquetStorage();
 
   try {
     const overallStart = Date.now();
@@ -279,9 +365,11 @@ async function fetchTradesCommand(args: string[]) {
       const futureFetcher = new FutureFetcher({
         client,
         database,
-        storage,
+        jsonlStorage,
+        parquetStorage,
         chunkSize,
         concurrency,
+        maxSeq,
       });
 
       const futureResult = await futureFetcher.fetchAllFutures(currency);
@@ -294,18 +382,23 @@ async function fetchTradesCommand(args: string[]) {
       const optionFetcher = new OptionFetcher({
         client,
         database,
-        storage,
+        jsonlStorage,
+        parquetStorage,
         chunkSize,
         concurrency,
+        maxSeq,
       });
 
-      const optionResult = await optionFetcher.fetchAllOptions(
+      // Get instrument count upfront for progress bar
+      // Note: Filtering by maxSeq happens inside fetchAllOptions() during preparation
+      const instrumentNames = database.getIncompleteOptions(
         currency,
-        undefined,
         minExpiration,
         maxExpiration
       );
 
+      // Fetch options with simple logging (no progress bar)
+      const optionResult = await optionFetcher.fetchAllOptions(currency, undefined, minExpiration, maxExpiration);
       console.log(`\n✓ Options: ${optionResult.totalTrades} trades from ${optionResult.fetched} instruments (${optionResult.completed} completed)\n`);
     }
 
@@ -313,8 +406,8 @@ async function fetchTradesCommand(args: string[]) {
     console.log(`\n━━━ Fetch Complete ━━━`);
     console.log(`Duration: ${duration}s\n`);
   } finally {
-    await storage.closeAll();
     database.close();
+    await jsonlStorage.closeAll();
   }
 }
 
@@ -331,11 +424,12 @@ async function fetchDeliveriesCommand(args: string[]) {
 
   const client = new DeribitClient();
   const database = new Database();
+  const storage = new ParquetStorage();
   const fetcher = new DeliveryFetcher({
     client,
     database,
+    storage,
     batchSize: 100,
-    dbBatchSize: 1000,
   });
 
   try {
@@ -365,7 +459,7 @@ async function fetchAllCommand(args: string[]) {
   const parsed = parseArgs(args);
 
   if (parsed.positional.length < 1) {
-    console.error("Usage: fetch-all <currency> [--kind <type>] [--concurrency <n>] [--min-expiration <date>] [--max-expiration <date>]");
+    console.error("Usage: fetch-all <currency> [--kind <type>] [--concurrency <n>] [--min-expiration <date>] [--max-expiration <date>] [--max-seq <n>]");
     process.exit(1);
   }
 
@@ -375,6 +469,7 @@ async function fetchAllCommand(args: string[]) {
   const skipDeliveries = parsed.flags["skip-deliveries"] === true;
   const minExpiration = parsed.flags["min-expiration"] as string | undefined;
   const maxExpiration = parsed.flags["max-expiration"] as string | undefined;
+  const maxSeq = parsed.flags["max-seq"] as string | undefined;
 
   console.log(`\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`);
   console.log(`  Complete ${currency} Historical Data Fetch`);
@@ -384,7 +479,12 @@ async function fetchAllCommand(args: string[]) {
 
   // Step 1: Fetch instruments
   console.log(`[1/3] Fetching instruments...`);
-  await fetchInstrumentsCommand([currency, ...(kindFilter ? [`--kind`, kindFilter] : [])]);
+  await fetchInstrumentsCommand([
+    currency,
+    ...(kindFilter ? [`--kind`, kindFilter] : []),
+    ...(minExpiration ? [`--min-expiration`, minExpiration] : []),
+    ...(maxExpiration ? [`--max-expiration`, maxExpiration] : []),
+  ]);
 
   // Step 2: Fetch trades
   console.log(`\n[2/3] Fetching trades...`);
@@ -394,6 +494,7 @@ async function fetchAllCommand(args: string[]) {
     `--concurrency`, String(concurrency),
     ...(minExpiration ? [`--min-expiration`, minExpiration] : []),
     ...(maxExpiration ? [`--max-expiration`, maxExpiration] : []),
+    ...(maxSeq ? [`--max-seq`, maxSeq] : []),
   ];
   await fetchTradesCommand(tradeArgs);
 
@@ -411,6 +512,40 @@ async function fetchAllCommand(args: string[]) {
   console.log(`\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`);
   console.log(`  ✅ Complete! Duration: ${duration}s`);
   console.log(`━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n`);
+}
+
+async function convertToRawParquetCommand(args: string[]) {
+  const parsed = parseArgs(args);
+
+  if (parsed.positional.length < 1) {
+    console.error("Usage: convert-to-raw-parquet <currency> [--output-dir <path>]");
+    process.exit(1);
+  }
+
+  const currency = parsed.positional[0]!.toUpperCase();
+  const outputDir = parsed.flags["output-dir"] as string | undefined;
+
+  const database = new Database();
+  const storage = new JSONLStorage();
+
+  try {
+    const converter = new ParquetConverter({
+      database,
+      jsonlStorage: storage,
+      rawOutputDir: outputDir,
+    });
+
+    const result = await converter.convertAllInstruments(currency);
+
+    console.log(`\n━━━ Conversion Summary ━━━`);
+    console.log(`Total processed: ${result.total}`);
+    console.log(`Converted: ${result.converted}`);
+    console.log(`Skipped: ${result.skipped}`);
+    console.log(`Failed: ${result.failed}`);
+    console.log(`Total trades: ${result.totalTrades.toLocaleString()}\n`);
+  } finally {
+    database.close();
+  }
 }
 
 async function mergeToParquetCommand(args: string[]) {
@@ -468,7 +603,6 @@ async function mergeToParquetCommand(args: string[]) {
     );
   } finally {
     database.close();
-    await storage.closeAll();
   }
 }
 
@@ -540,6 +674,9 @@ async function main() {
       break;
     case "fetch-all":
       await fetchAllCommand(commandArgs);
+      break;
+    case "convert-to-raw-parquet":
+      await convertToRawParquetCommand(commandArgs);
       break;
     case "merge-to-parquet":
       await mergeToParquetCommand(commandArgs);
