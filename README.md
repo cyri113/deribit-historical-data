@@ -2,317 +2,192 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-A production-grade TypeScript/Bun system for fetching complete historical trade data from Deribit's cryptocurrency derivatives exchange. Features resumable downloads, crash-safe storage, and 10-50x performance improvements through concurrent chunk fetching.
-
-## What This Does
-
-- **Fetches complete historical data** for cryptocurrency options and futures from Deribit
-- **Sequence-based pagination** ensures deterministic results with no gaps or duplicates
-- **Dual fetch strategies** optimize for different instrument types (futures vs options)
-- **Hybrid JSONL→Parquet storage** with automatic conversion and cleanup on completion
-- **Analytics-ready Parquet** with enriched data (Greeks, moneyness, delivery prices)
-- **Black-76 option pricing** with on-the-fly Greeks calculation (delta, gamma, vega, theta)
-- **Production-ready** with rate limiting, retries, and comprehensive error handling
+Fetch Deribit historical trades for expired instruments (options, futures). TypeScript/Bun with seq-based pagination, filesystem-based idempotency, BunQueue workflows, and DuckDB Greeks (10-100x faster than row-by-row).
 
 ## Quick Start
 
 ```bash
-# Install dependencies
 bun install
 
-# Start the progress dashboard (optional)
-bun src/web/server.ts
-# Then open http://localhost:3000 in your browser
+# Fetch expired BTC options from last 3 months
+bun src/cli/index.ts fetch-all BTC --kind option --min-expiration 3m
 
-# Fetch all BTC instruments (options + futures)
-bun src/cli/index.ts fetch-instruments BTC
+# Enrich with Greeks
+bun src/cli/index.ts enrich-with-duckdb BTC
 
-# Download historical trades (auto-detects futures vs options strategy)
-bun src/cli/index.ts fetch-trades BTC --concurrency 5
-
-# Fetch settlement prices
-bun src/cli/index.ts fetch-deliveries btc_usd
-
-# Fetch historical volatility
-bun src/cli/index.ts fetch-volatility BTC ETH
-
-# Or run complete pipeline
-bun src/cli/index.ts fetch-all BTC
-
-# Convert to enriched analytics Parquet (with Greeks + moneyness)
-bun src/cli/index.ts merge-to-parquet BTC
+# Monitor progress
+bun src/cli/index.ts queue-dashboard  # http://localhost:6790
 ```
 
 **Output:**
-- Raw trade data: `data/parquet-raw/BTC/*.parquet` (auto-converted from JSONL on completion)
-- Delivery prices: `data/parquet-raw/deliveries/*.parquet` (settlement prices)
-- Historical volatility: `data/parquet-raw/volatility/*.parquet` (volatility timeseries)
-- Analytics data: `data/parquet/BTC/*.parquet` (enriched with Greeks + moneyness)
-- Temporary JSONL: `data/jsonl/BTC/*.jsonl` (only for in-progress instruments, auto-deleted)
-- Metadata: `deribit-data.db` (SQLite with checkpoints)
+- `data/parquet-raw/BTC/*.parquet` - Bronze: Raw trades (one file per instrument)
+- `data/parquet-raw/deliveries/*.parquet` - Delivery/settlement prices
+- `data/parquet-raw/volatility/*.parquet` - Historical volatility
+- `data/parquet-duckdb/BTC/*.parquet` - Silver/Gold: Enriched with Greeks
+- `data/queue.db` - BunQueue job queue (only SQLite database)
 
-## Key Features
+## Features
 
-### 🚀 High Performance
-- **Concurrent chunk fetching** for large futures (10-50x speedup)
-- **Streaming architecture** for options (constant memory usage)
-- **Rate limiting** with token bucket (15 req/s sustainable)
-- **Batch processing** with optimized SQLite and JSONL storage
+**Data:** Expired instruments with expiration filters, seq-based pagination (no gaps), idempotent re-runs
+**Performance:** BunQueue concurrent jobs (3 parallel), 15 req/s shared rate limiting
+**Storage:** Direct Parquet writes, filesystem-based idempotency (skip completed instruments)
+**Analytics:** DuckDB vectorized Greeks (20-50k/sec, 10-100x faster than TypeScript)
+**Workflows:** BunQueue job queue, retry logic (3 attempts), web dashboard
+**Reliability:** Atomic Parquet writes, shared rate limiter, crash recovery via re-run
 
-### 🔒 Reliability
-- **Sequence-based pagination** (deterministic, no gaps)
-- **Crash-safe hybrid storage** (JSONL for in-progress, Parquet for completed)
-- **Automatic resumability** (chunk-level for futures, offset for options)
-- **Disk-first writes** (prefer duplicates over data loss)
-- **Auto-cleanup** (JSONL deleted after Parquet conversion)
+## CLI Commands
 
-### 📊 Data Quality
-- **Complete historical coverage** (all instruments from Deribit)
-- **Runtime validation** with Zod schemas
-- **Deduplication** during merge (JSONL → Parquet)
-- **Gap detection** and validation tools
+**Fetch expired instruments:**
+```bash
+# Expired BTC options from last 3 months
+bun src/cli/index.ts fetch-all BTC --kind option --min-expiration 3m
 
-### 🧮 Analytics
-- **Hybrid storage pipeline** - JSONL (in-progress) → Parquet (completed) → Enriched Parquet (analytics)
-- **Auto-conversion** - Raw Parquet created automatically when instrument fetch completes
-- **On-the-fly Greeks** calculation during enrichment (Black-76 model)
-- **Moneyness classification** (ITM/ATM/OTM) using delivery prices
-- **Columnar storage** for 10-100x faster queries vs JSONL
-- **~10x compression** ratio (Parquet vs raw JSONL)
+# Expired BTC futures and options from specific date range
+bun src/cli/index.ts fetch-all BTC --min-expiration 2024-01-01 --max-expiration 2024-12-31
 
-### 📊 Real-time Progress Dashboard
-- **Web UI** - Live progress monitoring at `http://localhost:3000`
-- **100ms updates** - Near real-time WebSocket updates
-- **Instrument tracking** - Status (pending/in-progress/completed), progress bars, trade counts
-- **Filtering & pagination** - Sort by progress/name/trades, filter by type/status
-- **CLI-inspired design** - Dark theme, monospace fonts, terminal aesthetics
+# All expired BTC instruments
+bun src/cli/index.ts fetch-all BTC
+
+# Delivery prices and volatility
+bun src/cli/index.ts fetch-deliveries btc_usd eth_usd
+bun src/cli/index.ts fetch-volatility BTC ETH
+```
+
+**Enrich with Greeks:**
+```bash
+bun src/cli/index.ts enrich-with-duckdb BTC  # Recommended (20-50k/sec, DuckDB vectorized)
+```
+
+**Queue management:**
+```bash
+bun src/cli/index.ts queue-status      # Quick status
+bun src/cli/index.ts queue-dashboard   # Monitor at http://localhost:6790
+```
+
+**Note:** Legacy commands (`fetch-instruments`, `fetch-trades`, `convert-to-raw-parquet`, `merge-to-parquet`, `stats`) are deprecated. Use `fetch-all` instead.
 
 ## Architecture
 
 ```
-┌─────────────────────┐
-│  Deribit API        │  history.deribit.com (seq-based pagination)
-└──────────┬──────────┘
-           │
-           ▼
-┌─────────────────────────────────────────┐
-│  Application Layer                      │
-│  • FutureFetcher  (concurrent chunks)   │
-│  • OptionFetcher  (streaming)           │
-│  • DeliveryFetcher (paginated)          │
-└──────────┬──────────────────────────────┘
-           │
-           ▼
-┌──────────────────────────────────────────┐
-│  Infrastructure                          │
-│  • DeribitClient    (HTTP + rate limit)  │
-│  • JSONLStorage     (temp, in-progress)  │
-│  • ParquetStorage   (auto-conversion)    │
-│  • Database         (SQLite checkpoints) │
-│  • ParquetWriter    (analytics enrich)   │
-└──────────┬───────────────────────────────┘
-           │
-           ▼
-┌──────────────────────────────────────────────┐
-│  Storage (Hybrid Three-Layer)                │
-│  1. data/jsonl/*/*.jsonl (temp, deleted)     │
-│  2. data/parquet-raw/*/*.parquet (raw data)  │
-│  3. data/parquet/*/*.parquet (analytics)     │
-│  • deribit-data.db (metadata + checkpoints)  │
-└──────────────────────────────────────────────┘
+CLI → Application (Fetchers, Analytics, Filters) → Domain (Black-76, moneyness) → Infrastructure
+
+Infrastructure:
+├── DeribitClient      - HTTP, rate limit (15 req/s shared), Zod validation
+├── QueueManager       - BunQueue (embedded SQLite, retry, dashboard)
+├── ParquetStorage     - Direct Parquet I/O (read/write trades, instruments, deliveries, volatility)
+├── DuckDB             - WASM, Black-76 pure SQL, vectorized (10-100x faster)
+└── RateLimiter        - Token bucket (15 req/s)
+
+Storage (Medallion Architecture):
+1. data/parquet-raw/BTC/*.parquet         - Bronze: Raw trades (one file per instrument)
+2. data/parquet-raw/deliveries/*.parquet  - Delivery/settlement prices
+3. data/parquet-raw/volatility/*.parquet  - Historical volatility
+4. data/parquet-duckdb/BTC/*.parquet      - Silver/Gold: Enriched with Greeks
+5. data/queue.db                          - BunQueue job queue (only SQLite)
+
+No instrument metadata database - All metadata embedded in Parquet files via parseInstrumentName()
 ```
-
-**Design Philosophy:**
-- Layered architecture (Infrastructure → Domain → Application → CLI)
-- Dependency injection for testability
-- Pure functions in domain layer (Black-76, moneyness)
-- Separation of concerns (see [Design Decisions](docs/design-decisions.md))
-
-## CLI Commands
-
-```bash
-# Fetch instrument metadata
-bun src/cli/index.ts fetch-instruments <currency> [--kind option|future]
-
-# Fetch historical trades (seq-based)
-bun src/cli/index.ts fetch-trades <currency> [--concurrency N]
-
-# Fetch delivery prices
-bun src/cli/index.ts fetch-deliveries <index>...
-
-# Complete pipeline (instruments → trades → deliveries)
-bun src/cli/index.ts fetch-all <currency>
-
-# Enrich raw Parquet with Greeks and moneyness (optional)
-bun src/cli/index.ts merge-to-parquet <currency> [--min-expiration <date>]
-
-# Show statistics
-bun src/cli/index.ts stats [currency]
-
-# Help
-bun src/cli/index.ts help
-```
-
-**Note:** Raw Parquet files are created automatically when fetch completes. The `merge-to-parquet` command is optional and creates enriched analytics data with Greeks calculations.
-
-See [API Reference](docs/api-reference.md) for complete command documentation.
 
 ## Performance
 
-### Throughput
-- **Futures:** 50k-100k trades/minute (concurrency=5)
-- **Options:** 20k-30k trades/minute (streaming)
-- **Deliveries:** ~1000 records/minute
+**Throughput:** 99% of instruments <10k trades (single API call, <10s per instrument)
+**Time:** Typical expiry (100 options) ~10-30min, 4,640 expired options (3 months) ~30-60min
+**Storage:** Typical expiry (100 options) ~10-50MB Parquet, 4,640 options ~500MB-2GB
+**Concurrency:** 3 parallel BunQueue jobs, 15 req/s shared rate limiter
+**Greeks:** DuckDB 20-50k/sec vs TypeScript 1-2k/sec (10-100x faster)
 
-### Time Estimates
-- **BTC-PERPETUAL** (300M trades): 2-6 hours
-- **Single expiration cycle** (100 options): 10-30 minutes
-- **All ETH options** (1000+ instruments): 2-4 hours
+## Key Design Decisions
 
-### Storage
-- **BTC-PERPETUAL:** ~50GB JSONL (temp) → ~5GB Parquet (final)
-- **Typical option:** 100KB-10MB JSONL (temp) → 10-100KB Parquet
-- **SQLite metadata:** <100MB for 10,000 instruments
-- **Space savings:** JSONL auto-deleted after Parquet conversion (~90% reduction)
+1. **Seq-based pagination:** Deterministic, no gaps (vs timestamp-based)
+2. **Simplified fetch strategy:** Unified approach (fetch all [1, lastSeq] in memory) for 99% of instruments <10k trades
+3. **Direct Parquet storage:** Write directly to Parquet (no JSONL intermediate layer)
+4. **Filesystem-based idempotency:** Check Parquet exists → skip (no SQLite database for progress tracking)
+5. **BunQueue workflows:** Professional queue vs custom dashboard (-550 lines code)
+6. **DuckDB SQL Greeks:** 10-100x faster via vectorized execution
 
-## Documentation
+See [Design Decisions](docs/design-decisions.md) for rationale.
 
-Comprehensive documentation available in [`/docs`](docs/README.md):
+## Data Model
 
-### 📖 Getting Started
-- **[Overview](docs/overview.md)** - Project goals, use cases, target audience
-- **[Operations Guide](docs/operations.md)** - Installation, commands, troubleshooting
+**Parquet Raw (Bronze):**
+- `trade_seq`, `timestamp`, `price`, `index_price`, `direction`, `amount`, `iv`
+- One file per instrument: `BTC-25DEC24-60000-C.parquet`
+- Metadata embedded via `parseInstrumentName()` from filename
 
-### 🏗️ Understanding the System
-- **[Architecture](docs/architecture.md)** - System design, layers, data flow
-- **[Design Decisions](docs/design-decisions.md)** - Why seq-based? Why JSONL? (6 key decisions)
-- **[Data Model](docs/data-model.md)** - Database schema, JSONL format, relationships
+**Parquet Enriched (Silver/Gold - 35 fields):**
+- Trade data + Greeks (delta, gamma, vega, theta)
+- Moneyness (ITM/ATM/OTM, delivery_price, intrinsic_value)
+- Metrics (iv_rank, yield, expected_value, sharpe)
 
-### 🔧 Technical Reference
-- **[Deribit API](docs/deribit-api.md)** - Endpoints, rate limiting, pagination strategies
-- **[API Reference](docs/api-reference.md)** - Complete CLI and TypeScript API
-- **[Development Guide](docs/development.md)** - Setup, testing, contributing
+**BunQueue (only SQLite):**
+- Job queue state in `data/queue.db`
+- No instrument metadata database
 
-## Technology Stack
+⚠️ **IV Format:** Deribit returns `iv:65` = 65% (use `iv/100` for Greeks)
 
-- **Runtime:** Bun (fast TypeScript runtime with built-in SQLite)
-- **Language:** TypeScript (strict mode, no `any`)
-- **Storage:** SQLite (metadata), JSONL (trades), Parquet (analytics)
-- **API:** Deribit REST API (history.deribit.com)
-- **Validation:** Zod (runtime schema validation)
-- **Testing:** Bun Test (unit, integration, E2E)
+## Queue Dashboard
 
-No external dependencies for HTTP, testing, or file I/O.
+Monitor job progress via BunQueue dashboard:
 
-## Project Structure
-
+```bash
+bun src/cli/index.ts queue-dashboard
+# Open http://localhost:6790
 ```
-src/
-├── cli/                 # Command-line interface
-├── application/         # Orchestration (fetchers, analytics, filters)
-│   ├── fetchers/        # FutureFetcher, OptionFetcher, DeliveryFetcher
-│   ├── analytics/       # Greeks calculation, ParquetMerger
-│   └── filters/         # Risk-based filtering
-├── domain/              # Pure business logic (Black-76, moneyness)
-└── infrastructure/      # External I/O (API, DB, storage, rate limiting)
-    ├── deribit-client.ts    # HTTP + rate limiting
-    ├── database.ts          # SQLite metadata + checkpoints
-    ├── jsonl-storage.ts     # Temporary JSONL (in-progress)
-    ├── parquet-storage.ts   # Raw Parquet (auto-conversion)
-    └── parquet-writer.ts    # Analytics Parquet (enrichment)
 
-tests/
-├── unit/                # Pure function tests (Black-76, moneyness)
-├── integration/         # DB, storage, and API tests
-└── e2e/                 # Full pipeline tests
+**Features:**
+- Real-time job queue status
+- Completed/failed/waiting jobs with timestamps
+- Retry management (3 attempts, exponential backoff)
+- Job history
+- Performance metrics
 
-docs/                    # Comprehensive documentation
-data/
-├── jsonl/               # Temporary (in-progress instruments only)
-├── parquet-raw/         # Raw trade data (auto-converted from JSONL)
-└── parquet/             # Analytics data (enriched with Greeks)
-deribit-data.db          # Metadata database (gitignored)
-```
+**Storage:** `data/queue.db` (backup: `cp data/queue.db backups/`)
 
 ## Testing
 
 ```bash
-# Run all tests
-bun test
-
-# Unit tests only
-bun test tests/unit/
-
-# Integration tests
-bun test tests/integration/
-
-# E2E tests
-bun test tests/e2e/
-
-# With coverage
-bun test --coverage
+bun test                    # All tests
+bun test tests/unit/        # Pure functions (100% coverage)
+bun test tests/integration/ # DB, storage, API (80%+)
+bun test --coverage         # With coverage report
 ```
 
-**Coverage:**
-- Unit tests: 100% (pure functions)
-- Integration tests: 80%+
-- E2E tests: Critical paths
+## Documentation
 
-## Why Seq-Based + Hybrid Storage?
+**Getting Started:**
+- [Overview](docs/overview.md) - What it does, use cases
+- [Operations](docs/operations.md) - Install, commands, troubleshooting
 
-The project uses **sequence-based pagination** with **hybrid JSONL→Parquet storage** for superior reliability and performance:
+**Architecture:**
+- [Architecture](docs/architecture.md) - Layers, components, data flow
+- [Design Decisions](docs/design-decisions.md) - 8 key choices with rationale
+- [Data Model](docs/data-model.md) - Schema, formats, lifecycle
 
-- ✅ **Deterministic pagination** - No gaps or duplicates (trade_seq is monotonic)
-- ✅ **10-50x faster** for large futures via concurrent chunk fetching
-- ✅ **Crash-safe hybrid storage** - JSONL for speed, Parquet for efficiency
-- ✅ **Precise resumability** - Resume from exact trade_seq + 1
-- ✅ **Auto-cleanup** - JSONL deleted after Parquet conversion (~90% space savings)
-- ✅ **Best of both worlds** - Fast appends (JSONL) + efficient storage (Parquet)
-
-See [Design Decisions](docs/design-decisions.md) for detailed rationale.
+**Reference:**
+- [API Reference](docs/api-reference.md) - CLI and TypeScript API
+- [Development](docs/development.md) - Setup, testing, contributing
 
 ## Use Cases
 
-### Quantitative Research
-- Backtest options strategies using complete historical data
-- Study implied volatility surface evolution
-- Analyze Greeks behavior near expiration
+**Backtest:** Fetch options → compute Greeks → filter (delta > 0.3) → P&L
+**IV Research:** Trade-level IV → volatility surface → model validation
+**Microstructure:** Bid-ask spreads, order flow, market impact
+**Greeks:** Track delta/gamma decay over lifetimes
 
-### Market Analysis
-- Validate pricing models against historical trades
-- Understand market microstructure (bid-ask spreads, order flow)
-- Measure market impact and liquidity patterns
+## Stack
 
-### Academic Research
-- Study cryptocurrency derivatives markets
-- Analyze option pricing efficiency
-- Research market behavior during major events
-
-### Data Science
-- Train ML models on historical options data
-- Feature engineering from Greeks and IV
-- Market prediction and analysis
-
-## Contributing
-
-Contributions welcome! Please see [Development Guide](docs/development.md) for:
-- Development setup
-- Code style and conventions
-- Testing requirements
-- Pull request process
+**Runtime:** Bun (TypeScript, SQLite, test, bundler built-in)
+**Language:** TypeScript strict, no `any`
+**Storage:** Parquet (columnar analytics), SQLite (BunQueue jobs only)
+**Queue:** BunQueue (embedded SQLite, MIT)
+**Analytics:** DuckDB WASM (vectorized SQL)
+**Validation:** Zod
 
 ## License
 
-MIT License - see [LICENSE](LICENSE) file for details.
-
-## Links
-
-- **Documentation:** [/docs](docs/README.md)
-- **GitHub:** https://github.com/cyri113/deribit-historical-data
-- **Issues:** https://github.com/cyri113/deribit-historical-data/issues
+MIT - see [LICENSE](LICENSE)
 
 ---
 
-**Built with:** TypeScript + Bun + SQLite + Hybrid JSONL→Parquet
-**Architecture:** Seq-based pagination, dual fetch strategies, hybrid storage with auto-conversion
-**Status:** Production-ready, actively maintained
+**Built with:** TypeScript + Bun + BunQueue + DuckDB
+**Architecture:** Seq-based pagination, filesystem idempotency, medallion storage (Bronze/Silver/Gold), vectorized Greeks

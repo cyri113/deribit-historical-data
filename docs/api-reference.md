@@ -1,6 +1,6 @@
 # API Reference
 
-Complete reference for CLI commands and TypeScript API.
+Complete CLI commands and TypeScript API reference.
 
 ## CLI Commands
 
@@ -12,37 +12,12 @@ Fetch and store instrument metadata from Deribit.
 bun src/cli/index.ts fetch-instruments <currency> [options]
 ```
 
-**Arguments:**
+**Arguments:** `currency` (BTC, ETH, SOL)
+**Options:** `--kind <type>` (option, future, spot), `--expired` (default: true)
 
-| Argument | Type | Description |
-|----------|------|-------------|
-| `currency` | string | Currency code (BTC, ETH, SOL) |
-
-**Options:**
-
-| Option | Type | Default | Description |
-|--------|------|---------|-------------|
-| `--kind` | string | all | Filter by: "option", "future", "spot" |
-| `--expired` | boolean | true | Include expired instruments |
-
-**Examples:**
+**Example:**
 ```bash
-bun src/cli/index.ts fetch-instruments BTC
 bun src/cli/index.ts fetch-instruments BTC --kind option
-bun src/cli/index.ts fetch-instruments ETH --kind future --no-expired
-```
-
-**Output:**
-```
-Fetching BTC instruments...
-✓ Found 10,234 instruments
-✓ Stored 10,234 instruments in database
-
-Breakdown:
-  future: 12
-  option: 10,222
-
-Next: bun src/cli/index.ts fetch-trades BTC
 ```
 
 ---
@@ -55,44 +30,19 @@ Fetch historical trades using seq-based pagination.
 bun src/cli/index.ts fetch-trades <currency> [options]
 ```
 
-**Arguments:**
+**Arguments:** `currency` (BTC, ETH, SOL)
+**Options:** `--kind <type>`, `--concurrency <n>` (default: 3), `--chunk-size <n>` (default: 10000)
 
-| Argument | Type | Description |
-|----------|------|-------------|
-| `currency` | string | Currency code (BTC, ETH, SOL) |
-
-**Options:**
-
-| Option | Type | Default | Description |
-|--------|------|---------|-------------|
-| `--kind` | string | all | Filter by: "option", "future" |
-| `--concurrency` | number | 3 | Parallel fetches (1-20) |
-| `--chunk-size` | number | 10000 | Trades per chunk |
-
-**Examples:**
+**Example:**
 ```bash
-bun src/cli/index.ts fetch-trades BTC
-bun src/cli/index.ts fetch-trades BTC --kind future --concurrency 5
-bun src/cli/index.ts fetch-trades ETH --kind option --chunk-size 5000
-```
-
-**Output:**
-```
-Fetching futures...
-  BTC-PERPETUAL: [████████░░] 80% (24,000/30,000 chunks)
-
-Fetching options...
-Options | ████████░░░░░░░░ | 45% | 234/520 instruments | 45,123 trades | 3 active
-
-✓ Futures: 240,000,000 trades from 12 instruments
-✓ Options: 1,234,567 trades from 10,222 instruments
+bun src/cli/index.ts fetch-trades BTC --concurrency 5
 ```
 
 **Storage:**
-- Trades written to JSONL during fetch (in-progress instruments)
-- Auto-converted to Parquet when instrument completes
-- JSONL automatically deleted after successful Parquet conversion
-- Final storage: `data/parquet-raw/BTC/*.parquet`
+- Trades written to JSONL during fetch (in-progress only)
+- Auto-converted to Parquet when complete
+- JSONL deleted after conversion
+- Final: `data/parquet-raw/BTC/*.parquet`
 
 ---
 
@@ -104,67 +54,33 @@ Fetch historical settlement prices.
 bun src/cli/index.ts fetch-deliveries <index>... [options]
 ```
 
-**Arguments:**
+**Arguments:** `index` (btc_usd, eth_usd, sol_usd)
+**Options:** `--concurrency <n>` (default: 2), `--batch-size <n>` (default: 100)
 
-| Argument | Type | Description |
-|----------|------|-------------|
-| `index` | string[] | One or more index names (btc_usd, eth_usd) |
-
-**Options:**
-
-| Option | Type | Default | Description |
-|--------|------|---------|-------------|
-| `--concurrency` | number | 2 | Parallel fetches |
-| `--batch-size` | number | 100 | Records per API call |
-
-**Examples:**
+**Example:**
 ```bash
-bun src/cli/index.ts fetch-deliveries btc_usd
-bun src/cli/index.ts fetch-deliveries btc_usd eth_usd sol_usd
-bun src/cli/index.ts fetch-deliveries btc_usd --concurrency 4
+bun src/cli/index.ts fetch-deliveries btc_usd eth_usd
 ```
 
 ---
 
 ### fetch-volatility
 
-Fetch historical volatility data for one or more currencies.
+Fetch historical volatility data.
 
 ```bash
 bun src/cli/index.ts fetch-volatility <currency>...
 ```
 
-**Arguments:**
+**Arguments:** `currency` (BTC, ETH, SOL)
+**Options:** `--concurrency <n>` (default: 2)
 
-| Argument | Type | Description |
-|----------|------|-------------|
-| `currency` | string | Currency codes (BTC, ETH, SOL, etc.) |
-
-**Options:**
-
-| Option | Type | Default | Description |
-|--------|------|---------|-------------|
-| `--concurrency` | number | 2 | Max parallel fetches |
-
-**Examples:**
+**Example:**
 ```bash
-bun src/cli/index.ts fetch-volatility BTC
 bun src/cli/index.ts fetch-volatility BTC ETH
 ```
 
-**Output:**
-```
-Fetching historical volatility for 2 currencies...
-
-  BTC: 384 records [0.1s]
-  ETH: 384 records [0.1s]
-
-✓ Fetched 768 volatility records
-```
-
-**Storage:**
-- Parquet files: `data/parquet-raw/volatility/{currency}.parquet`
-- Database metadata: `historical_volatility_metadata` table
+**Storage:** `data/parquet-raw/volatility/{currency}.parquet`
 
 ---
 
@@ -176,122 +92,79 @@ Complete pipeline: instruments → trades → deliveries → volatility.
 bun src/cli/index.ts fetch-all <currency> [options]
 ```
 
-**Arguments:**
+**Options:** `--kind <type>`, `--concurrency <n>`, `--skip-deliveries`, `--skip-volatility`
 
-| Argument | Type | Description |
-|----------|------|-------------|
-| `currency` | string | Currency code (BTC, ETH, SOL) |
-
-**Options:**
-
-| Option | Type | Default | Description |
-|--------|------|---------|-------------|
-| `--kind` | string | all | Filter by: "option", "future" |
-| `--concurrency` | number | 3 | Parallel fetches |
-| `--skip-deliveries` | boolean | false | Skip delivery price fetching |
-| `--skip-volatility` | boolean | false | Skip historical volatility fetching |
-
-**Examples:**
+**Example:**
 ```bash
-bun src/cli/index.ts fetch-all BTC
-bun src/cli/index.ts fetch-all BTC --kind option --concurrency 5
-bun src/cli/index.ts fetch-all ETH --skip-deliveries --skip-volatility
+bun src/cli/index.ts fetch-all BTC --concurrency 5
 ```
 
 ---
 
 ### merge-to-parquet
 
-Enrich raw Parquet files with computed Greeks and moneyness (optional analytics step).
+Enrich raw Parquet with Greeks using **TypeScript row-by-row** processing (~1-2k trades/sec).
 
-**Note:** Raw Parquet files are created automatically during fetch. This command is **optional** and creates enriched analytics files with Greeks calculations.
+**Note:** For large datasets, use `enrich-with-duckdb` (10-100x faster).
 
 ```bash
 bun src/cli/index.ts merge-to-parquet <currency> [options]
 ```
 
-**Arguments:**
-
-| Argument | Type | Description |
-|----------|------|-------------|
-| `currency` | string | Currency code (BTC, ETH, SOL) |
-
 **Options:**
+- `--min-expiration <date>` (e.g., "3m", "2024-01-01")
+- `--max-expiration <date>`
+- `--output-dir <path>` (default: ./data/parquet)
 
-| Option | Type | Default | Description |
-|--------|------|---------|-------------|
-| `--min-expiration` | string | none | Only merge options expiring after date (e.g., "3m", "2024-01-01") |
-| `--max-expiration` | string | none | Only merge options expiring before date |
-| `--output-dir` | string | ./data/parquet | Output directory for enriched Parquet files |
-
-**Date Formats:**
-- Relative: `3d` (3 days ago), `3m` (3 months ago), `1y` (1 year ago)
-- Absolute: `2024-01-01`, `2024-06-15`
-
-**Examples:**
+**Example:**
 ```bash
-# Enrich all completed BTC options with Greeks
-bun src/cli/index.ts merge-to-parquet BTC
-
-# Enrich only recent options (last 3 months)
 bun src/cli/index.ts merge-to-parquet BTC --min-expiration 3m
-
-# Enrich specific date range
-bun src/cli/index.ts merge-to-parquet ETH --min-expiration 2024-01-01 --max-expiration 2024-12-31
-
-# Custom output directory
-bun src/cli/index.ts merge-to-parquet BTC --output-dir ./analytics/btc
 ```
 
 **What it does:**
-1. Reads trades from raw Parquet (`data/parquet-raw/BTC/*.parquet`)
-2. Computes Greeks (delta, gamma, vega, theta) using Black-76 model
-3. Calculates moneyness (ITM/ATM/OTM)
-4. Writes enriched analytics Parquet (`data/parquet/BTC/*.parquet`)
+1. Read trades from `data/parquet-raw/BTC/*.parquet`
+2. Compute Greeks (Black-76) in TypeScript
+3. Calculate moneyness (ITM/ATM/OTM)
+4. Write to `data/parquet/BTC/*.parquet`
 
-**Output:**
-```
-━━━ Merging BTC Options to Parquet ━━━
+**Enriched Fields:** `delivery_price`, `moneyness`, `intrinsic_value`, `delta`, `gamma`, `vega`, `theta`, `theoretical_price`
 
-Filtering: expiring after 2026-05-18
-Found 1364 completed options
+---
 
-  ✓ BTC-20JUL26-65000-C: 185 trades enriched in 0.01s
-  ✓ BTC-20JUL26-65000-P: 142 trades enriched in 0.01s
-  ...
+### enrich-with-duckdb
 
-━━━ Merge Summary ━━━
-Total instruments: 1364
-Enriched instruments: 1364
-Total trades: 1,234,567
-Duration: 45.32s
+⚡ **High-performance Greeks enrichment** using DuckDB SQL vectorized computation.
+
+**Recommended for large datasets.** 10-100x faster than `merge-to-parquet`.
+
+```bash
+bun src/cli/index.ts enrich-with-duckdb <target>... [options]
 ```
 
-**What It Does:**
+**Arguments:** `target` (currency like BTC, or specific instrument)
+**Options:**
+- `--input-dir <path>` (default: ./data/parquet-raw)
+- `--output-dir <path>` (default: ./data/parquet-duckdb)
+- `--max-memory <size>` (default: 4GB)
+- `--threads <n>` (default: CPU cores)
 
-1. Reads trades from JSONL files
-2. Computes Greeks (delta, gamma, vega, theta) using Black-76 model
-3. Calculates moneyness (ITM/ATM/OTM) from delivery prices
-4. Writes enriched data to Parquet files
+**Example:**
+```bash
+bun src/cli/index.ts enrich-with-duckdb BTC --max-memory 8GB
+```
 
-**Enriched Fields:**
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `delivery_price` | double | Settlement price at expiration |
-| `moneyness` | string | "ITM", "ATM", or "OTM" |
-| `intrinsic_value` | double | max(0, delivery - strike) for calls |
-| `moneyness_percentage` | double | % by which option is ITM/OTM |
-| `delta` | double | Rate of change w.r.t. underlying |
-| `gamma` | double | Rate of change of delta |
-| `vega` | double | Sensitivity to volatility |
-| `theta` | double | Time decay per day |
-| `theoretical_price` | double | Black-76 fair value |
+**How it works:**
+1. Pure SQL Greeks (Black-76 as SQL expressions)
+2. Vectorized execution (DuckDB processes millions of rows in parallel)
+3. Memory efficient (streams Parquet, constant memory)
+4. Direct Parquet → Parquet (no intermediate formats)
 
 **Performance:**
-- ~1000-2000 trades/second
-- 10-100x faster queries vs JSONL
-- ~10x compression vs JSONL
+
+| Method | Throughput | Memory | CPU |
+|--------|-----------|--------|-----|
+| TypeScript | 1-2k trades/sec | High | 1 core |
+| DuckDB | 20-50k trades/sec | Low | All cores |
 
 ---
 
@@ -303,15 +176,8 @@ Show download statistics.
 bun src/cli/index.ts stats [currency]
 ```
 
-**Arguments:**
-
-| Argument | Type | Description |
-|----------|------|-------------|
-| `currency` | string | Optional: Currency filter (BTC, ETH, SOL) |
-
-**Examples:**
+**Example:**
 ```bash
-bun src/cli/index.ts stats
 bun src/cli/index.ts stats BTC
 ```
 
@@ -321,112 +187,64 @@ bun src/cli/index.ts stats BTC
 
 ### DeribitClient
 
-HTTP client for Deribit API with rate limiting and retries.
-
-#### Constructor
+HTTP client with rate limiting and retries.
 
 ```typescript
-new DeribitClient(config?: DeribitClientConfig)
+new DeribitClient(config?: {
+  baseUrl?: string;
+  historyBaseUrl?: string;
+  rateLimiter?: RateLimiter;
+  maxRetries?: number;
+  retryDelay?: number;
+})
 ```
 
-**Config:**
-```typescript
-interface DeribitClientConfig {
-  baseUrl?: string;              // Default: "https://www.deribit.com/api/v2"
-  historyBaseUrl?: string;       // Default: "https://history.deribit.com/api/v2"
-  rateLimiter?: RateLimiter;     // Default: 15 req/s limiter
-  maxRetries?: number;           // Default: 3
-  retryDelay?: number;           // Default: 1000ms
-}
-```
-
-#### Methods
-
-**getInstruments**
+**Methods:**
 
 ```typescript
+// Fetch instruments
 async getInstruments(
   currency: string,
   kind?: "future" | "option" | "spot",
   expired?: boolean
 ): Promise<DeribitInstrument[]>
-```
 
-Fetch all instruments for a currency.
-
-**Example:**
-```typescript
-const client = new DeribitClient();
-const instruments = await client.getInstruments("BTC", "option", true);
-console.log(instruments.length); // 10,234
-```
-
-**getTradesBySeq**
-
-```typescript
+// Fetch trades by sequence range
 async getTradesBySeq(
   instrumentName: string,
   startSeq: number,
   endSeq: number,
   count?: number
 ): Promise<{ trades: DeribitTrade[]; hasMore: boolean }>
-```
 
-Fetch trades by sequence range.
-
-**Example:**
-```typescript
-const { trades, hasMore } = await client.getTradesBySeq(
-  "BTC-PERPETUAL",
-  1,
-  10000,
-  10000
-);
-console.log(trades.length); // 10,000
-```
-
-**getAllTradesBySeq**
-
-```typescript
+// Stream all trades in range
 async *getAllTradesBySeq(
   instrumentName: string,
   startSeq: number,
   endSeq: number,
   batchSize?: number
 ): AsyncGenerator<DeribitTrade[]>
-```
 
-Stream all trades in a range.
-
-**Example:**
-```typescript
-for await (const batch of client.getAllTradesBySeq("BTC-PERPETUAL", 1, 100000)) {
-  console.log(`Fetched ${batch.length} trades`);
-}
-```
-
-**getDeliveryPrices**
-
-```typescript
+// Fetch delivery prices
 async getDeliveryPrices(
   indexName: string,
   offset?: number,
   count?: number
 ): Promise<{ data: DeribitDeliveryPrice[]; recordsTotal: number }>
-```
 
-Fetch delivery prices with pagination.
-
-**getAllDeliveryPrices**
-
-```typescript
+// Stream all delivery prices
 async *getAllDeliveryPrices(
   indexName: string,
   batchSize?: number
 ): AsyncGenerator<DeribitDeliveryPrice[]>
 ```
 
-Stream all delivery prices.
+**Example:**
+```typescript
+const client = new DeribitClient();
+const instruments = await client.getInstruments("BTC", "option", true);
+const { trades } = await client.getTradesBySeq("BTC-PERPETUAL", 1, 10000);
+```
 
 ---
 
@@ -434,102 +252,28 @@ Stream all delivery prices.
 
 SQLite wrapper for metadata and checkpoints.
 
-#### Constructor
-
 ```typescript
 new Database(path?: string)  // Default: "deribit-data.db"
 ```
 
-#### Methods
-
-**upsertInstruments**
+**Key Methods:**
 
 ```typescript
-upsertInstruments(instruments: Array<{
-  instrument_name: string;
-  kind: string;
-  base_currency: string;
-  expiration_timestamp?: number;
-  strike?: number;
-  option_type?: string;
-  is_active: boolean;
-  settlement_period?: string;
-  last_seq?: number;
-}>): void
-```
+// Instruments
+upsertInstruments(instruments: Array<{...}>): void
+getInstruments(currency: string, kind?: string): Array<InstrumentRecord>
 
-**getInstruments**
+// Future chunks
+createFutureChunks(instrumentName: string, lastSeq: number, chunkSize?: number): void
+getIncompleteFutureChunks(instrumentName: string): Array<{...}>
+markFutureChunkDone(instrumentName: string, chunkStartSeq: number, chunkEndSeq: number, tradeCount: number, jsonlPath: string): void
 
-```typescript
-getInstruments(
-  currency: string,
-  kind?: string,
-  expired?: boolean
-): Array<InstrumentRecord>
-```
+// Option progress
+getOptionProgress(instrumentName: string): { last_no: number; status: string; trade_count: number; }
+updateOptionProgress(instrumentName: string, lastNo: number, tradeCount: number, jsonlPath: string): void
 
-**createFutureChunks**
-
-```typescript
-createFutureChunks(
-  instrumentName: string,
-  lastSeq: number,
-  chunkSize?: number
-): void
-```
-
-**getIncompleteFutureChunks**
-
-```typescript
-getIncompleteFutureChunks(instrumentName: string): Array<{
-  id: number;
-  chunk_start_seq: number;
-  chunk_end_seq: number;
-}>
-```
-
-**markFutureChunkDone**
-
-```typescript
-markFutureChunkDone(
-  instrumentName: string,
-  chunkStartSeq: number,
-  chunkEndSeq: number,
-  tradeCount: number,
-  jsonlPath: string
-): void
-```
-
-**getOptionProgress**
-
-```typescript
-getOptionProgress(instrumentName: string): {
-  last_no: number;
-  status: string;
-  trade_count: number;
-}
-```
-
-**updateOptionProgress**
-
-```typescript
-updateOptionProgress(
-  instrumentName: string,
-  lastNo: number,
-  tradeCount: number,
-  jsonlPath: string
-): void
-```
-
-**insertDeliveryPrices**
-
-```typescript
+// Delivery prices
 insertDeliveryPrices(deliveryPrices: DeliveryPrice[]): void
-```
-
-**getDeliveryPrice**
-
-```typescript
 getDeliveryPrice(indexName: string, date: number): DeliveryPrice | null
 ```
 
@@ -539,48 +283,18 @@ getDeliveryPrice(indexName: string, date: number): DeliveryPrice | null
 
 Append-only JSONL file storage for trades.
 
-#### Constructor
-
 ```typescript
 new JSONLStorage(dataDir?: string)  // Default: "./data/jsonl"
 ```
 
-#### Methods
-
-**appendTrades**
+**Methods:**
 
 ```typescript
-async appendTrades(
-  instrumentName: string,
-  trades: DeribitTrade[]
-): Promise<void>
-```
-
-Append trades to JSONL file (with automatic flush).
-
-**readTrades**
-
-```typescript
+async appendTrades(instrumentName: string, trades: DeribitTrade[]): Promise<void>
 async readTrades(instrumentName: string): Promise<DeribitTrade[]>
-```
-
-Read all trades from JSONL file.
-
-**countTrades**
-
-```typescript
 async countTrades(instrumentName: string): Promise<number>
-```
-
-Count trades without loading into memory.
-
-**closeAll**
-
-```typescript
 async closeAll(): Promise<void>
 ```
-
-Close all open file handles (call on shutdown).
 
 ---
 
@@ -588,127 +302,30 @@ Close all open file handles (call on shutdown).
 
 Pure functions for option pricing and Greeks.
 
-**black76Call**
-
 ```typescript
-function black76Call(
-  forwardPrice: number,
-  strike: number,
-  timeToExpiry: number,
-  volatility: number,
-  discountFactor?: number
-): number
+// Price calculations
+black76Call(forwardPrice: number, strike: number, timeToExpiry: number, volatility: number, discountFactor?: number): number
+black76Put(...): number
+
+// Greeks
+delta(forwardPrice, strike, timeToExpiry, volatility, optionType: "call" | "put", discountFactor?): number
+gamma(forwardPrice, strike, timeToExpiry, volatility, discountFactor?): number
+vega(forwardPrice, strike, timeToExpiry, volatility, discountFactor?): number  // Per 1% vol change
+theta(forwardPrice, strike, timeToExpiry, volatility, optionType, discountFactor?, riskFreeRate?): number  // Per day
+
+// All at once
+calculateGreeks(forwardPrice, strike, timeToExpiry, volatility, optionType, discountFactor?, riskFreeRate?): Black76Greeks
 ```
-
-Calculate call option price.
-
-**Example:**
-```typescript
-const price = black76Call(62000, 60000, 0.5, 0.65, 1);
-console.log(price); // 3245.67
-```
-
-**black76Put**
-
-```typescript
-function black76Put(
-  forwardPrice: number,
-  strike: number,
-  timeToExpiry: number,
-  volatility: number,
-  discountFactor?: number
-): number
-```
-
-**delta**
-
-```typescript
-function delta(
-  forwardPrice: number,
-  strike: number,
-  timeToExpiry: number,
-  volatility: number,
-  optionType: "call" | "put",
-  discountFactor?: number
-): number
-```
-
-**gamma**
-
-```typescript
-function gamma(
-  forwardPrice: number,
-  strike: number,
-  timeToExpiry: number,
-  volatility: number,
-  discountFactor?: number
-): number
-```
-
-**vega**
-
-```typescript
-function vega(
-  forwardPrice: number,
-  strike: number,
-  timeToExpiry: number,
-  volatility: number,
-  discountFactor?: number
-): number
-```
-
-Returns vega per 1% change in volatility.
-
-**theta**
-
-```typescript
-function theta(
-  forwardPrice: number,
-  strike: number,
-  timeToExpiry: number,
-  volatility: number,
-  optionType: "call" | "put",
-  discountFactor?: number,
-  riskFreeRate?: number
-): number
-```
-
-Returns theta per day.
-
-**calculateGreeks**
-
-```typescript
-function calculateGreeks(
-  forwardPrice: number,
-  strike: number,
-  timeToExpiry: number,
-  volatility: number,
-  optionType: "call" | "put",
-  discountFactor?: number,
-  riskFreeRate?: number
-): Black76Greeks
-```
-
-Calculate all Greeks at once.
 
 **Example:**
 ```typescript
 const greeks = calculateGreeks(62000, 60000, 0.5, 0.65, "call");
-console.log(greeks);
-// {
-//   price: 3245.67,
-//   delta: 0.68,
-//   gamma: 0.000012,
-//   vega: 156.3,
-//   theta: -8.45
-// }
+// { price: 3245.67, delta: 0.68, gamma: 0.000012, vega: 156.3, theta: -8.45 }
 ```
 
 ---
 
 ### Moneyness
-
-**determineMoneyness**
 
 ```typescript
 function determineMoneyness(
@@ -716,99 +333,37 @@ function determineMoneyness(
   deliveryPrice: number,
   optionType: "call" | "put"
 ): Moneyness
+
+enum Moneyness { ITM = "ITM", ATM = "ATM", OTM = "OTM" }
 ```
 
 **Example:**
 ```typescript
-const moneyness = determineMoneyness(60000, 62000, "call");
-console.log(moneyness); // Moneyness.ITM
-```
-
-**Enum:**
-```typescript
-enum Moneyness {
-  ITM = "ITM",  // In the money
-  ATM = "ATM",  // At the money
-  OTM = "OTM"   // Out of the money
-}
-```
-
----
-
-### Utility Functions
-
-**parseInstrumentName**
-
-```typescript
-function parseInstrumentName(instrumentName: string): Instrument | null
-```
-
-Parse instrument name into components.
-
-**Example:**
-```typescript
-const instrument = parseInstrumentName("BTC-27DEC24-60000-C");
-console.log(instrument);
-// {
-//   name: "BTC-27DEC24-60000-C",
-//   underlying: "BTC",
-//   strike: 60000,
-//   expiration: 1735372800000,
-//   optionType: "call",
-//   instrumentType: "option"
-// }
+const moneyness = determineMoneyness(60000, 62000, "call");  // Moneyness.ITM
 ```
 
 ---
 
 ### ParquetWriter
 
-Infrastructure class for converting JSONL trades to enriched Parquet files.
-
-#### Constructor
+Infrastructure class for JSONL → enriched Parquet conversion.
 
 ```typescript
-new ParquetWriter(config: ParquetWriterConfig)
+new ParquetWriter(config: {
+  database: Database;
+  jsonlStorage: JSONLStorage;
+  outputDir?: string;
+})
 ```
 
-**Config:**
-```typescript
-interface ParquetWriterConfig {
-  database: Database;              // Database instance for metadata + delivery prices
-  jsonlStorage: JSONLStorage;      // JSONL storage for reading trades
-  outputDir?: string;              // Default: "./data/parquet"
-}
-```
-
-#### Methods
-
-**enrichInstrument()**
-
-Convert a single instrument's trades to Parquet with computed Greeks and moneyness.
+**Methods:**
 
 ```typescript
 async enrichInstrument(
   instrumentName: string,
   onProgress?: (progress: EnrichmentProgress) => void
 ): Promise<EnrichmentProgress>
-```
 
-**Example:**
-```typescript
-const writer = new ParquetWriter({
-  database: new Database(),
-  jsonlStorage: new JSONLStorage(),
-});
-
-const result = await writer.enrichInstrument("BTC-10AUG26-65000-C");
-console.log(`Enriched ${result.enrichedTrades} trades`);
-```
-
-**enrichMultipleInstruments()**
-
-Process multiple instruments with progress tracking.
-
-```typescript
 async enrichMultipleInstruments(
   instrumentNames: string[],
   onProgress?: (progress: EnrichmentProgress) => void
@@ -821,64 +376,40 @@ async enrichMultipleInstruments(
 
 Application-layer orchestrator for JSONL → Parquet pipeline.
 
-#### Constructor
-
 ```typescript
-new ParquetMerger(config: ParquetMergerConfig)
-```
-
-**Config:**
-```typescript
-interface ParquetMergerConfig {
+new ParquetMerger(config: {
   database: Database;
   jsonlStorage: JSONLStorage;
   outputDir?: string;
-}
+})
 ```
 
-#### Methods
-
-**mergeCurrency()**
-
-Merge all completed options for a currency.
+**Methods:**
 
 ```typescript
 async mergeCurrency(
   currency: string,
-  onProgress?: (progress: EnrichmentProgress) => void,
+  onProgress?: (progress) => void,
   minExpiration?: number,
   maxExpiration?: number
 ): Promise<MergeResult>
+
+async mergeAllCurrencies(
+  currencies: string[],
+  onProgress?: (progress) => void
+): Promise<MergeResult[]>
 ```
 
 **Example:**
 ```typescript
-const merger = new ParquetMerger({
-  database: new Database(),
-  jsonlStorage: new JSONLStorage(),
-});
-
+const merger = new ParquetMerger({ database, jsonlStorage });
 const result = await merger.mergeCurrency("BTC");
 console.log(`Merged ${result.enrichedInstruments} instruments`);
-console.log(`Total trades: ${result.totalTrades}`);
-```
-
-**mergeAllCurrencies()**
-
-Merge multiple currencies in sequence.
-
-```typescript
-async mergeAllCurrencies(
-  currencies: string[],
-  onProgress?: (progress: EnrichmentProgress) => void
-): Promise<MergeResult[]>
 ```
 
 ---
 
 ## Type Definitions
-
-### Core Types
 
 ```typescript
 interface Trade {

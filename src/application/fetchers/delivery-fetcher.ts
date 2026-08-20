@@ -1,11 +1,9 @@
 import { DeribitClient } from "../../infrastructure/deribit-client.ts";
-import { Database } from "../../infrastructure/database.ts";
 import { ParquetStorage } from "../../infrastructure/parquet-storage.ts";
 import type { DeribitDeliveryPrice } from "../../domain/models.ts";
 
 export interface DeliveryFetcherConfig {
   client: DeribitClient;
-  database: Database;
   storage: ParquetStorage;
   batchSize?: number; // Records per API request
 }
@@ -25,13 +23,11 @@ export interface DeliveryFetchProgress {
  */
 export class DeliveryFetcher {
   private client: DeribitClient;
-  private database: Database;
   private storage: ParquetStorage;
   private batchSize: number;
 
   constructor(config: DeliveryFetcherConfig) {
     this.client = config.client;
-    this.database = config.database;
     this.storage = config.storage;
     this.batchSize = config.batchSize ?? 100;
   }
@@ -149,28 +145,4 @@ export class DeliveryFetcher {
     return results;
   }
 
-  /**
-   * Get delivery price for a specific date, fetching if not in DB
-   *
-   * @param indexName - Index name
-   * @param date - Timestamp in milliseconds
-   * @returns Delivery price or null if not found
-   */
-  async getOrFetchDeliveryPrice(
-    indexName: string,
-    date: number
-  ): Promise<number | null> {
-    // Check database first
-    const cached = this.database.getDeliveryPrice(indexName, date);
-    if (cached) {
-      return cached.deliveryPrice;
-    }
-
-    // Fetch all delivery prices for the index
-    await this.fetchDeliveryPrices(indexName);
-
-    // Try again from database
-    const fetched = this.database.getDeliveryPrice(indexName, date);
-    return fetched?.deliveryPrice ?? null;
-  }
 }

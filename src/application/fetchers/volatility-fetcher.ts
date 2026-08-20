@@ -1,11 +1,9 @@
 import { DeribitClient } from "../../infrastructure/deribit-client.ts";
-import { Database } from "../../infrastructure/database.ts";
 import { ParquetStorage } from "../../infrastructure/parquet-storage.ts";
 import type { DeribitHistoricalVolatility } from "../../domain/models.ts";
 
 export interface VolatilityFetcherConfig {
   client: DeribitClient;
-  database: Database;
   storage: ParquetStorage;
 }
 
@@ -24,12 +22,10 @@ export interface VolatilityFetchProgress {
  */
 export class VolatilityFetcher {
   private client: DeribitClient;
-  private database: Database;
   private storage: ParquetStorage;
 
   constructor(config: VolatilityFetcherConfig) {
     this.client = config.client;
-    this.database = config.database;
     this.storage = config.storage;
   }
 
@@ -62,9 +58,6 @@ export class VolatilityFetcher {
 
       // Write to Parquet file
       await this.storage.writeHistoricalVolatility(currency, volatilityData);
-
-      // Update database metadata
-      this.database.upsertVolatilityMetadata(currency, volatilityData.length);
 
       progress.endTime = Date.now();
 
