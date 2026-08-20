@@ -224,6 +224,39 @@ export class DuckDBEnricher {
   }
 
   /**
+   * Enrich a currency - wrapper method for BunQueue compatibility
+   */
+  async enrich(
+    currency: string,
+    inputDir?: string,
+    outputDir?: string,
+    maxMemory?: string,
+    threads?: number
+  ): Promise<{ totalTrades: number; successCount: number; failedCount: number }> {
+    // Update config if provided
+    if (inputDir) this.inputDir = inputDir;
+    if (outputDir) this.outputDir = outputDir;
+    if (maxMemory) this.maxMemory = maxMemory;
+    if (threads !== undefined) this.threads = threads;
+
+    // Initialize DuckDB
+    await this.initialize();
+
+    // Enrich all instruments
+    const results = await this.enrichCurrency(currency);
+
+    // Cleanup
+    await this.cleanup();
+
+    // Return summary
+    const totalTrades = results.reduce((sum, r) => sum + r.tradeCount, 0);
+    const successCount = results.filter(r => !r.error).length;
+    const failedCount = results.filter(r => r.error).length;
+
+    return { totalTrades, successCount, failedCount };
+  }
+
+  /**
    * Cleanup DuckDB resources
    */
   async cleanup(): Promise<void> {

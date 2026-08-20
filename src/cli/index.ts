@@ -9,7 +9,6 @@ import { DeliveryFetcher } from "../application/fetchers/delivery-fetcher.ts";
 import { VolatilityFetcher } from "../application/fetchers/volatility-fetcher.ts";
 import { ParquetMerger } from "../application/analytics/parquet-merger.ts";
 import { ParquetConverter } from "../application/converters/parquet-converter.ts";
-import { DuckDBEnricher } from "../application/analytics/duckdb-enricher.ts";
 import cliProgress from "cli-progress";
 import Table from "cli-table3";
 
@@ -188,8 +187,8 @@ Commands:
       bun src/cli/index.ts merge-to-parquet ETH --min-expiration 2024-01-01 --max-expiration 2024-12-31
 
   enrich-with-duckdb <currency>
-    Enrich raw Parquet files with Greeks using DuckDB (parallel, memory-efficient)
-    10-100x faster than TypeScript for large datasets
+    Enqueue enrichment job to add Greeks to raw Parquet files using DuckDB
+    10-100x faster than TypeScript, retryable via BunQueue
 
     Options:
       --input-dir <path>      Input directory for raw Parquet (default: ./data/parquet-raw)
@@ -201,6 +200,7 @@ Commands:
       bun src/cli/index.ts enrich-with-duckdb BTC
       bun src/cli/index.ts enrich-with-duckdb BTC --max-memory 8GB --threads 8
       bun src/cli/index.ts enrich-with-duckdb ETH --output-dir ./data/enriched
+      bun src/cli/index.ts queue-dashboard  # Monitor progress
 
   stats [currency]
     Show download statistics
@@ -724,43 +724,27 @@ async function enrichWithDuckDBCommand(args: string[]) {
   const maxMemory = parsed.flags["max-memory"] as string | undefined;
   const threads = parsed.flags["threads"] ? parseInt(parsed.flags["threads"] as string) : undefined;
 
-  const enricher = new DuckDBEnricher({
+  console.log(`\n━━━ Enqueueing DuckDB Enrichment: ${currency} ━━━`);
+  console.log(`Input:  ${inputDir ?? './data/parquet-raw'}`);
+  console.log(`Output: ${outputDir ?? './data/parquet-duckdb'}`);
+  console.log(`Memory: ${maxMemory ?? '4GB'}`);
+  console.log(`Threads: ${threads ?? 'auto'}\n`);
+
+  // Enqueue enrichment job
+  const { QueueManager } = await import("../infrastructure/queue.ts");
+  const queue = QueueManager.getQueue();
+
+  const job = await queue.add("enrich-duckdb", {
+    currency,
     inputDir,
     outputDir,
     maxMemory,
     threads,
   });
 
-  console.log(`\n━━━ DuckDB Enrichment: ${currency} ━━━`);
-  console.log(`Input:  ${inputDir ?? './data/parquet-raw'}`);
-  console.log(`Output: ${outputDir ?? './data/parquet-duckdb'}`);
-  console.log(`Memory: ${maxMemory ?? '4GB'}`);
-  console.log(`Threads: ${threads ?? 'auto'}\n`);
-
-  // Initialize DuckDB
-  await enricher.initialize();
-
-  // Enrich all instruments for currency
-  const results = await enricher.enrichCurrency(currency);
-
-  // Cleanup
-  await enricher.cleanup();
-
-  // Summary
-  const successful = results.filter(r => !r.error);
-  const failed = results.filter(r => r.error);
-
-  if (failed.length > 0) {
-    console.log(`\n⚠️  ${failed.length} instruments failed:`);
-    for (const result of failed.slice(0, 5)) {
-      console.log(`  ${result.instrumentName}: ${result.error}`);
-    }
-    if (failed.length > 5) {
-      console.log(`  ... and ${failed.length - 5} more`);
-    }
-  }
-
-  console.log(`\nEnriched Parquet files written to: ${outputDir ?? './data/parquet-duckdb'}/${currency}/\n`);
+  console.log(`✓ Enrichment job enqueued (ID: ${job.id})`);
+  console.log(`\nMonitor progress:`);
+  console.log(`  bun src/cli/index.ts queue-dashboard  # http://localhost:6790\n`);
 }
 
 async function statsCommand(args: string[]) {
