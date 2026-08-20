@@ -119,13 +119,16 @@ export class DuckDBEnricher {
   }
 
   /**
-   * Enrich all instruments for a currency
+   * Enrich all instruments for a currency using DuckDB bulk processing
+   *
+   * Strategy: Get list of files from filesystem, then use DuckDB to process each file's
+   * Greeks calculation in pure SQL (vectorized). This is faster than loading data into Node.js.
    */
   async enrichCurrency(
     currency: string,
     onProgress?: (progress: EnrichmentProgress) => void
   ): Promise<EnrichmentResult[]> {
-    console.log(`\n━━━ DuckDB Enrichment: ${currency} Options ━━━\n`);
+    console.log(`\n━━━ DuckDB Enrichment: ${currency} (Bulk SQL Processing) ━━━\n`);
 
     // Find all raw Parquet files for this currency using Bun.Glob
     const glob = new Bun.Glob("*.parquet");
@@ -137,10 +140,17 @@ export class DuckDBEnricher {
       return [];
     }
 
-    console.log(`Found ${fileNames.length} instruments to enrich\n`);
+    console.log(`Found ${fileNames.length} instruments to enrich`);
+    console.log(`Processing with DuckDB vectorized SQL (all cores)\n`);
 
     const results: EnrichmentResult[] = [];
     const overallStart = Date.now();
+
+    // Ensure output directory exists
+    const outputCurrencyDir = join(this.outputDir, currency);
+    if (!existsSync(outputCurrencyDir)) {
+      mkdirSync(outputCurrencyDir, { recursive: true });
+    }
 
     for (let i = 0; i < fileNames.length; i++) {
       const fileName = fileNames[i]!;
@@ -155,14 +165,14 @@ export class DuckDBEnricher {
         });
       }
 
-      console.log(`[${i + 1}/${fileNames.length}] Processing ${instrumentName}...`);
+      console.log(`[${i + 1}/${fileNames.length}] ${instrumentName}...`);
 
       const result = await this.enrichInstrument(instrumentName);
 
       if (result.error) {
         console.log(`  ✗ Error: ${result.error}`);
       } else {
-        console.log(`  ✓ ${result.tradeCount} trades enriched in ${(result.duration / 1000).toFixed(2)}s`);
+        console.log(`  ✓ ${result.tradeCount.toLocaleString()} trades (${(result.duration / 1000).toFixed(2)}s)`);
       }
 
       results.push(result);
