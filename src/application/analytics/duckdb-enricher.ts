@@ -1,7 +1,7 @@
 import { initializeDuckDB, getDuckDBConnection, closeDuckDB, executeSQLQuery, executeSQLStatement } from "../../infrastructure/duckdb-connection.ts";
 import { generateGreeksEnrichmentQuery } from "../../infrastructure/duckdb-greeks.ts";
-import { glob } from "glob";
-import { join } from "node:path";
+import { join, dirname } from "node:path";
+import { mkdirSync, existsSync } from "node:fs";
 
 export interface DuckDBEnricherConfig {
   inputDir?: string;   // Default: ./data/parquet-raw
@@ -75,6 +75,12 @@ export class DuckDBEnricher {
         onProgress({ instrumentName, startTime });
       }
 
+      // Ensure output directory exists
+      const outputDir = dirname(outputFile);
+      if (!existsSync(outputDir)) {
+        mkdirSync(outputDir, { recursive: true });
+      }
+
       // Generate enrichment SQL
       const sql = generateGreeksEnrichmentQuery({
         inputPath: inputFile,
@@ -84,10 +90,11 @@ export class DuckDBEnricher {
       // Execute using DuckDB
       await executeSQLStatement(sql);
 
-      // Count trades in output
+      // Count trades in output (DuckDB returns BigInt, convert to number)
       const countSQL = `SELECT COUNT(*) as count FROM read_parquet('${outputFile}')`;
-      const countResult = await executeSQLQuery<{ count: number }>(countSQL);
-      const tradeCount = countResult[0]?.count ?? 0;
+      const countResult = await executeSQLQuery<{ count: bigint | number }>(countSQL);
+      const countValue = countResult[0]?.count ?? 0;
+      const tradeCount = typeof countValue === 'bigint' ? Number(countValue) : countValue;
 
       const duration = Date.now() - startTime;
 
@@ -120,34 +127,35 @@ export class DuckDBEnricher {
   ): Promise<EnrichmentResult[]> {
     console.log(`\n━━━ DuckDB Enrichment: ${currency} Options ━━━\n`);
 
-    // Find all raw Parquet files for this currency
-    const pattern = join(this.inputDir, currency, "*.parquet");
-    const files = await glob(pattern);
+    // Find all raw Parquet files for this currency using Bun.Glob
+    const glob = new Bun.Glob("*.parquet");
+    const scanPath = join(this.inputDir, currency);
+    const fileNames = await Array.fromAsync(glob.scan({ cwd: scanPath }));
 
-    if (files.length === 0) {
-      console.log(`No Parquet files found at: ${pattern}`);
+    if (fileNames.length === 0) {
+      console.log(`No Parquet files found in: ${scanPath}`);
       return [];
     }
 
-    console.log(`Found ${files.length} instruments to enrich\n`);
+    console.log(`Found ${fileNames.length} instruments to enrich\n`);
 
     const results: EnrichmentResult[] = [];
     const overallStart = Date.now();
 
-    for (let i = 0; i < files.length; i++) {
-      const file = files[i]!;
-      const instrumentName = file.split("/").pop()!.replace(".parquet", "");
+    for (let i = 0; i < fileNames.length; i++) {
+      const fileName = fileNames[i]!;
+      const instrumentName = fileName.replace(".parquet", "");
 
       if (onProgress) {
         onProgress({
           instrumentName,
           currentInstrument: i + 1,
-          totalInstruments: files.length,
+          totalInstruments: fileNames.length,
           startTime: overallStart,
         });
       }
 
-      console.log(`[${i + 1}/${files.length}] Processing ${instrumentName}...`);
+      console.log(`[${i + 1}/${fileNames.length}] Processing ${instrumentName}...`);
 
       const result = await this.enrichInstrument(instrumentName);
 
@@ -165,7 +173,7 @@ export class DuckDBEnricher {
     const successCount = results.filter(r => !r.error).length;
 
     console.log(`\n━━━ Enrichment Complete ━━━`);
-    console.log(`Instruments: ${successCount}/${files.length} successful`);
+    console.log(`Instruments: ${successCount}/${fileNames.length} successful`);
     console.log(`Total trades: ${totalTrades.toLocaleString()}`);
     console.log(`Duration: ${totalDuration.toFixed(2)}s`);
     console.log(`Throughput: ${(totalTrades / totalDuration).toFixed(0)} trades/sec\n`);

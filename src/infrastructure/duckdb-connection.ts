@@ -92,13 +92,8 @@ export async function executeSQLStatement(sql: string): Promise<void> {
  * Close DuckDB connection and instance
  */
 export async function closeDuckDB(): Promise<void> {
-  if (connection) {
-    await connection.close();
-    connection = null;
-  }
-
-  if (instance) {
-    await instance.close();
-    instance = null;
-  }
+  // DuckDB connections and instances in @duckdb/node-api don't have close methods
+  // Just set to null to allow garbage collection
+  connection = null;
+  instance = null;
 }
