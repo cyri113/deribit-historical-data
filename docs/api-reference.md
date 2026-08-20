@@ -82,11 +82,17 @@ Fetching futures...
   BTC-PERPETUAL: [████████░░] 80% (24,000/30,000 chunks)
 
 Fetching options...
-  BTC-27DEC24-60000-C: ✓ Complete (5,234 trades)
+Options | ████████░░░░░░░░ | 45% | 234/520 instruments | 45,123 trades | 3 active
 
 ✓ Futures: 240,000,000 trades from 12 instruments
 ✓ Options: 1,234,567 trades from 10,222 instruments
 ```
+
+**Storage:**
+- Trades written to JSONL during fetch (in-progress instruments)
+- Auto-converted to Parquet when instrument completes
+- JSONL automatically deleted after successful Parquet conversion
+- Final storage: `data/parquet-raw/BTC/*.parquet`
 
 ---
 
@@ -120,9 +126,51 @@ bun src/cli/index.ts fetch-deliveries btc_usd --concurrency 4
 
 ---
 
+### fetch-volatility
+
+Fetch historical volatility data for one or more currencies.
+
+```bash
+bun src/cli/index.ts fetch-volatility <currency>...
+```
+
+**Arguments:**
+
+| Argument | Type | Description |
+|----------|------|-------------|
+| `currency` | string | Currency codes (BTC, ETH, SOL, etc.) |
+
+**Options:**
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `--concurrency` | number | 2 | Max parallel fetches |
+
+**Examples:**
+```bash
+bun src/cli/index.ts fetch-volatility BTC
+bun src/cli/index.ts fetch-volatility BTC ETH
+```
+
+**Output:**
+```
+Fetching historical volatility for 2 currencies...
+
+  BTC: 384 records [0.1s]
+  ETH: 384 records [0.1s]
+
+✓ Fetched 768 volatility records
+```
+
+**Storage:**
+- Parquet files: `data/parquet-raw/volatility/{currency}.parquet`
+- Database metadata: `historical_volatility_metadata` table
+
+---
+
 ### fetch-all
 
-Complete pipeline: instruments → trades → deliveries.
+Complete pipeline: instruments → trades → deliveries → volatility.
 
 ```bash
 bun src/cli/index.ts fetch-all <currency> [options]
@@ -141,19 +189,22 @@ bun src/cli/index.ts fetch-all <currency> [options]
 | `--kind` | string | all | Filter by: "option", "future" |
 | `--concurrency` | number | 3 | Parallel fetches |
 | `--skip-deliveries` | boolean | false | Skip delivery price fetching |
+| `--skip-volatility` | boolean | false | Skip historical volatility fetching |
 
 **Examples:**
 ```bash
 bun src/cli/index.ts fetch-all BTC
 bun src/cli/index.ts fetch-all BTC --kind option --concurrency 5
-bun src/cli/index.ts fetch-all ETH --skip-deliveries
+bun src/cli/index.ts fetch-all ETH --skip-deliveries --skip-volatility
 ```
 
 ---
 
 ### merge-to-parquet
 
-Convert JSONL trades to enriched Parquet files with computed Greeks and moneyness.
+Enrich raw Parquet files with computed Greeks and moneyness (optional analytics step).
+
+**Note:** Raw Parquet files are created automatically during fetch. This command is **optional** and creates enriched analytics files with Greeks calculations.
 
 ```bash
 bun src/cli/index.ts merge-to-parquet <currency> [options]
@@ -171,7 +222,7 @@ bun src/cli/index.ts merge-to-parquet <currency> [options]
 |--------|------|---------|-------------|
 | `--min-expiration` | string | none | Only merge options expiring after date (e.g., "3m", "2024-01-01") |
 | `--max-expiration` | string | none | Only merge options expiring before date |
-| `--output-dir` | string | ./data/parquet | Output directory for Parquet files |
+| `--output-dir` | string | ./data/parquet | Output directory for enriched Parquet files |
 
 **Date Formats:**
 - Relative: `3d` (3 days ago), `3m` (3 months ago), `1y` (1 year ago)
@@ -179,18 +230,24 @@ bun src/cli/index.ts merge-to-parquet <currency> [options]
 
 **Examples:**
 ```bash
-# Merge all completed BTC options
+# Enrich all completed BTC options with Greeks
 bun src/cli/index.ts merge-to-parquet BTC
 
-# Merge only recent options (last 3 months)
+# Enrich only recent options (last 3 months)
 bun src/cli/index.ts merge-to-parquet BTC --min-expiration 3m
 
-# Merge specific date range
+# Enrich specific date range
 bun src/cli/index.ts merge-to-parquet ETH --min-expiration 2024-01-01 --max-expiration 2024-12-31
 
 # Custom output directory
 bun src/cli/index.ts merge-to-parquet BTC --output-dir ./analytics/btc
 ```
+
+**What it does:**
+1. Reads trades from raw Parquet (`data/parquet-raw/BTC/*.parquet`)
+2. Computes Greeks (delta, gamma, vega, theta) using Black-76 model
+3. Calculates moneyness (ITM/ATM/OTM)
+4. Writes enriched analytics Parquet (`data/parquet/BTC/*.parquet`)
 
 **Output:**
 ```

@@ -223,6 +223,44 @@ WHERE index_name = 'btc_usd'
 ORDER BY date;
 ```
 
+---
+
+### Table: `historical_volatility_metadata`
+
+Tracks historical volatility data fetches for each currency.
+
+```sql
+CREATE TABLE historical_volatility_metadata (
+  currency TEXT PRIMARY KEY,                      -- e.g., "BTC", "ETH"
+  record_count INTEGER NOT NULL,                  -- Number of volatility records fetched
+  last_fetched_at INTEGER DEFAULT (unixepoch() * 1000)
+);
+```
+
+**Purpose:**
+- Track when volatility data was last fetched
+- Store metadata about volatility records
+- Historical volatility data is stored in Parquet files at `data/parquet-raw/volatility/{currency}.parquet`
+
+**Example Row:**
+```json
+{
+  "currency": "BTC",
+  "record_count": 384,
+  "last_fetched_at": 1724134650000
+}
+```
+
+**Related Parquet Schema:**
+```
+HISTORICAL_VOLATILITY_SCHEMA:
+  - currency: UTF8
+  - timestamp: TIMESTAMP_MILLIS
+  - volatility_value: DOUBLE
+```
+
+---
+
 ### Table: `greeks` ⚠️ DEPRECATED
 
 > **Note:** This table is deprecated in favor of the Parquet analytics pipeline. Greeks are now computed on-the-fly during JSONL → Parquet merge and stored together with trades in Parquet files.
@@ -413,11 +451,11 @@ jq 'select(.direction == "buy")' data/jsonl/BTC/BTC-PERPETUAL.jsonl
 
 ## Parquet File Format (Analytics)
 
-Enriched trade data with computed Greeks and moneyness, generated via `merge-to-parquet` command.
+Enriched trade data with computed Greeks, moneyness, and trading metrics, generated via `merge-to-parquet` command.
 
 ### Schema
 
-24 fields per trade (trade data + Greeks + moneyness):
+35 fields per trade (trade data + Greeks + moneyness + trading metrics):
 
 ```typescript
 interface EnrichedTrade {
@@ -452,6 +490,25 @@ interface EnrichedTrade {
   moneyness?: "ITM" | "ATM" | "OTM";   // Classification
   intrinsic_value?: number;             // max(0, delivery - strike) for calls
   moneyness_percentage?: number;        // % ITM/OTM
+
+  // Trading Metrics
+
+  // 1. Annualized Premium Yield
+  annualized_premium_yield?: number;    // % annual yield from premium selling
+
+  // 2. IV Rank (52-Week Percentile)
+  iv_rank_52w?: number;                 // Percentile (0-100) in 52-week IV range
+  iv_52w_high?: number;                 // Highest IV in past 52 weeks
+  iv_52w_low?: number;                  // Lowest IV in past 52 weeks
+  iv_52w_mean?: number;                 // Mean IV in past 52 weeks
+  iv_52w_stddev?: number;               // Standard deviation of IV
+
+  // 3. Expected Value (Stress Scenarios)
+  expected_value_btc?: number;          // Probability-weighted P&L (BTC)
+  win_probability?: number;             // Probability of profit (%)
+  max_loss_btc?: number;                // Maximum loss across scenarios (BTC)
+  max_gain_btc?: number;                // Maximum gain across scenarios (BTC)
+  sharpe_ratio?: number;                // Risk-adjusted return (EV / stddev)
 }
 ```
 
@@ -493,11 +550,22 @@ data/parquet/
   "gamma": 0.000026,
   "vega": 3.1565,
   "theta": -54990.58,
-  "theoretical_price": 6119.67,
+  "theoretical_price": 0.0944,
   "delivery_price": 65240.61,
   "moneyness": "ATM",
   "intrinsic_value": 240.61,
-  "moneyness_percentage": 0.37
+  "moneyness_percentage": 0.37,
+  "annualized_premium_yield": 45.2,
+  "iv_rank_52w": 68.5,
+  "iv_52w_high": 95.2,
+  "iv_52w_low": 12.4,
+  "iv_52w_mean": 58.3,
+  "iv_52w_stddev": 18.7,
+  "expected_value_btc": 0.00086,
+  "win_probability": 72.5,
+  "max_loss_btc": -0.0012,
+  "max_gain_btc": 0.0024,
+  "sharpe_ratio": 1.42
 }
 ```
 
@@ -516,10 +584,12 @@ bun src/cli/index.ts merge-to-parquet BTC
 
 **What happens during merge:**
 1. Read trades from JSONL files
-2. For each trade with IV: compute Greeks using Black-76
-3. Join with delivery price from SQLite (by instrument + expiration)
-4. Calculate moneyness if delivery price exists
-5. Write enriched record to Parquet
+2. Build 52-week IV history for each trade (two-pass algorithm)
+3. For each trade with IV: compute Greeks using Black-76
+4. Join with delivery price from SQLite (by instrument + expiration)
+5. Calculate moneyness if delivery price exists
+6. Calculate trading metrics (annualized yield, IV rank, expected value)
+7. Write enriched record to Parquet (35 fields)
 
 ### Performance
 
@@ -538,6 +608,30 @@ FROM 'data/parquet/BTC/*.parquet'
 WHERE option_type = 'call' AND moneyness = 'OTM' AND delta > 0.3
 GROUP BY instrument_name
 ORDER BY avg_delta DESC;
+
+-- High IV rank opportunities (mean reversion strategy)
+SELECT instrument_name,
+       AVG(iv_rank_52w) as avg_iv_rank,
+       AVG(annualized_premium_yield) as avg_yield,
+       COUNT(*) as trades
+FROM 'data/parquet/BTC/*.parquet'
+WHERE iv_rank_52w > 80  -- IV in top 20% of 52-week range
+  AND annualized_premium_yield > 30  -- >30% annual yield
+GROUP BY instrument_name
+ORDER BY avg_yield DESC;
+
+-- Positive expected value opportunities
+SELECT instrument_name,
+       AVG(expected_value_btc) as avg_ev,
+       AVG(win_probability) as avg_win_prob,
+       AVG(sharpe_ratio) as avg_sharpe,
+       COUNT(*) as trades
+FROM 'data/parquet/BTC/*.parquet'
+WHERE expected_value_btc > 0  -- Positive EV
+  AND win_probability > 60    -- >60% win probability
+  AND sharpe_ratio > 1        -- Good risk-adjusted return
+GROUP BY instrument_name
+ORDER BY avg_ev DESC;
 ```
 
 **Python (pandas):**
@@ -556,6 +650,27 @@ profitable = df[
 
 # Analyze Greeks distribution
 profitable[['delta', 'gamma', 'vega', 'theta']].describe()
+
+# Premium selling strategy: High IV rank + High yield
+premium_selling = df[
+    (df['iv_rank_52w'] > 70) &  # IV above 70th percentile
+    (df['annualized_premium_yield'] > 40) &  # >40% annual yield
+    (df['expected_value_btc'] > 0)  # Positive expected value
+]
+
+# Analyze risk-reward profile
+print(f"Trades found: {len(premium_selling)}")
+print(f"Avg yield: {premium_selling['annualized_premium_yield'].mean():.1f}%")
+print(f"Avg win probability: {premium_selling['win_probability'].mean():.1f}%")
+print(f"Avg Sharpe ratio: {premium_selling['sharpe_ratio'].mean():.2f}")
+
+# IV percentile analysis
+import matplotlib.pyplot as plt
+df['iv_rank_52w'].hist(bins=20)
+plt.xlabel('IV Rank (52-Week Percentile)')
+plt.ylabel('Trade Count')
+plt.title('Distribution of IV Rank at Trade Entry')
+plt.show()
 ```
 
 ### Regeneration

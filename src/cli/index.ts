@@ -7,12 +7,13 @@ import { JSONLStorage } from "../infrastructure/jsonl-storage.ts"; // Still need
 import { FutureFetcher } from "../application/fetchers/future-fetcher.ts";
 import { OptionFetcher } from "../application/fetchers/option-fetcher.ts";
 import { DeliveryFetcher } from "../application/fetchers/delivery-fetcher.ts";
+import { VolatilityFetcher } from "../application/fetchers/volatility-fetcher.ts";
 import { ParquetMerger } from "../application/analytics/parquet-merger.ts";
 import { ParquetConverter } from "../application/converters/parquet-converter.ts";
 import cliProgress from "cli-progress";
 import Table from "cli-table3";
 
-const COMMANDS = ["fetch-instruments", "fetch-trades", "fetch-deliveries", "fetch-all", "convert-to-raw-parquet", "merge-to-parquet", "stats", "help"] as const;
+const COMMANDS = ["fetch-instruments", "fetch-trades", "fetch-deliveries", "fetch-volatility", "fetch-all", "convert-to-raw-parquet", "merge-to-parquet", "stats", "help"] as const;
 type Command = typeof COMMANDS[number];
 
 // Argument parsing
@@ -132,13 +133,21 @@ Commands:
       bun src/cli/index.ts fetch-deliveries btc_usd
       bun src/cli/index.ts fetch-deliveries btc_usd eth_usd
 
+  fetch-volatility <currency>...
+    Fetch historical volatility data
+
+    Examples:
+      bun src/cli/index.ts fetch-volatility BTC
+      bun src/cli/index.ts fetch-volatility BTC ETH
+
   fetch-all <currency> [options]
-    Complete pipeline: instruments → trades → deliveries
+    Complete pipeline: instruments → trades → deliveries → volatility
 
     Options:
       --kind <type>           Filter by: option, future (default: both)
       --concurrency <n>       Parallel fetches (default: 3)
       --skip-deliveries       Skip delivery price fetching
+      --skip-volatility       Skip historical volatility fetching
       --min-expiration <date> Only fetch options expiring after date (e.g., 3m, 6m, 2024-01-01)
       --max-expiration <date> Only fetch options expiring before date
 
@@ -455,11 +464,51 @@ async function fetchDeliveriesCommand(args: string[]) {
   }
 }
 
+async function fetchVolatilityCommand(args: string[]) {
+  const parsed = parseArgs(args);
+
+  if (parsed.positional.length < 1) {
+    console.error("Usage: fetch-volatility <currency>...");
+    process.exit(1);
+  }
+
+  const currencies = parsed.positional.map(c => c.toUpperCase());
+  const concurrency = parsed.flags["concurrency"] ? parseInt(parsed.flags["concurrency"] as string) : 2;
+
+  const client = new DeribitClient();
+  const database = new Database();
+  const storage = new ParquetStorage();
+  const fetcher = new VolatilityFetcher({
+    client,
+    database,
+    storage,
+  });
+
+  try {
+    console.log(`\nFetching historical volatility for ${currencies.length} currencies...\n`);
+
+    const results = await fetcher.fetchMultipleCurrencies(
+      currencies,
+      concurrency,
+      (progress) => {
+        const duration = ((Date.now() - progress.startTime) / 1000).toFixed(1);
+        console.log(`  ${progress.currency}: ${progress.totalRecords} records [${duration}s]`);
+      }
+    );
+
+    const totalRecords = results.reduce((sum, r) => sum + r.totalRecords, 0);
+
+    console.log(`\n✓ Fetched ${totalRecords} volatility records`);
+  } finally {
+    database.close();
+  }
+}
+
 async function fetchAllCommand(args: string[]) {
   const parsed = parseArgs(args);
 
   if (parsed.positional.length < 1) {
-    console.error("Usage: fetch-all <currency> [--kind <type>] [--concurrency <n>] [--min-expiration <date>] [--max-expiration <date>] [--max-seq <n>]");
+    console.error("Usage: fetch-all <currency> [--kind <type>] [--concurrency <n>] [--min-expiration <date>] [--max-expiration <date>] [--max-seq <n>] [--skip-deliveries] [--skip-volatility]");
     process.exit(1);
   }
 
@@ -467,6 +516,7 @@ async function fetchAllCommand(args: string[]) {
   const kindFilter = parsed.flags["kind"] as "option" | "future" | undefined;
   const concurrency = parsed.flags["concurrency"] ? parseInt(parsed.flags["concurrency"] as string) : 3;
   const skipDeliveries = parsed.flags["skip-deliveries"] === true;
+  const skipVolatility = parsed.flags["skip-volatility"] === true;
   const minExpiration = parsed.flags["min-expiration"] as string | undefined;
   const maxExpiration = parsed.flags["max-expiration"] as string | undefined;
   const maxSeq = parsed.flags["max-seq"] as string | undefined;
@@ -478,7 +528,7 @@ async function fetchAllCommand(args: string[]) {
   const overallStart = Date.now();
 
   // Step 1: Fetch instruments
-  console.log(`[1/3] Fetching instruments...`);
+  console.log(`[1/4] Fetching instruments...`);
   await fetchInstrumentsCommand([
     currency,
     ...(kindFilter ? [`--kind`, kindFilter] : []),
@@ -487,7 +537,7 @@ async function fetchAllCommand(args: string[]) {
   ]);
 
   // Step 2: Fetch trades
-  console.log(`\n[2/3] Fetching trades...`);
+  console.log(`\n[2/4] Fetching trades...`);
   const tradeArgs = [
     currency,
     ...(kindFilter ? [`--kind`, kindFilter] : []),
@@ -500,11 +550,36 @@ async function fetchAllCommand(args: string[]) {
 
   // Step 3: Fetch deliveries
   if (!skipDeliveries) {
-    console.log(`\n[3/3] Fetching delivery prices...`);
+    console.log(`\n[3/4] Fetching delivery prices...`);
     const indexName = `${currency.toLowerCase()}_usd`;
     await fetchDeliveriesCommand([indexName]);
   } else {
-    console.log(`\n[3/3] Skipping delivery prices (--skip-deliveries)`);
+    console.log(`\n[3/4] Skipping delivery prices (--skip-deliveries)`);
+  }
+
+  // Step 4: Fetch historical volatility
+  if (!skipVolatility) {
+    console.log(`\n[4/4] Fetching historical volatility...`);
+    const client = new DeribitClient();
+    const database = new Database();
+    const storage = new ParquetStorage();
+    const fetcher = new VolatilityFetcher({
+      client,
+      database,
+      storage,
+    });
+
+    try {
+      const startTime = Date.now();
+      const result = await fetcher.fetchHistoricalVolatility(currency);
+      const duration = ((Date.now() - startTime) / 1000).toFixed(1);
+
+      console.log(`✓ Fetched ${result.totalRecords} volatility records (${duration}s)\n`);
+    } finally {
+      database.close();
+    }
+  } else {
+    console.log(`\n[4/4] Skipping historical volatility (--skip-volatility)`);
   }
 
   const duration = ((Date.now() - overallStart) / 1000).toFixed(2);
@@ -671,6 +746,9 @@ async function main() {
       break;
     case "fetch-deliveries":
       await fetchDeliveriesCommand(commandArgs);
+      break;
+    case "fetch-volatility":
+      await fetchVolatilityCommand(commandArgs);
       break;
     case "fetch-all":
       await fetchAllCommand(commandArgs);

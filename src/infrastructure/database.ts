@@ -157,6 +157,56 @@ export class Database {
       CREATE INDEX IF NOT EXISTS idx_option_progress_status
       ON option_progress(status)
     `);
+
+    // ========================================
+    // Medallion Architecture: Pipeline Tracking
+    // ========================================
+
+    // Stage 2: Track JSONL → Raw Parquet conversion
+    this.db.run(`
+      CREATE TABLE IF NOT EXISTS raw_parquet_status (
+        instrument_name TEXT PRIMARY KEY,
+        jsonl_path TEXT NOT NULL,
+        raw_parquet_path TEXT NOT NULL,
+        trade_count INTEGER NOT NULL,
+        converted_at INTEGER NOT NULL,
+        jsonl_last_modified INTEGER NOT NULL
+      )
+    `);
+
+    this.db.run(`
+      CREATE INDEX IF NOT EXISTS idx_raw_parquet_currency
+      ON raw_parquet_status(substr(instrument_name, 1, instr(instrument_name, '-') - 1))
+    `);
+
+    // Stage 3: Track Raw Parquet → Enriched Parquet
+    this.db.run(`
+      CREATE TABLE IF NOT EXISTS enriched_parquet_status (
+        instrument_name TEXT PRIMARY KEY,
+        raw_parquet_path TEXT NOT NULL,
+        enriched_parquet_path TEXT NOT NULL,
+        trade_count INTEGER NOT NULL,
+        enriched_at INTEGER NOT NULL,
+        enrichment_version INTEGER NOT NULL DEFAULT 1
+      )
+    `);
+
+    this.db.run(`
+      CREATE INDEX IF NOT EXISTS idx_enriched_parquet_currency
+      ON enriched_parquet_status(substr(instrument_name, 1, instr(instrument_name, '-') - 1))
+    `);
+
+    // ========================================
+    // Historical Volatility Metadata
+    // ========================================
+
+    this.db.run(`
+      CREATE TABLE IF NOT EXISTS historical_volatility_metadata (
+        currency TEXT PRIMARY KEY,
+        record_count INTEGER NOT NULL,
+        last_fetched_at INTEGER DEFAULT (unixepoch() * 1000)
+      )
+    `);
   }
 
   /**
@@ -724,6 +774,77 @@ export class Database {
   }
 
   /**
+   * Delete instruments not in the provided list
+   * Used to clean up stale instruments after fetching from API
+   * Also cascades to option_progress and future_chunks tables
+   */
+  deleteInstrumentsNotIn(
+    currency: string,
+    kind: string | undefined,
+    keepInstrumentNames: string[]
+  ): number {
+    // Use a transaction to ensure atomic cleanup
+    const cleanup = this.db.transaction(() => {
+      let instrumentQuery: string;
+      let params: any[];
+
+      if (keepInstrumentNames.length === 0) {
+        // Delete all for this currency/kind
+        instrumentQuery = `SELECT instrument_name FROM instruments WHERE base_currency = ?`;
+        params = [currency];
+
+        if (kind) {
+          instrumentQuery += ` AND kind = ?`;
+          params.push(kind);
+        }
+      } else {
+        // Delete instruments not in keep list
+        const placeholders = keepInstrumentNames.map(() => '?').join(',');
+        instrumentQuery = `SELECT instrument_name FROM instruments WHERE base_currency = ? AND instrument_name NOT IN (${placeholders})`;
+        params = [currency, ...keepInstrumentNames];
+
+        if (kind) {
+          instrumentQuery += ` AND kind = ?`;
+          params.push(kind);
+        }
+      }
+
+      // Get list of instruments to delete
+      const stmt = this.db.prepare(instrumentQuery);
+      const toDelete = stmt.all(...params) as Array<{ instrument_name: string }>;
+
+      if (toDelete.length === 0) {
+        return 0;
+      }
+
+      const deleteNames = toDelete.map(r => r.instrument_name);
+      const deletePlaceholders = deleteNames.map(() => '?').join(',');
+
+      // Delete from option_progress
+      const deleteProgress = this.db.prepare(
+        `DELETE FROM option_progress WHERE instrument_name IN (${deletePlaceholders})`
+      );
+      deleteProgress.run(...deleteNames);
+
+      // Delete from future_chunks
+      const deleteChunks = this.db.prepare(
+        `DELETE FROM future_chunks WHERE instrument_name IN (${deletePlaceholders})`
+      );
+      deleteChunks.run(...deleteNames);
+
+      // Delete from instruments
+      const deleteInstruments = this.db.prepare(
+        `DELETE FROM instruments WHERE instrument_name IN (${deletePlaceholders})`
+      );
+      deleteInstruments.run(...deleteNames);
+
+      return deleteNames.length;
+    });
+
+    return cleanup();
+  }
+
+  /**
    * Update last_seq for an instrument
    */
   updateInstrumentLastSeq(instrumentName: string, lastSeq: number): void {
@@ -1068,6 +1189,137 @@ export class Database {
     const stmt = this.db.prepare(query);
     const rows = stmt.all(...params) as any[];
     return rows.map((row) => row.instrument_name);
+  }
+
+  // ========================================
+  // Medallion Architecture: Pipeline Tracking Methods
+  // ========================================
+
+  /**
+   * Mark instrument as converted to raw Parquet
+   */
+  markRawParquetConverted(
+    instrumentName: string,
+    jsonlPath: string,
+    rawParquetPath: string,
+    tradeCount: number
+  ): void {
+    const now = Date.now();
+    const stat = Bun.file(jsonlPath).size ? Bun.file(jsonlPath).lastModified : now;
+
+    this.db.run(
+      `INSERT OR REPLACE INTO raw_parquet_status
+       (instrument_name, jsonl_path, raw_parquet_path, trade_count, converted_at, jsonl_last_modified)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+      [instrumentName, jsonlPath, rawParquetPath, tradeCount, now, stat]
+    );
+  }
+
+  /**
+   * Get raw Parquet conversion status for an instrument
+   */
+  getRawParquetStatus(instrumentName: string) {
+    return this.db
+      .query(
+        `SELECT * FROM raw_parquet_status WHERE instrument_name = ?`
+      )
+      .get(instrumentName);
+  }
+
+  /**
+   * Get instruments that need conversion to raw Parquet
+   * (completed options not yet converted or JSONL modified since conversion)
+   */
+  getInstrumentsNeedingConversion(currency: string): string[] {
+    const rows = this.db
+      .query(
+        `SELECT i.instrument_name
+         FROM instruments i
+         INNER JOIN option_progress op ON i.instrument_name = op.instrument_name
+         LEFT JOIN raw_parquet_status rps ON i.instrument_name = rps.instrument_name
+         WHERE i.base_currency = ?
+           AND i.kind = 'option'
+           AND op.status = 'completed'
+           AND (rps.instrument_name IS NULL OR rps.jsonl_last_modified < op.updated_at)
+         ORDER BY i.instrument_name`
+      )
+      .all(currency) as Array<{ instrument_name: string }>;
+
+    return rows.map((r) => r.instrument_name);
+  }
+
+  /**
+   * Mark instrument as enriched
+   */
+  markEnriched(
+    instrumentName: string,
+    rawParquetPath: string,
+    enrichedParquetPath: string,
+    tradeCount: number,
+    version: number = 1
+  ): void {
+    const now = Date.now();
+
+    this.db.run(
+      `INSERT OR REPLACE INTO enriched_parquet_status
+       (instrument_name, raw_parquet_path, enriched_parquet_path, trade_count, enriched_at, enrichment_version)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+      [instrumentName, rawParquetPath, enrichedParquetPath, tradeCount, now, version]
+    );
+  }
+
+  /**
+   * Get instruments that need enrichment
+   * (have raw Parquet but no enriched, or enrichment version outdated)
+   */
+  getInstrumentsNeedingEnrichment(
+    currency: string,
+    minVersion: number = 1
+  ): string[] {
+    const rows = this.db
+      .query(
+        `SELECT rps.instrument_name
+         FROM raw_parquet_status rps
+         LEFT JOIN enriched_parquet_status eps ON rps.instrument_name = eps.instrument_name
+         WHERE substr(rps.instrument_name, 1, instr(rps.instrument_name, '-') - 1) = ?
+           AND (eps.instrument_name IS NULL OR eps.enrichment_version < ?)
+         ORDER BY rps.instrument_name`
+      )
+      .all(currency, minVersion) as Array<{ instrument_name: string }>;
+
+    return rows.map((r) => r.instrument_name);
+  }
+
+  /**
+   * Upsert historical volatility metadata
+   */
+  upsertVolatilityMetadata(currency: string, recordCount: number): void {
+    const stmt = this.db.prepare(`
+      INSERT INTO historical_volatility_metadata (currency, record_count, last_fetched_at)
+      VALUES (?, ?, ?)
+      ON CONFLICT(currency) DO UPDATE SET
+        record_count = excluded.record_count,
+        last_fetched_at = excluded.last_fetched_at
+    `);
+    stmt.run(currency, recordCount, Date.now());
+  }
+
+  /**
+   * Get historical volatility metadata for a currency
+   */
+  getVolatilityMetadata(currency: string): { currency: string; recordCount: number; lastFetchedAt: number } | null {
+    const stmt = this.db.prepare(`
+      SELECT currency, record_count, last_fetched_at FROM historical_volatility_metadata WHERE currency = ?
+    `);
+    const row = stmt.get(currency) as any;
+
+    if (!row) return null;
+
+    return {
+      currency: row.currency,
+      recordCount: row.record_count,
+      lastFetchedAt: row.last_fetched_at,
+    };
   }
 
   /**

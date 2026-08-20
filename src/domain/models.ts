@@ -58,6 +58,17 @@ export const DeribitInstrumentsResponseSchema = z.object({
   result: z.array(DeribitInstrumentSchema),
 });
 
+export const DeribitHistoricalVolatilitySchema = z.tuple([
+  z.number(), // timestamp
+  z.number(), // volatility value
+]);
+
+export const DeribitHistoricalVolatilityResponseSchema = z.object({
+  jsonrpc: z.string(),
+  id: z.number().optional(),
+  result: z.array(DeribitHistoricalVolatilitySchema),
+});
+
 /**
  * Domain Types
  */
@@ -65,6 +76,7 @@ export const DeribitInstrumentsResponseSchema = z.object({
 export type DeribitTrade = z.infer<typeof DeribitTradeSchema>;
 export type DeribitDeliveryPrice = z.infer<typeof DeribitDeliveryPriceSchema>;
 export type DeribitInstrument = z.infer<typeof DeribitInstrumentSchema>;
+export type DeribitHistoricalVolatility = z.infer<typeof DeribitHistoricalVolatilitySchema>;
 
 export interface Trade {
   id: string;
@@ -82,6 +94,12 @@ export interface DeliveryPrice {
   indexName: string;
   date: number;
   deliveryPrice: number;
+}
+
+export interface HistoricalVolatility {
+  currency: string;
+  timestamp: number;
+  volatilityValue: number;
 }
 
 export interface Instrument {
@@ -140,9 +158,28 @@ export interface RiskFilter {
  */
 
 export function parseInstrumentName(instrumentName: string): Instrument | null {
-  // Format: BTC-29MAR24-50000-C or ETH-PERPETUAL
+  // Formats:
+  // - Perpetual: BTC-PERPETUAL
+  // - Future: BTC-5AUG16, BTC-15JUL16 (2 parts)
+  // - Option: BTC-8APR26-64500-P, BTC-29MAR24-50000-C (4 parts)
   const parts = instrumentName.split("-");
 
+  const monthMap: Record<string, number> = {
+    JAN: 0,
+    FEB: 1,
+    MAR: 2,
+    APR: 3,
+    MAY: 4,
+    JUN: 5,
+    JUL: 6,
+    AUG: 7,
+    SEP: 8,
+    OCT: 9,
+    NOV: 10,
+    DEC: 11,
+  };
+
+  // Perpetual: BTC-PERPETUAL
   if (parts.length === 2 && parts[1] === "PERPETUAL") {
     return {
       name: instrumentName,
@@ -154,32 +191,48 @@ export function parseInstrumentName(instrumentName: string): Instrument | null {
     };
   }
 
+  // Future: BTC-5AUG16 or BTC-15JUL16 (2 parts)
+  if (parts.length === 2) {
+    const [underlying, dateStr] = parts;
+
+    // Parse date with flexible day length (1 or 2 digits): 5AUG16 or 15JUL16
+    const dateMatch = dateStr!.match(/^(\d{1,2})([A-Z]{3})(\d{2})$/);
+    if (!dateMatch) return null;
+
+    const day = parseInt(dateMatch[1]!);
+    const monthStr = dateMatch[2]!;
+    const year = 2000 + parseInt(dateMatch[3]!);
+
+    const month = monthMap[monthStr];
+    if (month === undefined) return null;
+
+    const expiration = new Date(Date.UTC(year, month, day, 8, 0, 0)).getTime();
+
+    return {
+      name: instrumentName,
+      underlying: underlying!,
+      strike: 0,
+      expiration,
+      optionType: "call",
+      instrumentType: "future",
+    };
+  }
+
+  // Option: BTC-8APR26-64500-P or BTC-29MAR24-50000-C (4 parts)
   if (parts.length === 4) {
     const [underlying, dateStr, strikeStr, optionTypeStr] = parts;
     const optionType = optionTypeStr === "C" ? "call" : "put";
     const strike = parseFloat(strikeStr!);
 
-    // Parse date (e.g., "29MAR24")
-    const day = parseInt(dateStr!.slice(0, 2));
-    const monthStr = dateStr!.slice(2, 5);
-    const year = 2000 + parseInt(dateStr!.slice(5, 7));
+    // Parse date with flexible day length (1 or 2 digits): 8APR26 or 29MAR24
+    const dateMatch = dateStr!.match(/^(\d{1,2})([A-Z]{3})(\d{2})$/);
+    if (!dateMatch) return null;
 
-    const monthMap: Record<string, number> = {
-      JAN: 0,
-      FEB: 1,
-      MAR: 2,
-      APR: 3,
-      MAY: 4,
-      JUN: 5,
-      JUL: 6,
-      AUG: 7,
-      SEP: 8,
-      OCT: 9,
-      NOV: 10,
-      DEC: 11,
-    };
+    const day = parseInt(dateMatch[1]!);
+    const monthStr = dateMatch[2]!;
+    const year = 2000 + parseInt(dateMatch[3]!);
 
-    const month = monthMap[monthStr!];
+    const month = monthMap[monthStr];
     if (month === undefined) return null;
 
     const expiration = new Date(Date.UTC(year, month, day, 8, 0, 0)).getTime();

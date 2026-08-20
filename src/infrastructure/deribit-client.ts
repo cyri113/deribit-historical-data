@@ -3,9 +3,11 @@ import {
   DeribitTradesResponseSchema,
   DeribitDeliveryPricesResponseSchema,
   DeribitInstrumentsResponseSchema,
+  DeribitHistoricalVolatilityResponseSchema,
   type DeribitTrade,
   type DeribitDeliveryPrice,
   type DeribitInstrument,
+  type DeribitHistoricalVolatility,
 } from "../domain/models.ts";
 
 export class DeribitAPIError extends Error {
@@ -261,6 +263,41 @@ export class DeribitClient {
 
     const data = await response.json();
     const validated = DeribitInstrumentsResponseSchema.parse(data);
+    return validated.result;
+  }
+
+  /**
+   * Fetch historical volatility data for a currency
+   *
+   * @param currency - e.g., "BTC", "ETH"
+   * @returns Array of [timestamp, volatility] tuples
+   */
+  async getHistoricalVolatility(
+    currency: string
+  ): Promise<DeribitHistoricalVolatility[]> {
+    // Wait for rate limiter
+    await this.rateLimiter.acquire();
+
+    // Build query params
+    const params = new URLSearchParams({
+      currency,
+    });
+
+    const url = `${this.baseUrl}/public/get_historical_volatility?${params}`;
+
+    const response = await fetch(url, {
+      signal: AbortSignal.timeout(60000), // 60 second timeout
+    });
+
+    if (!response.ok) {
+      throw new DeribitAPIError(
+        `HTTP error: ${response.status} ${response.statusText}`,
+        response.status
+      );
+    }
+
+    const data = await response.json();
+    const validated = DeribitHistoricalVolatilityResponseSchema.parse(data);
     return validated.result;
   }
 

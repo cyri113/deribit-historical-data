@@ -33,6 +33,9 @@ bun src/cli/index.ts fetch-trades BTC --concurrency 5
 # Fetch settlement prices
 bun src/cli/index.ts fetch-deliveries btc_usd
 
+# Fetch historical volatility
+bun src/cli/index.ts fetch-volatility BTC ETH
+
 # Or run complete pipeline
 bun src/cli/index.ts fetch-all BTC
 
@@ -42,6 +45,8 @@ bun src/cli/index.ts merge-to-parquet BTC
 
 **Output:**
 - Raw trade data: `data/parquet-raw/BTC/*.parquet` (auto-converted from JSONL on completion)
+- Delivery prices: `data/parquet-raw/deliveries/*.parquet` (settlement prices)
+- Historical volatility: `data/parquet-raw/volatility/*.parquet` (volatility timeseries)
 - Analytics data: `data/parquet/BTC/*.parquet` (enriched with Greeks + moneyness)
 - Temporary JSONL: `data/jsonl/BTC/*.jsonl` (only for in-progress instruments, auto-deleted)
 - Metadata: `deribit-data.db` (SQLite with checkpoints)

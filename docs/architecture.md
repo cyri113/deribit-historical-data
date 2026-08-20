@@ -21,9 +21,10 @@ The Deribit Historical Data Pipeline follows a layered architecture with clear s
 │              src/application/                               │
 │  ┌─────────────────────────────────────────────────────┐   │
 │  │  Fetchers                                           │   │
-│  │  • FutureFetcher    (chunk-based, concurrent)       │   │
-│  │  • OptionFetcher    (streaming, lazy)               │   │
-│  │  • DeliveryFetcher  (paginated)                     │   │
+│  │  • FutureFetcher      (chunk-based, concurrent)     │   │
+│  │  • OptionFetcher      (streaming, lazy)             │   │
+│  │  • DeliveryFetcher    (paginated)                   │   │
+│  │  • VolatilityFetcher  (single-fetch per currency)   │   │
 │  └─────────────────────────────────────────────────────┘   │
 │  ┌─────────────────────────────────────────────────────┐   │
 │  │  Analytics                                          │   │
@@ -54,21 +55,23 @@ The Deribit Historical Data Pipeline follows a layered architecture with clear s
 │               src/infrastructure/                           │
 │  ┌─────────────────────────────────────────────────────┐   │
 │  │  External I/O                                       │   │
-│  │  • deribit-client.ts  (HTTP + rate limiting)        │   │
-│  │  • database.ts        (SQLite operations)           │   │
-│  │  • jsonl-storage.ts   (JSONL file I/O)              │   │
-│  │  • parquet-writer.ts  (Parquet enrichment)          │   │
-│  │  • rate-limiter.ts    (token bucket)                │   │
+│  │  • deribit-client.ts   (HTTP + rate limiting)       │   │
+│  │  • database.ts         (SQLite operations)          │   │
+│  │  • jsonl-storage.ts    (temp JSONL, in-progress)    │   │
+│  │  • parquet-storage.ts  (raw Parquet, auto-convert)  │   │
+│  │  • parquet-writer.ts   (enriched Parquet, Greeks)   │   │
+│  │  • rate-limiter.ts     (token bucket)               │   │
 │  └─────────────────────────────────────────────────────┘   │
 └────────────────────────┬────────────────────────────────────┘
                          │
                          ▼
-┌─────────────────────────────────────────────────────────────┐
-│                 Storage (Two-Layer)                         │
-│  • data/jsonl/BTC/*.jsonl    (source: crash-safe trades)    │
-│  • data/parquet/BTC/*.parquet (analytics: enriched data)    │
-│  • deribit-data.db           (metadata + checkpoints)       │
-└─────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────┐
+│                 Storage (Hybrid Three-Layer)                 │
+│  1. data/jsonl/BTC/*.jsonl         (temp, in-progress only)  │
+│  2. data/parquet-raw/BTC/*.parquet (raw, auto-converted)     │
+│  3. data/parquet/BTC/*.parquet     (analytics, enriched)     │
+│  • deribit-data.db                 (metadata + checkpoints)  │
+└──────────────────────────────────────────────────────────────┘
 ```
 
 ## Layer Responsibilities
@@ -177,13 +180,25 @@ The Deribit Historical Data Pipeline follows a layered architecture with clear s
 - WAL mode for concurrency
 
 #### JSONLStorage (`jsonl-storage.ts`)
-- Append-only file writes
+- **Temporary storage** for in-progress instruments
+- Append-only file writes (fast, crash-safe)
 - Per-instrument JSONL files
+- Auto-deleted after Parquet conversion
 - Crash-safe flush operations
+
+#### ParquetStorage (`parquet-storage.ts`)
+- **Raw Parquet creation** from completed instruments
+- `writeTrades()` - Bulk write for JSONL→Parquet conversion
+- `appendTrades()` - Resume-safe writes with deduplication
+- Supports all instrument types (options, futures, perpetuals)
+- Automatic JSONL cleanup after successful conversion
 - File handle management
 
 #### ParquetWriter (`parquet-writer.ts`)
-- Reads trades from JSONL
+- **Analytics enrichment** - Reads from raw Parquet
+- Enriches trades with Greeks (via Black-76 model)
+- Adds moneyness classification (ITM/OTM)
+- Creates enriched analytics Parquet files
 - Computes Greeks on-the-fly (Black-76)
 - Joins with delivery prices
 - Calculates moneyness (ITM/ATM/OTM)
