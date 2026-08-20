@@ -24,13 +24,31 @@
     "enforce_updates": true,
     "block_on_missing": true,
     "critical_files": {
-      "src/cli/index.ts": ["docs/operations.md", "docs/api-reference.md"],
-      "src/infrastructure/database.ts": ["docs/data-model.md"],
-      "src/infrastructure/deribit-client.ts": ["docs/deribit-api.md"],
-      "src/infrastructure/jsonl-storage.ts": ["docs/data-model.md", "docs/design-decisions.md"],
-      "src/infrastructure/parquet-writer.ts": ["docs/data-model.md", "docs/architecture.md"],
-      "src/application/fetchers/*.ts": ["docs/architecture.md", "docs/design-decisions.md"],
-      "src/domain/*.ts": ["docs/api-reference.md"]
+      "src/cli/index.ts": [
+        "docs/operations.md",
+        "docs/api-reference.md"
+      ],
+      "src/infrastructure/database.ts": [
+        "docs/data-model.md"
+      ],
+      "src/infrastructure/deribit-client.ts": [
+        "docs/deribit-api.md"
+      ],
+      "src/infrastructure/jsonl-storage.ts": [
+        "docs/data-model.md",
+        "docs/design-decisions.md"
+      ],
+      "src/infrastructure/parquet-writer.ts": [
+        "docs/data-model.md",
+        "docs/architecture.md"
+      ],
+      "src/application/fetchers/*.ts": [
+        "docs/architecture.md",
+        "docs/design-decisions.md"
+      ],
+      "src/domain/*.ts": [
+        "docs/api-reference.md"
+      ]
     }
   },
   "coverage": {
@@ -41,9 +59,6 @@
   },
   "permissions": {
     "allow": [
-      "WebFetch(domain:github.com)",
-      "Bash(curl -s \"https://history.deribit.com/api/v2/public/get_last_settlement_by_currency?currency=BTC&type=delivery\")",
-      "Bash(bun *)",
       "Bash(sqlite3 *)"
     ],
     "deny": [],

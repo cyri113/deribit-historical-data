@@ -180,6 +180,23 @@ export class JSONLStorage {
   }
 
   /**
+   * Delete JSONL file for an instrument
+   * Used after successful conversion to Parquet
+   *
+   * @param instrumentName - Instrument to delete JSONL file for
+   */
+  async deleteFile(instrumentName: string): Promise<void> {
+    // Close file handle first
+    await this.close(instrumentName);
+
+    const filePath = this.getFilePath(instrumentName);
+
+    if (existsSync(filePath)) {
+      await Bun.file(filePath).delete();
+    }
+  }
+
+  /**
    * Get stats for all JSONL files
    */
   async getStats(): Promise<Array<{ instrument: string; size: number; tradeCount: number }>> {

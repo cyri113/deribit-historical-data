@@ -7,6 +7,15 @@ import parquet from "parquetjs";
 import { existsSync } from "node:fs";
 import { rm } from "node:fs/promises";
 
+/**
+ * ParquetWriter Integration Tests
+ *
+ * Tests the enrichment pipeline that reads trades and creates analytics Parquet files.
+ *
+ * Note: ParquetWriter currently reads from JSONL for backwards compatibility.
+ * In the new hybrid architecture, raw Parquet files are created automatically during fetch,
+ * and ParquetWriter is used for optional enrichment with Greeks.
+ */
 describe("ParquetWriter Integration Tests", () => {
   let db: Database;
   let storage: JSONLStorage;
@@ -161,6 +170,33 @@ describe("ParquetWriter Integration Tests", () => {
     expect(firstRow.moneyness).toBe("ATM");
     expect(firstRow.intrinsic_value).toBeCloseTo(240.61, 1);
     expect(firstRow.moneyness_percentage).toBeDefined();
+
+    // Verify: Trading Metrics calculated
+
+    // 1. Annualized Premium Yield
+    expect(firstRow.annualized_premium_yield).toBeDefined();
+    expect(typeof firstRow.annualized_premium_yield).toBe("number");
+    expect(firstRow.annualized_premium_yield).toBeGreaterThan(0); // Positive yield
+
+    // 2. IV Rank (52-Week Percentile)
+    // First trade has no history, so IV rank should be undefined
+    expect(firstRow.iv_rank_52w).toBeUndefined();
+    expect(firstRow.iv_52w_high).toBeUndefined();
+    expect(firstRow.iv_52w_low).toBeUndefined();
+    expect(firstRow.iv_52w_mean).toBeUndefined();
+    expect(firstRow.iv_52w_stddev).toBeUndefined();
+
+    // 3. Expected Value (Stress Scenarios)
+    expect(firstRow.expected_value_btc).toBeDefined();
+    expect(typeof firstRow.expected_value_btc).toBe("number");
+    expect(firstRow.win_probability).toBeDefined();
+    expect(firstRow.win_probability).toBeGreaterThan(0);
+    expect(firstRow.win_probability).toBeLessThan(100);
+    expect(firstRow.max_loss_btc).toBeDefined();
+    expect(firstRow.max_loss_btc).toBeLessThan(0); // Can lose money
+    expect(firstRow.max_gain_btc).toBeDefined();
+    expect(firstRow.max_gain_btc).toBeGreaterThan(0);
+    expect(firstRow.sharpe_ratio).toBeDefined();
 
     await reader.close();
   });

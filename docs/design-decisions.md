@@ -214,36 +214,55 @@ if (instrument.kind === "future") {
 
 ---
 
-## Decision 3: JSONL Intermediate Storage
+## Decision 3: Hybrid JSONL→Parquet Storage
 
 ### Context
-Trade data must be stored reliably and efficiently. Options:
+Trade data must be stored reliably and efficiently. We need:
+1. Fast append-only writes during fetching (crash-safe resume)
+2. Efficient long-term storage (compression, columnar format)
+3. No manual conversion step (auto-cleanup)
+
+Options considered:
 1. SQLite directly
 2. Parquet directly
-3. JSONL → Parquet pipeline
+3. JSONL only (keep forever)
+4. **Hybrid JSONL→Parquet** (automatic conversion)
 
 ### Decision
-Use **JSONL (JSON Lines) as intermediate storage**, with planned Parquet conversion.
+Use **hybrid storage** where in-progress instruments write to JSONL, then auto-convert to Parquet when complete, with JSONL cleanup.
 
 ### Rationale
 
-#### Crash Safety
-- **JSONL:** Append-only format. Partial writes = truncated file, data intact.
-- **Parquet:** Columnar, immutable. Partial write = corrupted file, data lost.
-- **SQLite:** Needs WAL/journal. Still more complex than append-only.
+#### Best of Both Worlds
+- **JSONL (in-progress):** Fast O(1) appends, crash-safe, resumable
+- **Parquet (completed):** 10x compression, columnar queries, efficient storage
+- **Auto-conversion:** No manual steps, automatic cleanup
 
-**Example crash scenario:**
+#### Crash Safety During Fetch
+- **JSONL:** Append-only format. Partial writes = truncated file, data intact.
+- **Parquet:** Columnar, immutable. Partial write during fetch = corrupted file, data lost.
+
+**Example crash scenario (in-progress instrument):**
 ```
 Writing trade 50,000 / 100,000...
 [CRASH]
 
-JSONL: File has 50,000 valid lines, resume from line 50,001 ✅
-Parquet: File corrupted, re-download entire file ❌
+JSONL: File has 50,000 valid lines, resume from trade_seq 50,001 ✅
+Parquet: Would lose all 50,000 trades, must re-fetch ❌
 ```
 
-#### Human Readable
-- **JSONL:** Plain text, easy to inspect, debug, or manually edit
-- **Parquet:** Binary format, requires special tools
+**After completion:**
+```
+Fetching complete (100,000 trades)
+→ Read JSONL (100,000 lines)
+→ Write Parquet (compressed, validated)
+→ Delete JSONL (save ~90% space)
+```
+
+#### Space Efficiency
+- **JSONL:** ~50GB for BTC-PERPETUAL (300M trades)
+- **Parquet:** ~5GB for same data (~10x compression)
+- **Hybrid:** Only in-progress instruments keep JSONL (~1-5% of total at any time)
 
 **Debugging example:**
 ```bash
@@ -257,67 +276,77 @@ wc -l data/jsonl/BTC/BTC-PERPETUAL.jsonl
 grep '"trade_seq":123456' data/jsonl/BTC/BTC-PERPETUAL.jsonl
 ```
 
-#### Simplicity
-- **JSONL:** Single-pass append, minimal logic
-- **Parquet:** Complex schema management, row groups, compression settings
+#### Human Readable (JSONL only)
+- **JSONL:** Plain text, easy to inspect, debug, or manually edit
+- **Parquet:** Binary format, requires special tools
 
-#### Incrementality
-- **JSONL:** Append new trades anytime
-- **Parquet:** Immutable after write, must rewrite entire file
+**Note:** Only useful during development/debugging since JSONL is temporary
 
 ### Trade-offs
 
 **Advantages:**
-- ✅ Crash-safe (append-only)
-- ✅ Human-readable
-- ✅ Simple implementation
-- ✅ Incremental writes
-- ✅ Easy validation/debugging
+- ✅ **Crash-safe resume** - JSONL survives crashes, Parquet for long-term
+- ✅ **Space efficient** - Only in-progress keep JSONL (~90% savings)
+- ✅ **No manual steps** - Auto-conversion, auto-cleanup
+- ✅ **Fast appends** - O(1) JSONL writes during fetch
+- ✅ **Efficient storage** - Parquet compression for completed
+- ✅ **Easy debugging** - Can inspect in-progress JSONL if needed
 
 **Disadvantages:**
-- ❌ Larger file size vs Parquet (~5x)
-- ❌ Slower analytics (line-by-line parsing)
-- ❌ Extra conversion step to Parquet
+- ❌ Extra complexity (two storage classes vs one)
+- ❌ Conversion overhead (small, happens once per instrument)
 
-### Size Comparison
+### Implementation Details
 
+**Storage lifecycle:**
 ```
-BTC-PERPETUAL (300M trades):
-- JSONL: ~50 GB
-- Parquet (compressed): ~10 GB
-- SQLite: ~30 GB
+1. Instrument fetch starts
+   → Create JSONL file (data/jsonl/BTC/BTC-27MAR26-70000-C.jsonl)
+
+2. During fetch (in-progress)
+   → Append trades to JSONL
+   → Update checkpoint in SQLite
+   → Resume from checkpoint if crash
+
+3. Fetch completes (last chunk or no more trades)
+   → Read all trades from JSONL
+   → Write to Parquet (data/parquet-raw/BTC/BTC-27MAR26-70000-C.parquet)
+   → Delete JSONL file
+   → Update checkpoint path to Parquet
 ```
 
-### Conversion Strategy ✅ IMPLEMENTED
+**Space savings example:**
+```
+10,000 BTC options:
+- Old: 10,000 JSONL files × 5 MB avg = 50 GB total
+- New: ~100 in-progress JSONL (concurrency) × 5 MB = 500 MB
+      + 9,900 completed Parquet × 500 KB = 4.95 GB
+      = 5.45 GB total (~90% reduction)
+```
 
-JSONL serves as the **source of truth**. Convert to Parquet for analytics using built-in pipeline:
+### Enrichment Pipeline (Separate Step)
+
+Raw Parquet files can be enriched with analytics using built-in pipeline:
 
 ```bash
-# Fetch trades to JSONL (source of truth)
+# Fetch trades (creates raw Parquet automatically)
 bun src/cli/index.ts fetch-all BTC
 
-# Convert to enriched Parquet (analytics)
+# Enrich raw Parquet with Greeks (optional)
 bun src/cli/index.ts merge-to-parquet BTC
 ```
 
-**How it works:**
-1. **Read** trades from JSONL files (one per instrument)
+**How enrichment works:**
+1. **Read** trades from raw Parquet files
 2. **Compute** Greeks on-the-fly using Black-76 model
-3. **Join** with delivery prices from SQLite
-4. **Calculate** moneyness (ITM/ATM/OTM) at expiration
-5. **Write** enriched data to Parquet with full schema
+3. **Join** with delivery prices
+4. **Calculate** moneyness (ITM/ATM/OTM)
+5. **Write** enriched analytics Parquet
 
-**Enrichment during merge:**
-- Delta, gamma, vega, theta (Black-76)
-- Moneyness classification (ITM/ATM/OTM)
-- Intrinsic value and percentage
-- Theoretical vs actual price comparison
-
-**Benefits of two-stage pipeline:**
-1. **Reliability:** JSONL ensures no data loss during fetch
-2. **Performance:** Parquet optimized for analytics (10-100x faster)
-3. **Flexibility:** Can regenerate Parquet anytime from JSONL
-4. **Enrichment:** Greeks computed during merge (not pre-stored)
+**Three-layer storage:**
+1. **JSONL** - Temporary, in-progress only (deleted after conversion)
+2. **Parquet Raw** - Permanent, auto-created from JSONL
+3. **Parquet Analytics** - Optional, enriched with Greeks (manual step)
 
 ### Alternatives Considered
 
@@ -328,18 +357,25 @@ bun src/cli/index.ts merge-to-parquet BTC
 - Large database files harder to distribute
 - Slower for scan queries vs Parquet
 
-#### Alt 2: Parquet Only
+#### Alt 2: Parquet Only (Direct Write)
 **Rejected because:**
-- Crash risk (immutable format)
-- Difficult to debug
-- Complex append logic
-- Harder to implement resumability
+- Crash risk during fetch (immutable format, lose all data)
+- Must read entire file to append new trades (slow for large datasets)
+- Complex resumability logic
+- Binary format harder to debug
 
-#### Alt 3: CSV
+#### Alt 3: JSONL Only (Keep Forever)
 **Rejected because:**
-- Escaping issues (commas in strings)
-- No schema (type ambiguity)
-- JSONL is self-describing
+- Wastes ~90% disk space (50 GB vs 5 GB for BTC-PERPETUAL)
+- Slower analytics queries (line-by-line parsing)
+- No compression benefits
+
+#### Alt 4: Manual Conversion (Old Approach)
+**Rejected because:**
+- User must remember to run conversion command
+- JSONL files accumulate unnecessarily
+- Extra step in workflow
+- No automatic cleanup
 
 ---
 

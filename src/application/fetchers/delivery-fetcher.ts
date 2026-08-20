@@ -1,12 +1,13 @@
 import { DeribitClient } from "../../infrastructure/deribit-client.ts";
 import { Database } from "../../infrastructure/database.ts";
-import type { DeliveryPrice } from "../../domain/models.ts";
+import { ParquetStorage } from "../../infrastructure/parquet-storage.ts";
+import type { DeribitDeliveryPrice } from "../../domain/models.ts";
 
 export interface DeliveryFetcherConfig {
   client: DeribitClient;
   database: Database;
+  storage: ParquetStorage;
   batchSize?: number; // Records per API request
-  dbBatchSize?: number; // Records per DB transaction
 }
 
 export interface DeliveryFetchProgress {
@@ -18,21 +19,21 @@ export interface DeliveryFetchProgress {
 }
 
 /**
- * DeliveryFetcher - Fetches historical delivery (settlement) prices and stores in DB
+ * DeliveryFetcher - Fetches historical delivery (settlement) prices and stores in Parquet
  *
- * Handles pagination and batch database writes
+ * Handles pagination and writes to Parquet file
  */
 export class DeliveryFetcher {
   private client: DeribitClient;
   private database: Database;
+  private storage: ParquetStorage;
   private batchSize: number;
-  private dbBatchSize: number;
 
   constructor(config: DeliveryFetcherConfig) {
     this.client = config.client;
     this.database = config.database;
+    this.storage = config.storage;
     this.batchSize = config.batchSize ?? 100;
-    this.dbBatchSize = config.dbBatchSize ?? 1000;
   }
 
   /**
@@ -57,7 +58,7 @@ export class DeliveryFetcher {
       startTime: Date.now(),
     };
 
-    let deliveryBuffer: DeliveryPrice[] = [];
+    const allDeliveryPrices: DeribitDeliveryPrice[] = [];
 
     try {
       const generator = this.client.getAllDeliveryPrices(
@@ -66,40 +67,25 @@ export class DeliveryFetcher {
       );
 
       for await (const deribitPrices of generator) {
-        // Convert to domain models
-        const deliveryPrices: DeliveryPrice[] = deribitPrices
-          .map((dp) => ({
-            indexName,
-            date: new Date(dp.date).getTime(), // Convert YYYY-MM-DD string to timestamp
-            deliveryPrice: dp.delivery_price,
-          }))
-          .filter((dp) => {
-            // Apply date filtering if specified
-            if (startDate && dp.date < startDate) return false;
-            if (endDate && dp.date > endDate) return false;
-            return true;
-          });
+        // Apply date filtering if specified
+        const filtered = deribitPrices.filter((dp) => {
+          const timestamp = new Date(dp.date).getTime();
+          if (startDate && timestamp < startDate) return false;
+          if (endDate && timestamp > endDate) return false;
+          return true;
+        });
 
-        deliveryBuffer.push(...deliveryPrices);
-        progress.totalRecords += deliveryPrices.length;
+        allDeliveryPrices.push(...filtered);
+        progress.totalRecords += filtered.length;
+        progress.batchesProcessed++;
 
-        // Flush to database when buffer is full
-        if (deliveryBuffer.length >= this.dbBatchSize) {
-          this.database.insertDeliveryPrices(deliveryBuffer);
-          progress.batchesProcessed++;
-          deliveryBuffer = [];
-
-          if (onProgress) {
-            onProgress({ ...progress });
-          }
+        if (onProgress) {
+          onProgress({ ...progress });
         }
       }
 
-      // Flush remaining records
-      if (deliveryBuffer.length > 0) {
-        this.database.insertDeliveryPrices(deliveryBuffer);
-        progress.batchesProcessed++;
-      }
+      // Write all delivery prices to Parquet file
+      await this.storage.writeDeliveryPrices(indexName, allDeliveryPrices);
 
       progress.endTime = Date.now();
 
@@ -109,9 +95,9 @@ export class DeliveryFetcher {
 
       return progress;
     } catch (error) {
-      // Flush buffer on error to avoid data loss
-      if (deliveryBuffer.length > 0) {
-        this.database.insertDeliveryPrices(deliveryBuffer);
+      // On error, still try to write whatever we have
+      if (allDeliveryPrices.length > 0) {
+        await this.storage.writeDeliveryPrices(indexName, allDeliveryPrices);
       }
       throw error;
     }

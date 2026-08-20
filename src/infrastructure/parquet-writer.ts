@@ -5,6 +5,11 @@ import type { DeribitTrade } from "../domain/models.ts";
 import { parseInstrumentName } from "../domain/models.ts";
 import { calculateGreeks } from "../domain/black76.ts";
 import { calculateMoneyness, calculateIntrinsicValue, calculateMoneynessPercentage } from "../domain/moneyness.ts";
+import {
+  calculateAnnualizedYield,
+  calculateIVRank,
+  calculateExpectedValue
+} from "../domain/trading-metrics.ts";
 import { mkdir } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { join, dirname } from "node:path";
@@ -17,6 +22,7 @@ import { join, dirname } from "node:path";
  * - Computed Greeks (Black-76)
  * - Moneyness classification
  * - Delivery price at expiry
+ * - Trading metrics (annualized yield, IV rank, expected value)
  */
 const ENRICHED_TRADE_SCHEMA = new parquet.ParquetSchema({
   // Trade data
@@ -52,6 +58,24 @@ const ENRICHED_TRADE_SCHEMA = new parquet.ParquetSchema({
   moneyness: { type: "UTF8", optional: true }, // 'ITM', 'ATM', 'OTM'
   intrinsic_value: { type: "DOUBLE", optional: true },
   moneyness_percentage: { type: "DOUBLE", optional: true },
+
+  // Trading Metrics
+  // 1. Annualized Premium Yield
+  annualized_premium_yield: { type: "DOUBLE", optional: true }, // Percentage
+
+  // 2. IV Rank (52-Week Percentile)
+  iv_rank_52w: { type: "DOUBLE", optional: true }, // Percentile (0-100)
+  iv_52w_high: { type: "DOUBLE", optional: true },
+  iv_52w_low: { type: "DOUBLE", optional: true },
+  iv_52w_mean: { type: "DOUBLE", optional: true },
+  iv_52w_stddev: { type: "DOUBLE", optional: true },
+
+  // 3. Expected Value (Stress Scenarios)
+  expected_value_btc: { type: "DOUBLE", optional: true },
+  win_probability: { type: "DOUBLE", optional: true }, // Percentage (0-100)
+  max_loss_btc: { type: "DOUBLE", optional: true },
+  max_gain_btc: { type: "DOUBLE", optional: true },
+  sharpe_ratio: { type: "DOUBLE", optional: true },
 });
 
 export interface ParquetWriterConfig {
@@ -66,6 +90,50 @@ export interface EnrichmentProgress {
   enrichedTrades: number;
   startTime: number;
   endTime?: number;
+}
+
+/**
+ * GlobalIVHistoryData - Efficient storage for cross-instrument IV history
+ *
+ * Stores each IV once and computes historical lookback windows on-demand.
+ * This avoids massive data duplication (storing same IV billions of times).
+ *
+ * Memory savings: Stores 2.26M IVs once (~18 MB) instead of pre-computing
+ * historical arrays for every bucket (157 GB with duplicates).
+ */
+export class GlobalIVHistoryData {
+  private bucketedData: Map<number, number[]>;
+  private sortedBuckets: number[];
+  private fiftyTwoWeeksMs = 52 * 7 * 24 * 60 * 60 * 1000;
+
+  constructor(bucketedData: Map<number, number[]>) {
+    this.bucketedData = bucketedData;
+    this.sortedBuckets = Array.from(bucketedData.keys()).sort((a, b) => a - b);
+  }
+
+  /**
+   * Get historical IVs for a specific time bucket (computed on-demand)
+   *
+   * Returns all IVs from the 52 weeks BEFORE the given bucket.
+   * This is called once per trade during enrichment.
+   *
+   * @param bucket - Time bucket to get historical IVs for
+   * @returns Array of historical IVs from past 52 weeks
+   */
+  getHistoricalIVs(bucket: number): number[] {
+    const lookbackStart = bucket - this.fiftyTwoWeeksMs;
+    const historicalIVs: number[] = [];
+
+    // Collect IVs from all buckets in the 52-week lookback window
+    for (const b of this.sortedBuckets) {
+      if (b >= bucket) break; // Stop when we reach the current bucket
+      if (b >= lookbackStart) {
+        historicalIVs.push(...this.bucketedData.get(b)!);
+      }
+    }
+
+    return historicalIVs;
+  }
 }
 
 /**
@@ -110,12 +178,71 @@ export class ParquetWriter {
   }
 
   /**
-   * Enrich a single trade with Greeks and moneyness
+   * Round timestamp to nearest time bucket for IV history grouping
+   *
+   * Reduces memory usage by grouping trades into hourly buckets instead of
+   * tracking IV history for every individual trade timestamp.
+   *
+   * @param timestamp - Original timestamp in milliseconds
+   * @param bucketSizeMs - Bucket size in milliseconds (default: 1 hour)
+   * @returns Bucketed timestamp (rounded down to nearest bucket)
+   */
+  private bucketTimestamp(timestamp: number, bucketSizeMs: number = 3600000): number {
+    return Math.floor(timestamp / bucketSizeMs) * bucketSizeMs;
+  }
+
+  /**
+   * Build global IV history map from ALL instruments
+   *
+   * Creates a rolling 52-week IV history that includes IVs from ALL instruments,
+   * not just the current one. This provides statistically robust IV rank calculation.
+   *
+   * @param instrumentNames - All instruments to include in global history
+   * @returns GlobalIVHistoryData for efficient on-demand IV lookups
+   */
+  public async buildGlobalIVHistory(
+    instrumentNames: string[]
+  ): Promise<GlobalIVHistoryData> {
+    console.log(`Building global IV history from ${instrumentNames.length} instruments...`);
+
+    // Collect and bucket all IV data by hourly intervals
+    // Each IV is stored exactly once (no duplication)
+    const bucketedData = new Map<number, number[]>();
+
+    for (const instrumentName of instrumentNames) {
+      try {
+        const trades = await this.jsonlStorage.readTrades(instrumentName);
+        for (const trade of trades) {
+          if (trade.iv !== undefined && trade.iv !== null) {
+            const bucket = this.bucketTimestamp(trade.timestamp);
+            if (!bucketedData.has(bucket)) {
+              bucketedData.set(bucket, []);
+            }
+            bucketedData.get(bucket)!.push(trade.iv);
+          }
+        }
+      } catch (error) {
+        // Skip instruments with no trades or read errors
+        continue;
+      }
+    }
+
+    const totalIVs = Array.from(bucketedData.values()).reduce((sum, ivs) => sum + ivs.length, 0);
+    console.log(`Collected ${totalIVs} IV data points into ${bucketedData.size} hourly buckets`);
+    console.log(`Memory-efficient storage: each IV stored once, lookups computed on-demand\n`);
+
+    // Return GlobalIVHistoryData for on-demand historical IV computation
+    return new GlobalIVHistoryData(bucketedData);
+  }
+
+  /**
+   * Enrich a single trade with Greeks, moneyness, and trading metrics
    */
   private enrichTrade(
     trade: DeribitTrade,
     instrument: ReturnType<typeof parseInstrumentName>,
-    deliveryPrice?: number
+    deliveryPrice?: number,
+    globalIVHistory?: GlobalIVHistoryData
   ): Record<string, any> {
     const { strike, expiration, optionType } = instrument!;
 
@@ -197,6 +324,89 @@ export class ParquetWriter {
       enriched.moneyness_percentage = null;
     }
 
+    // Trading Metrics
+
+    // 1. Annualized Premium Yield
+    const daysToExpiry = timeToExpiry * 365.25;
+    if (trade.price > 0 && daysToExpiry > 0) {
+      try {
+        const yieldMetrics = calculateAnnualizedYield(
+          trade.price,
+          strike,
+          trade.index_price,
+          daysToExpiry
+        );
+        enriched.annualized_premium_yield = yieldMetrics?.annualized_premium_yield ?? null;
+      } catch (error) {
+        enriched.annualized_premium_yield = null;
+      }
+    } else {
+      enriched.annualized_premium_yield = null;
+    }
+
+    // 2. IV Rank (52-Week Percentile) - using GLOBAL IV history
+    if (trade.iv && globalIVHistory) {
+      const bucketedTimestamp = this.bucketTimestamp(trade.timestamp);
+      const historicalIVs = globalIVHistory.getHistoricalIVs(bucketedTimestamp);
+      if (historicalIVs.length > 0) {
+        try {
+          const ivRankStats = calculateIVRank(trade.iv, historicalIVs);
+          enriched.iv_rank_52w = ivRankStats.iv_rank_52w;
+          enriched.iv_52w_high = ivRankStats.iv_52w_high;
+          enriched.iv_52w_low = ivRankStats.iv_52w_low;
+          enriched.iv_52w_mean = ivRankStats.iv_52w_mean;
+          enriched.iv_52w_stddev = ivRankStats.iv_52w_stddev;
+        } catch (error) {
+          enriched.iv_rank_52w = null;
+          enriched.iv_52w_high = null;
+          enriched.iv_52w_low = null;
+          enriched.iv_52w_mean = null;
+          enriched.iv_52w_stddev = null;
+        }
+      } else {
+        enriched.iv_rank_52w = null;
+        enriched.iv_52w_high = null;
+        enriched.iv_52w_low = null;
+        enriched.iv_52w_mean = null;
+        enriched.iv_52w_stddev = null;
+      }
+    } else {
+      enriched.iv_rank_52w = null;
+      enriched.iv_52w_high = null;
+      enriched.iv_52w_low = null;
+      enriched.iv_52w_mean = null;
+      enriched.iv_52w_stddev = null;
+    }
+
+    // 3. Expected Value (Stress Scenarios)
+    if (trade.price > 0) {
+      try {
+        const evMetrics = calculateExpectedValue(
+          trade.price,
+          strike,
+          trade.index_price,
+          optionType
+        );
+        enriched.expected_value_btc = evMetrics.expected_value_btc;
+        enriched.win_probability = evMetrics.win_probability;
+        enriched.max_loss_btc = evMetrics.max_loss_btc;
+        enriched.max_gain_btc = evMetrics.max_gain_btc;
+        enriched.sharpe_ratio = evMetrics.sharpe_ratio;
+      } catch (error) {
+        enriched.expected_value_btc = null;
+        enriched.win_probability = null;
+        enriched.max_loss_btc = null;
+        enriched.max_gain_btc = null;
+        enriched.sharpe_ratio = null;
+      }
+    } else {
+      enriched.expected_value_btc = null;
+      enriched.win_probability = null;
+      enriched.max_loss_btc = null;
+      enriched.max_gain_btc = null;
+      enriched.sharpe_ratio = null;
+    }
+
     return enriched;
   }
 
@@ -204,11 +414,13 @@ export class ParquetWriter {
    * Convert JSONL trades to enriched Parquet for a single instrument
    *
    * @param instrumentName - Instrument to process
+   * @param globalIVHistory - Optional global IV history map (for cross-instrument IV rank)
    * @param onProgress - Optional progress callback
    * @returns Progress information
    */
   async enrichInstrument(
     instrumentName: string,
+    globalIVHistory?: GlobalIVHistoryData,
     onProgress?: (progress: EnrichmentProgress) => void
   ): Promise<EnrichmentProgress> {
     const startTime = Date.now();
@@ -252,13 +464,15 @@ export class ParquetWriter {
 
     let enrichedCount = 0;
 
-    // Process trades in batches for memory efficiency
+    // Enrich trades with all metrics (Greeks, moneyness, trading metrics)
     const batchSize = 1000;
     for (let i = 0; i < trades.length; i += batchSize) {
       const batch = trades.slice(i, i + batchSize);
 
       for (const trade of batch) {
-        const enriched = this.enrichTrade(trade, instrument, deliveryPrice);
+        // Enrich trade with Greeks, moneyness, and trading metrics
+        // globalIVHistory provides cross-instrument IV rank context
+        const enriched = this.enrichTrade(trade, instrument, deliveryPrice, globalIVHistory);
         await writer.appendRow(enriched);
         enrichedCount++;
 
@@ -292,18 +506,20 @@ export class ParquetWriter {
    * Enrich multiple instruments with progress tracking
    *
    * @param instrumentNames - Array of instruments to process
+   * @param globalIVHistory - Optional global IV history map (for cross-instrument IV rank)
    * @param onProgress - Optional progress callback
    * @returns Array of progress results
    */
   async enrichMultipleInstruments(
     instrumentNames: string[],
+    globalIVHistory?: GlobalIVHistoryData,
     onProgress?: (progress: EnrichmentProgress) => void
   ): Promise<EnrichmentProgress[]> {
     const results: EnrichmentProgress[] = [];
 
     for (const instrumentName of instrumentNames) {
       try {
-        const progress = await this.enrichInstrument(instrumentName, onProgress);
+        const progress = await this.enrichInstrument(instrumentName, globalIVHistory, onProgress);
         results.push(progress);
 
         const duration = ((progress.endTime! - progress.startTime) / 1000).toFixed(2);
@@ -322,6 +538,9 @@ export class ParquetWriter {
 
   /**
    * Enrich all instruments for a currency
+   *
+   * Builds a global IV history from ALL instruments first, then enriches each
+   * instrument with cross-instrument IV rank context.
    *
    * @param currency - Base currency (e.g., "BTC", "ETH")
    * @param onProgress - Optional progress callback
@@ -347,7 +566,11 @@ export class ParquetWriter {
 
     console.log(`Found ${instrumentNames.length} completed options\n`);
 
-    const results = await this.enrichMultipleInstruments(instrumentNames, onProgress);
+    // Build global IV history from ALL instruments (cross-instrument context)
+    const globalIVHistory = await this.buildGlobalIVHistory(instrumentNames);
+
+    // Enrich each instrument with global IV rank context
+    const results = await this.enrichMultipleInstruments(instrumentNames, globalIVHistory, onProgress);
 
     const totalTrades = results.reduce((sum, r) => sum + r.enrichedTrades, 0);
 

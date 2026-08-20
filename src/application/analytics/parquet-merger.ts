@@ -62,7 +62,7 @@ export class ParquetMerger {
     instrumentNames: string[],
     onProgress?: (progress: EnrichmentProgress) => void
   ): Promise<EnrichmentProgress[]> {
-    return this.writer.enrichMultipleInstruments(instrumentNames, onProgress);
+    return this.writer.enrichMultipleInstruments(instrumentNames, undefined, onProgress);
   }
 
   /**
@@ -118,9 +118,13 @@ export class ParquetMerger {
 
     console.log(`Found ${instrumentNames.length} completed options\n`);
 
-    // Enrich all instruments
+    // Build global IV history for cross-instrument IV rank
+    const globalIVHistory = await this.writer.buildGlobalIVHistory(instrumentNames);
+
+    // Enrich all instruments with global IV rank context
     const results = await this.writer.enrichMultipleInstruments(
       instrumentNames,
+      globalIVHistory,
       onProgress
     );
 

@@ -1,13 +1,16 @@
 import type { DeribitClient } from "../../infrastructure/deribit-client.ts";
 import type { Database } from "../../infrastructure/database.ts";
 import { JSONLStorage } from "../../infrastructure/jsonl-storage.ts";
+import { ParquetStorage } from "../../infrastructure/parquet-storage.ts";
 
 export interface FutureFetcherConfig {
   client: DeribitClient;
   database: Database;
-  storage: JSONLStorage;
+  jsonlStorage: JSONLStorage;
+  parquetStorage: ParquetStorage;
   chunkSize?: number; // Default 10000
   concurrency?: number; // Max parallel chunk fetches
+  maxSeq?: number; // Skip instruments with more than this many trades
 }
 
 export interface FutureFetchProgress {
@@ -27,21 +30,25 @@ export interface FutureFetchProgress {
  * - Fetch last_seq up front
  * - Pre-allocate all chunks [1, last_seq] into fixed ranges
  * - Fetch chunks concurrently (producer-consumer pattern)
- * - Each chunk written to JSONL + checkpoint in DB
+ * - Each chunk written to Parquet + checkpoint in DB
  */
 export class FutureFetcher {
   private client: DeribitClient;
   private database: Database;
-  private storage: JSONLStorage;
+  private jsonlStorage: JSONLStorage;
+  private parquetStorage: ParquetStorage;
   private chunkSize: number;
   private concurrency: number;
+  private maxSeq?: number;
 
   constructor(config: FutureFetcherConfig) {
     this.client = config.client;
     this.database = config.database;
-    this.storage = config.storage;
+    this.jsonlStorage = config.jsonlStorage;
+    this.parquetStorage = config.parquetStorage;
     this.chunkSize = config.chunkSize ?? 10000;
     this.concurrency = config.concurrency ?? 3;
+    this.maxSeq = config.maxSeq;
   }
 
   /**
@@ -51,6 +58,7 @@ export class FutureFetcher {
   async prepareInstrument(instrumentName: string): Promise<{
     lastSeq: number | null;
     chunksCreated: number;
+    skipped?: boolean;
   }> {
     // Get last_seq from API (Design Decision #8: three-state result)
     const lastSeq = await this.client.getLastTradeSeq(instrumentName);
@@ -68,6 +76,13 @@ export class FutureFetcher {
       return { lastSeq: 0, chunksCreated: 0 };
     }
 
+    // Check if instrument exceeds max-seq threshold
+    if (this.maxSeq !== undefined && lastSeq > this.maxSeq) {
+      console.log(`⏭️  ${instrumentName}: ${lastSeq.toLocaleString()} trades (above --max-seq ${this.maxSeq.toLocaleString()}) - SKIPPED`);
+      this.database.updateInstrumentLastSeq(instrumentName, lastSeq);
+      return { lastSeq, chunksCreated: 0, skipped: true };
+    }
+
     // Update instrument with last_seq
     this.database.updateInstrumentLastSeq(instrumentName, lastSeq);
 
@@ -76,9 +91,42 @@ export class FutureFetcher {
 
     const stats = this.database.getFutureChunkStats(instrumentName);
 
-    console.log(`✓ ${instrumentName}: last_seq=${lastSeq}, chunks=${stats.total}`);
+    console.log(`✓ ${instrumentName}: last_seq=${lastSeq.toLocaleString()}, chunks=${stats.total}`);
 
     return { lastSeq, chunksCreated: stats.total };
+  }
+
+  /**
+   * Convert JSONL to Parquet and delete JSONL file
+   * Called when all chunks for a future are complete
+   */
+  private async convertToParquet(instrumentName: string): Promise<void> {
+    // Read all trades from JSONL
+    const trades = await this.jsonlStorage.readTrades(instrumentName);
+
+    if (trades.length === 0) {
+      // No trades to convert, just clean up
+      await this.jsonlStorage.deleteFile(instrumentName);
+      return;
+    }
+
+    // Write to Parquet
+    await this.parquetStorage.writeTrades(instrumentName, trades);
+
+    // Delete JSONL file
+    await this.jsonlStorage.deleteFile(instrumentName);
+
+    // Update database with new Parquet path
+    const parquetPath = this.parquetStorage.getTradeFilePath(instrumentName);
+    const stats = this.database.getFutureChunkStats(instrumentName);
+
+    // Update the last chunk's path to point to Parquet
+    // (Database will have all chunks, just update the final path reference)
+    this.database.db.run(
+      `UPDATE instruments SET file_path = ? WHERE instrument_name = ?`,
+      parquetPath,
+      instrumentName
+    );
   }
 
   /**
@@ -101,7 +149,7 @@ export class FutureFetcher {
 
     for await (const trades of generator) {
       // Write to JSONL (Design Decision #5: disk first, DB second)
-      await this.storage.appendTrades(instrumentName, trades);
+      await this.jsonlStorage.appendTrades(instrumentName, trades);
       totalTrades += trades.length;
     }
 
@@ -156,7 +204,7 @@ export class FutureFetcher {
             );
 
             // Mark chunk as done in DB (after JSONL flush)
-            const jsonlPath = this.storage["getFilePath"](instrumentName);
+            const jsonlPath = this.jsonlStorage.getFilePath(instrumentName);
             this.database.markFutureChunkDone(
               instrumentName,
               chunk.chunk_start_seq,
@@ -167,6 +215,12 @@ export class FutureFetcher {
 
             completedChunks++;
             totalTrades += result.tradeCount;
+
+            // Check if this was the last chunk - if so, convert to Parquet
+            const updatedStats = this.database.getFutureChunkStats(instrumentName);
+            if (updatedStats.pending === 0) {
+              await this.convertToParquet(instrumentName);
+            }
 
             if (onProgress) {
               onProgress({
