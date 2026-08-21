@@ -383,8 +383,35 @@ async function pipelineCommand(args: string[]) {
 
   console.log(`\n━━━ Processing jobs... ━━━\n`);
 
-  // Keep process alive - worker will process jobs
-  await new Promise(() => {}); // Never resolves
+  // Wait for all jobs to complete
+  const totalJobs = chain.length;
+  let completedJobs = 0;
+
+  await new Promise<void>((resolve) => {
+    worker.on("completed", (job) => {
+      // Only count jobs from this pipeline (match job names in chain)
+      if (chain.some(step => step.name === job.name)) {
+        completedJobs++;
+        console.log(`\n[${completedJobs}/${totalJobs}] ✓ ${job.name} completed`);
+
+        if (completedJobs >= totalJobs) {
+          console.log(`\n━━━ Pipeline Complete! ━━━\n`);
+          resolve();
+        }
+      }
+    });
+
+    worker.on("failed", (job, error) => {
+      if (chain.some(step => step.name === job.name)) {
+        console.error(`\n✗ ${job.name} failed:`, error);
+        console.error(`\n━━━ Pipeline Failed ━━━\n`);
+        process.exit(1);
+      }
+    });
+  });
+
+  await worker.close();
+  await queue.close();
 }
 
 async function queueWorkerCommand() {
