@@ -326,8 +326,9 @@ export class DeribitClient {
       });
 
       if (!response.ok) {
-        if (response.status === 404) {
-          // Instrument exists but has no trades
+        if (response.status === 404 || response.status === 400) {
+          // 404: Instrument exists but has no trades
+          // 400: Instrument doesn't exist or invalid name
           return 0;
         }
         throw new DeribitAPIError(

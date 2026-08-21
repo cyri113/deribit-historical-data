@@ -295,31 +295,32 @@ async function pipelineCommand(args: string[]) {
   console.log(`\n📊 Step 3/3: Gold layer (trading metrics)...`);
   await goldCommand([currency]);
 
-  console.log(`\n━━━ Pipeline Complete ━━━`);
-  console.log(`Bronze: data/bronze/instruments/${currency}/`);
-  console.log(`Silver: data/silver/${currency}.parquet`);
-  console.log(`Gold: data/gold/${currency}.parquet`);
+  console.log(`\n━━━ Pipeline jobs enqueued! ━━━`);
+  console.log(`\n⚠️  Note: Jobs are processing in the background via BunQueue.`);
+  console.log(`Monitor progress with:`);
+  console.log(`  bun src/cli/index.ts queue-dashboard`);
+  console.log(`\nOutput will be at:`);
+  console.log(`  Bronze: data/bronze/instruments/${currency}/`);
+  console.log(`  Silver: data/silver/${currency}.parquet`);
+  console.log(`  Gold: data/gold/${currency}.parquet\n`);
 }
 
 async function queueWorkerCommand() {
   const { QueueManager } = await import("../infrastructure/queue.ts");
-  const queue = QueueManager.getQueue();
 
-  console.log("Starting queue worker...");
+  console.log("Starting BunQueue worker...");
+  console.log("Jobs will be processed automatically via routes.");
   console.log("Press Ctrl+C to stop.\n");
 
-  // BunQueue worker runs continuously
-  await queue.worker(async (job) => {
-    console.log(`Processing job ${job.id}: ${job.type}`);
+  // Initialize the queue - this starts processing jobs automatically via routes
+  const queue = QueueManager.getQueue();
 
-    try {
-      await QueueManager.processJob(job);
-      console.log(`✓ Job ${job.id} completed`);
-    } catch (error) {
-      console.error(`✗ Job ${job.id} failed:`, error);
-      throw error; // Let BunQueue handle retry
-    }
-  });
+  console.log("✓ Queue worker ready and processing jobs");
+  console.log("Monitor progress with:");
+  console.log("  bun src/cli/index.ts queue-dashboard\n");
+
+  // Keep the process alive
+  await new Promise(() => {}); // Never resolves - keeps process running
 }
 
 async function queueStatusCommand() {
