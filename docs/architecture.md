@@ -1,151 +1,158 @@
 # Architecture
 
-Layered: CLI → Application → Domain → Infrastructure
-
-**Design:** Seq-based pagination, dual fetch (futures=concurrent chunks, options=streaming)
-
-## Layers
-
-```
-┌──────────────────────────────────────┐
-│  CLI (src/cli/index.ts)              │  Command parsing, progress display, queue management
-└───────────────┬──────────────────────┘
-                ↓
-┌──────────────────────────────────────┐
-│  Application (src/application/)      │
-│  • Fetchers (Future, Option, Delivery, Volatility)
-│  • Analytics (ParquetMerger, DuckDBEnricher)
-│  • Filters (RiskFilters)
-└───────────────┬──────────────────────┘
-                ↓
-┌──────────────────────────────────────┐
-│  Domain (src/domain/)                │  Pure functions, no I/O
-│  • black76.ts, moneyness.ts, models.ts
-└───────────────┬──────────────────────┘
-                ↓
-┌──────────────────────────────────────┐
-│  Infrastructure (src/infrastructure/)│
-│  • deribit-client.ts (HTTP + rate limiting)
-│  • queue.ts (BunQueue job queue)
-│  • parquet-storage.ts (Parquet I/O)
-│  • parquet-writer.ts (enriched Parquet with Greeks)
-│  • duckdb-connection.ts, duckdb-greeks.ts
-│  • rate-limiter.ts (token bucket)
-└──────────────────────────────────────┘
-```
-
-## Components
-
-### Fetchers
-**FutureFetcher:** Check Parquet exists → fetch all trades [1, lastSeq] → write Parquet (idempotent via filesystem)
-**OptionFetcher:** Check Parquet exists → fetch all trades [1, lastSeq] → write Parquet (idempotent via filesystem)
-**DeliveryFetcher:** Paginated fetch → write Parquet
-**VolatilityFetcher:** Single-fetch → write Parquet
-
-### Analytics
-**ParquetMerger:** TypeScript row-by-row ~1-2k/sec (legacy)
-**DuckDBEnricher:** SQL vectorized ~20-50k/sec, 10-100x faster (recommended)
-  - Black-76 as pure SQL (no UDF)
-  - All CPU cores, streaming memory
-
-### Domain (Pure Functions)
-**black76.ts:** Pricing (call/put), Greeks (delta, gamma, vega, theta)
-**moneyness.ts:** ITM/OTM classification
-**models.ts:** Types, Zod schemas
-
-### Infrastructure
-**DeribitClient:** HTTP, rate limit (15 req/s), auto-retry, Zod validation
-**QueueManager:** BunQueue (SQLite job queue, retry logic, concurrency control)
-**ParquetStorage:** Direct Parquet I/O (read/write trades, instruments, deliveries, volatility)
-**ParquetWriter:** Row-by-row Greeks, join delivery prices
-**DuckDB:** WASM, Black-76 pure SQL, vectorized
-
-## Storage Architecture
-
-**Filesystem-based medallion architecture:**
-1. `data/parquet-raw/BTC/*.parquet` - **Bronze**: Raw trades (one file per instrument)
-2. `data/parquet-raw/futures/*.parquet` - **Bronze**: Dated futures (forward prices for Greeks)
-3. `data/parquet-raw/deliveries/*.parquet` - Delivery/settlement prices
-4. `data/parquet-raw/volatility/*.parquet` - Historical volatility
-5. `data/parquet-duckdb/BTC.parquet` - **Silver/Gold**: Enriched with Greeks (single file per currency, DuckDBEnricher)
-6. `data/queue.db` - BunQueue job queue (only SQLite database)
-
-**No instrument metadata database** - All metadata embedded in Parquet files via `parseInstrumentName()`
-
-## Data Flow
-
-### Fetch
-```
-fetch-all BTC --kind option --min-expiration 3m --max-expiration 2026-08-21
-  ↓
-BunQueue: enqueue fetch-instruments + fetch-trades jobs
-  ↓
-fetch-instruments: API getInstruments(expired=true) → filter by expiration → return instruments
-fetch-trades: For each instrument → enqueue fetch-option/fetch-future jobs
-  ↓
-fetch-option/future:
-  1. Check if Parquet exists → skip if yes (idempotent)
-  2. API getLastTradeSeq → get total count
-  3. Fetch all trades [1, lastSeq] in memory
-  4. Write to Parquet
-  ↓
-DeribitClient: shared rate limiter (15 req/s) → API → Zod validate
-```
-
-### Enrich (DuckDB)
-```
-enrich-with-duckdb BTC
-  ↓
-Read Parquet → Generate Black-76 SQL (CDF/PDF, d1/d2, Greeks) → DuckDB vectorized → Parquet
-  ↓
-~20-50k/sec, all cores
-```
-
-## Concurrency
-
-**BunQueue:** 3 concurrent jobs (configurable)
-**Rate Limiting:** Shared 15 req/s limiter across all workers (75% of Deribit's 20 req/s limit)
-**Idempotency:** Re-run commands skip completed instruments via Parquet file existence checks
-
-## Stack
-
-**Runtime:** Bun (TypeScript, SQLite, test, bundler built-in)
-**Language:** TypeScript (strict, no `any`)
-**Storage:** Parquet (columnar analytics), SQLite (BunQueue jobs only)
-**Validation:** Zod
-**Queue:** BunQueue (embedded SQLite, retry logic, concurrency control)
-**Analytics:** DuckDB WASM (vectorized SQL)
-**Testing:** Bun test (90 tests passing)
+**Pattern:** Medallion (bronze/silver/gold), layered (CLI → Application → Domain → Infrastructure)
 
 ## Directory Structure
 
 ```
-deribit-historical-data/
-├── src/
-│   ├── cli/index.ts
-│   ├── application/
-│   │   ├── fetchers/       # Future, Option, Delivery fetchers
-│   │   ├── analytics/      # ParquetMerger, DuckDBEnricher
-│   │   └── filters/        # RiskFilters
-│   ├── domain/             # black76, moneyness, models
-│   └── infrastructure/     # deribit-client, database, queue, storage, duckdb
-├── tests/
-│   ├── unit/
-│   ├── integration/
-│   └── e2e/
-├── data/
-│   ├── parquet-raw/
-│   │   ├── BTC/            # Bronze: Raw trades per instrument
-│   │   ├── deliveries/     # Delivery/settlement prices
-│   │   └── volatility/     # Historical volatility
-│   ├── parquet-duckdb/     # Silver/Gold: Enriched with Greeks
-│   └── queue.db            # BunQueue job queue (only SQLite)
-└── docs/
+src/
+├── cli/index.ts              # Commands: bronze, silver, pipeline
+├── application/
+│   ├── fetchers/             # FutureFetcher, OptionFetcher, DeliveryFetcher
+│   └── analytics/            # DuckDBEnricher (Greeks computation)
+├── domain/                   # Pure functions: black76.ts, models.ts, parseInstrumentName()
+└── infrastructure/
+    ├── deribit-client.ts     # HTTP + rate limit (15 req/s)
+    ├── parquet-storage.ts    # Read/write Parquet files
+    ├── duckdb-connection.ts  # DuckDB WASM instance
+    ├── duckdb-greeks.ts      # Black-76 SQL generators
+    ├── queue.ts              # BunQueue manager
+    └── rate-limiter.ts       # Token bucket
+
+data/
+├── bronze/instruments/{ASSET}/*.parquet  # Raw trades
+├── bronze/futures/*.parquet              # Dated futures
+├── silver/{ASSET}.parquet                # Enriched with Greeks
+└── queue.db                              # BunQueue state
 ```
 
-## Patterns
+## Components
 
-**Dependency Injection:** Explicit constructor deps (client, parquetStorage)
-**Strategy:** Filesystem-based idempotency (check Parquet exists before fetch)
-**Queue-based Pipeline:** BunQueue orchestrates instrument discovery → trade fetching
-**Shared Rate Limiting:** Single DeribitClient instance with token bucket limiter
+### CLI (`src/cli/index.ts`)
+- `bronze <currency>` → Enqueues: fetch-instruments, fetch-trades, fetch-dated-futures
+- `silver <currency>` → Enqueues: enrich-duckdb
+- `pipeline <currency>` → Runs bronze + silver sequentially
+- `queue-worker` → Processes jobs from queue.db
+
+### Application Layer
+
+**Fetchers:**
+- Check if bronze/.../file.parquet exists → skip (idempotent)
+- Fetch trades via seq-based pagination [1, lastSeq]
+- Write atomically to Parquet
+
+**Analytics:**
+- `DuckDBEnricher` - Single SQL query processes ALL files → single output
+
+### Domain Layer (Pure Functions)
+- `parseInstrumentName(str)` - Extract strike, expiry, type from filename
+- `black76.ts` - Pricing formulas (not used; Greeks computed in SQL)
+
+### Infrastructure
+
+**DeribitClient:**
+- Rate limit: 15 req/s (75% of Deribit's 20 req/s)
+- Seq-based: `getTradesBySeq(instrument, startSeq, endSeq)`
+- Loop detection: tracks previousSeq to prevent infinite loops
+
+**ParquetStorage:**
+- `getTradeFilePath(name)` → `data/bronze/instruments/{ASSET}/{name}.parquet`
+- `getFuturesFilePath(name)` → `data/bronze/futures/{name}.parquet`
+- Atomic writes, no append mode
+
+**DuckDB:**
+- WASM-based, in-process
+- Greeks = pure SQL expressions (no UDFs)
+- Vectorized execution: 20-50k trades/sec
+
+**QueueManager (BunQueue):**
+- SQLite-based job queue (data/queue.db)
+- 3 concurrent jobs, retry 3x with exponential backoff
+- Job types: fetch-instruments, fetch-trades, fetch-dated-futures, enrich-duckdb
+
+## Data Flow
+
+### Bronze Pipeline
+
+```
+bronze BTC --kind option --min-expiration 3m
+  ↓
+Job: fetch-instruments
+  API getInstruments(BTC, option, expired=true)
+  Filter: expiration_timestamp <= now AND >= 3m ago
+  → Returns list of instruments
+  ↓
+Job: fetch-trades
+  For each instrument:
+    if exists(bronze/instruments/BTC/{name}.parquet) → skip
+    else:
+      lastSeq ← API getLastTradeSeq(instrument)
+      trades ← API getAllTradesBySeq(instrument, 1, lastSeq)
+      write bronze/instruments/BTC/{name}.parquet
+  ↓
+Job: fetch-dated-futures
+  Extract unique expiries from option names via regex: ^([A-Z]+-[0-9]{1,2}[A-Z]{3}[0-9]{2})-
+  For each expiry (e.g., BTC-29MAY26):
+    if exists(bronze/futures/{expiry}.parquet) → skip
+    else:
+      fetch trades → write bronze/futures/{expiry}.parquet
+```
+
+### Silver Pipeline
+
+```
+silver BTC
+  ↓
+Job: enrich-duckdb
+  DuckDB single SQL query:
+    Read: bronze/instruments/BTC/*.parquet (3,478 files)
+    LEFT JOIN: bronze/futures/BTC-*.parquet (ASOF join on timestamp)
+    Compute: delta, gamma, vega, theta via Black-76 SQL
+    Compute: is_valid flag
+    Write: silver/BTC.parquet (single file, all instruments)
+  ↓
+Output: silver/BTC.parquet (894k trades, 21 fields)
+```
+
+### ASOF Join (Forward Prices)
+
+```sql
+-- Extract expiry from instrument name, join to futures
+LEFT JOIN (
+  SELECT instrument_name, timestamp, price as futures_price
+  FROM read_parquet('bronze/futures/*.parquet')
+) futures
+  ON regexp_extract(opt.instrument_name, '^([A-Z]+-[0-9]{1,2}[A-Z]{3}[0-9]{2})-', 1) = futures.instrument_name
+  AND futures.timestamp <= opt.timestamp
+QUALIFY ROW_NUMBER() OVER (PARTITION BY opt.trade_id ORDER BY futures.timestamp DESC) = 1
+```
+
+**Result:** Each option trade gets `futures_price` = nearest prior futures trade price
+
+## Concurrency
+
+- **BunQueue:** 3 parallel workers
+- **Rate limit:** 15 req/s shared across all workers
+- **Idempotency:** Re-run commands skip completed files
+
+## Key Patterns
+
+1. **Filesystem idempotency** - Check .parquet exists → skip (no DB tracking)
+2. **Seq-based pagination** - Monotonic trade_seq, no gaps
+3. **Metadata in filename** - Parse instrument name → no instrument table
+4. **Single enrichment query** - Process ALL files in one SQL statement
+5. **Strict forward pricing** - Greeks NULL if no futures_price (no fallback)
+6. **ASOF join** - Match trades to forward prices by time
+
+## Performance
+
+- **Bronze:** 99% instruments complete in <10s (3 parallel)
+- **Silver:** 894k trades enriched in ~1.3s (650k trades/sec)
+- **Bottleneck:** API rate limit (15 req/s) not computation
+
+## Error Handling
+
+- **API errors:** Retry 3x with exponential backoff
+- **Loop detection:** Track previousSeq, break if stuck
+- **Job failures:** Visible in queue-dashboard
+- **Crash recovery:** Re-run commands skip completed files

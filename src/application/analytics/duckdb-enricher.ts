@@ -4,8 +4,8 @@ import { join, dirname } from "node:path";
 import { mkdirSync, existsSync } from "node:fs";
 
 export interface DuckDBEnricherConfig {
-  inputDir?: string;   // Default: ./data/parquet-raw
-  outputDir?: string;  // Default: ./data/parquet-duckdb
+  inputDir?: string;   // Default: ./data/bronze
+  outputDir?: string;  // Default: ./data/silver
   maxMemory?: string;  // Default: 4GB
   threads?: number;    // Default: CPU cores
 }
@@ -43,8 +43,8 @@ export class DuckDBEnricher {
   private threads?: number;
 
   constructor(config: DuckDBEnricherConfig = {}) {
-    this.inputDir = config.inputDir ?? "./data/parquet-raw";
-    this.outputDir = config.outputDir ?? "./data/parquet-duckdb";
+    this.inputDir = config.inputDir ?? "./data/bronze";
+    this.outputDir = config.outputDir ?? "./data/silver";
     this.maxMemory = config.maxMemory ?? "4GB";
     this.threads = config.threads;
   }
@@ -139,7 +139,7 @@ export class DuckDBEnricher {
     console.log(`\n━━━ DuckDB Enrichment: ${currency} (Bulk Processing → Single File) ━━━\n`);
 
     const overallStart = Date.now();
-    const inputPattern = join(this.inputDir, currency, "*.parquet");
+    const inputPattern = join(this.inputDir, "instruments", currency, "*.parquet");
     const outputFile = join(this.outputDir, `${currency}.parquet`);
 
     // Ensure output directory exists
@@ -173,7 +173,7 @@ export class DuckDBEnricher {
       console.log(`Found ${fileCount} files, ${instrumentCount} instruments, ${inputTradeCount.toLocaleString()} trades`);
 
       // Check if futures data exists
-      const futuresPattern = join(this.inputDir, "..", "futures", `${currency}-*.parquet`);
+      const futuresPattern = join(this.inputDir, "futures", `${currency}-*.parquet`);
       const futuresCheckQuery = `SELECT COUNT(*) as count FROM read_parquet('${futuresPattern}')`;
       let hasFuturesData = false;
       try {

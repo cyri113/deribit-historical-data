@@ -154,7 +154,11 @@ class QueueManager {
             // Fetch instruments from API (with expired flag for historical data)
             let instruments = await deps.client.getInstruments(currency, kind, expired ?? true);
 
-            // Apply filters
+            // Filter to ONLY expired instruments (history API returns both expired and active)
+            const now = Date.now();
+            instruments = instruments.filter(i => i.expiration_timestamp && i.expiration_timestamp <= now);
+
+            // Apply additional expiration date filters
             if (minExpiration) {
               const minTs = typeof minExpiration === 'number' ? minExpiration : new Date(minExpiration).getTime();
               instruments = instruments.filter(i => i.expiration_timestamp && i.expiration_timestamp >= minTs);

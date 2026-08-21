@@ -12,7 +12,7 @@ import { ParquetConverter } from "../application/converters/parquet-converter.ts
 import cliProgress from "cli-progress";
 import Table from "cli-table3";
 
-const COMMANDS = ["fetch-instruments", "fetch-trades", "fetch-deliveries", "fetch-volatility", "fetch-all", "convert-to-raw-parquet", "merge-to-parquet", "enrich-with-duckdb", "stats", "queue-worker", "queue-status", "queue-dashboard", "help"] as const;
+const COMMANDS = ["bronze", "silver", "pipeline", "fetch-instruments", "fetch-trades", "fetch-deliveries", "fetch-volatility", "fetch-all", "convert-to-raw-parquet", "merge-to-parquet", "enrich-with-duckdb", "stats", "queue-worker", "queue-status", "queue-dashboard", "help"] as const;
 type Command = typeof COMMANDS[number];
 
 // Argument parsing
@@ -85,11 +85,64 @@ function parseDate(dateStr: string): number {
 
 function printHelp() {
   console.log(`
-Deribit Historical Data Fetcher (Seq-Based Architecture)
+Deribit Historical Data Fetcher (Medallion Architecture)
 
 Usage: bun src/cli/index.ts <command> [options]
 
-Commands:
+Commands (Medallion Architecture):
+
+  bronze <currency> [options]
+    Fetch raw data from Deribit API (Bronze layer)
+    Fetches: instruments, trades, futures, deliveries, volatility
+
+    Options:
+      --kind <type>           Filter by: option, future (default: both)
+      --concurrency <n>       Parallel fetches (default: 3)
+      --skip-deliveries       Skip delivery price fetching
+      --skip-volatility       Skip historical volatility fetching
+      --min-expiration <date> Only fetch options expiring after date (e.g., 3m, 6m, 2024-01-01)
+      --max-expiration <date> Only fetch options expiring before date
+
+    Examples:
+      bun src/cli/index.ts bronze BTC --kind option --min-expiration 3m
+      bun src/cli/index.ts bronze ETH --concurrency 5
+
+  silver <currency> [options]
+    Enrich bronze data with Greeks (Silver layer)
+    Uses DuckDB vectorized SQL (10-100x faster than TypeScript)
+
+    Options:
+      --input-dir <path>      Input directory for bronze Parquet (default: ./data/bronze)
+      --output-dir <path>     Output directory for silver Parquet (default: ./data/silver)
+      --max-memory <size>     DuckDB memory limit (default: 4GB)
+      --threads <n>           Number of threads (default: CPU cores)
+
+    Examples:
+      bun src/cli/index.ts silver BTC
+      bun src/cli/index.ts silver ETH --max-memory 8GB --threads 8
+
+  pipeline <currency> [options]
+    Run complete pipeline: bronze → silver (end-to-end)
+
+    Options:
+      Same as bronze command
+
+    Examples:
+      bun src/cli/index.ts pipeline BTC --kind option --min-expiration 3m
+      bun src/cli/index.ts pipeline ETH
+
+Queue Management:
+
+  queue-worker
+    Start queue worker to process jobs in background
+
+  queue-status
+    Show status of all jobs in the queue
+
+  queue-dashboard
+    Start web dashboard at http://localhost:6790
+
+Legacy Commands (deprecated, use bronze/silver/pipeline instead):
 
   fetch-instruments <currency> [--kind <type>] [--expired]
     Fetch and store instrument metadata from Deribit
@@ -162,7 +215,7 @@ Commands:
     Stage 2 of medallion architecture: Bronze → Silver
 
     Options:
-      --output-dir <path>     Output directory for raw Parquet files (default: ./data/parquet-raw)
+      --output-dir <path>     Output directory for raw Parquet files (default: ./data/bronze)
 
     Examples:
       bun src/cli/index.ts convert-to-raw-parquet BTC
@@ -191,8 +244,8 @@ Commands:
     10-100x faster than TypeScript, retryable via BunQueue
 
     Options:
-      --input-dir <path>      Input directory for raw Parquet (default: ./data/parquet-raw)
-      --output-dir <path>     Output directory for enriched Parquet (default: ./data/parquet-duckdb)
+      --input-dir <path>      Input directory for bronze Parquet (default: ./data/bronze)
+      --output-dir <path>     Output directory for silver Parquet (default: ./data/silver)
       --max-memory <size>     DuckDB memory limit (default: 4GB)
       --threads <n>           Number of threads (default: CPU cores)
 
@@ -732,8 +785,8 @@ async function enrichWithDuckDBCommand(args: string[]) {
   const threads = parsed.flags["threads"] ? parseInt(parsed.flags["threads"] as string) : undefined;
 
   console.log(`\n━━━ Enqueueing DuckDB Enrichment: ${currency} ━━━`);
-  console.log(`Input:  ${inputDir ?? './data/parquet-raw'}`);
-  console.log(`Output: ${outputDir ?? './data/parquet-duckdb'}`);
+  console.log(`Input:  ${inputDir ?? './data/bronze'}`);
+  console.log(`Output: ${outputDir ?? './data/silver'}`);
   console.log(`Memory: ${maxMemory ?? '4GB'}`);
   console.log(`Threads: ${threads ?? 'auto'}\n`);
 
@@ -751,6 +804,35 @@ async function enrichWithDuckDBCommand(args: string[]) {
 
   console.log(`✓ Enrichment job enqueued (ID: ${job.id})`);
   console.log(`\nMonitor progress:`);
+  console.log(`  bun src/cli/index.ts queue-dashboard  # http://localhost:6790\n`);
+}
+
+async function pipelineCommand(args: string[]) {
+  const parsed = parseArgs(args);
+
+  if (parsed.positional.length < 1) {
+    console.error("Usage: pipeline <currency> [options]");
+    console.error("\nOptions: same as bronze command");
+    console.error("\nExample: bun src/cli/index.ts pipeline BTC --kind option --min-expiration 3m");
+    process.exit(1);
+  }
+
+  const currency = parsed.positional[0]!.toUpperCase();
+
+  console.log(`\n━━━ Running Pipeline: ${currency} (Bronze → Silver) ━━━\n`);
+
+  // Step 1: Bronze layer (fetch raw data)
+  console.log(`📥 Step 1/2: Bronze layer (fetching raw data)...`);
+  await fetchAllCommand(args);
+
+  // Step 2: Silver layer (enrich with Greeks)
+  console.log(`\n🧮 Step 2/2: Silver layer (enriching with Greeks)...`);
+  await enrichWithDuckDBCommand([currency]);
+
+  console.log(`\n━━━ Pipeline Complete ━━━`);
+  console.log(`Bronze: data/bronze/instruments/${currency}/`);
+  console.log(`Silver: data/silver/${currency}.parquet`);
+  console.log(`\nMonitor jobs:`);
   console.log(`  bun src/cli/index.ts queue-dashboard  # http://localhost:6790\n`);
 }
 
@@ -888,10 +970,21 @@ async function main() {
       console.error(`  bun src/cli/index.ts fetch-all <currency>\n`);
       process.exit(1);
       break;
+    case "bronze":
+      await fetchAllCommand(commandArgs);
+      break;
+    case "silver":
+      await enrichWithDuckDBCommand(commandArgs);
+      break;
+    case "pipeline":
+      await pipelineCommand(commandArgs);
+      break;
     case "fetch-all":
+      console.warn("\n⚠️  'fetch-all' is deprecated. Use 'bronze' instead.\n");
       await fetchAllCommand(commandArgs);
       break;
     case "enrich-with-duckdb":
+      console.warn("\n⚠️  'enrich-with-duckdb' is deprecated. Use 'silver' instead.\n");
       await enrichWithDuckDBCommand(commandArgs);
       break;
     case "queue-worker":

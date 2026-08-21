@@ -1,114 +1,161 @@
 # Data Model
 
-Parquet storage formats, relationships, no SQLite database for trade metadata.
+Parquet storage schemas and data lifecycle. No SQLite for trade metadata (only BunQueue state).
 
-## Storage
+## Storage Layers
 
-1. **Parquet Raw** `data/parquet-raw/BTC/*.parquet` - Bronze layer (raw trades, one file per instrument)
-2. **Parquet Futures** `data/parquet-raw/futures/*.parquet` - Bronze layer (dated futures for forward prices)
-3. **Parquet Deliveries** `data/parquet-raw/deliveries/*.parquet` - Delivery/settlement prices
-4. **Parquet Volatility** `data/parquet-raw/volatility/*.parquet` - Historical volatility
-5. **Parquet Enriched** `data/parquet-duckdb/BTC.parquet` - Silver/Gold layer (single file per currency with Greeks)
-6. **Queue** `data/queue.db` - BunQueue job queue (only SQLite database)
-
----
-
-## Parquet Format (Raw)
-
-**Structure:** `data/parquet-raw/{CURRENCY}/{INSTRUMENT}.parquet`
-
-**Example:** `data/parquet-raw/BTC/BTC-25DEC24-60000-C.parquet`
-
-**Fields:**
-- `trade_seq` (integer) - Unique sequence number
-- `timestamp` (bigint) - Unix ms
-- `price` (double) - Trade price
-- `index_price` (double) - Underlying index price
-- `direction` (string) - "buy" or "sell"
-- `amount` (double) - Trade size
-- `iv` (double) - Implied volatility (percentage, e.g., 65 = 65%)
-
-**⚠️ IV Format:** Deribit returns `iv:65` = 65% (use `iv/100` for Greeks calc)
-
-**Metadata Embedded:** All instrument metadata extracted via `parseInstrumentName()` from filename
-- `BTC-25DEC24-60000-C` → strike=60000, expiration=2024-12-25, option_type=call, currency=BTC
+```
+data/
+├── bronze/                          # Raw API data (medallion layer 1)
+│   ├── instruments/BTC/*.parquet    # One file per instrument (BTC-29MAY26-70000-C.parquet)
+│   ├── futures/*.parquet            # Dated futures for forward prices (BTC-29MAY26.parquet)
+│   ├── deliveries/*.parquet         # Settlement prices (btc_usd.parquet)
+│   └── volatility/*.parquet         # Historical volatility (BTC.parquet)
+├── silver/                          # Enriched with Greeks (medallion layer 2)
+│   └── BTC.parquet                  # Single file: all instruments + Greeks
+└── queue.db                         # BunQueue job state (only SQLite)
+```
 
 ---
 
-## Parquet Format (Enriched)
+## Bronze Schema (16 fields)
 
-**Structure:** `data/parquet-duckdb/{CURRENCY}.parquet` (single file per currency)
+**File**: `bronze/instruments/BTC/BTC-29MAY26-70000-C.parquet`
 
-**Example:** `data/parquet-duckdb/BTC.parquet` contains ALL BTC instruments with `instrument_name` column
+| Field | Type | Description |
+|-------|------|-------------|
+| trade_id | string | Unique trade ID |
+| trade_seq | bigint | Monotonic sequence (pagination key) |
+| instrument_name | string | Full instrument name |
+| timestamp | bigint | Unix milliseconds |
+| price | double | Trade price |
+| amount | double | Contract size |
+| direction | string | "buy" or "sell" |
+| tick_direction | int | Price movement direction |
+| index_price | double | Spot index price |
+| mark_price | double | Mark price |
+| implied_volatility | double | **Percentage (65 = 65%, not 0.65)** |
+| strike | double | Strike price |
+| expiration_timestamp | bigint | Unix milliseconds |
+| option_type | string | "call" or "put" |
+| time_to_expiry_years | double | TTM in years (for Greeks) |
 
-**Fields (16 core):**
-- **Instrument:** instrument_name (extracted from filename during bulk enrichment)
-- **Trade:** trade_seq, timestamp, price, amount, direction, index_price, mark_price, implied_volatility
-- **Meta:** strike, expiration_timestamp, option_type, time_to_expiry_years
-- **Greeks:** delta, gamma, vega (per 1%), theta (per day)
-- **Forward Price:** futures_price (when futures data available, else NULL)
-- **Quality:** is_valid (boolean flag for analytics-ready data)
+**⚠️ IV Format**: Deribit returns `implied_volatility: 65` = 65% → Use `iv/100` for Black-76 formula
 
-**Generation:** `enrich-with-duckdb BTC` (DuckDB SQL vectorized, 10-100x faster than TypeScript)
+**Metadata**: Extracted from filename via `parseInstrumentName()`
+- `BTC-29MAY26-70000-C` → strike=70000, expiration=2026-05-29, type=call, currency=BTC
 
-**Data Quality Flag (`is_valid`):**
-- `TRUE` = Valid for backtesting/analysis (has futures forward price, IV > 0, TTM > 1 day, valid Greeks)
-- `FALSE` = Missing futures data, IV=0, very short-dated <1 day, or NaN Greeks
-- **STRICT**: Greeks calculated ONLY with futures forward prices (no fallback to spot index_price)
-- Without futures data: `delta/gamma/vega/theta = NULL`, `is_valid = false`
-- Recommendation: Use `WHERE is_valid = true` for analytics queries
-- All data preserved for audit/research (can see spot price in `index_price` column)
+---
+
+## Silver Schema (21 fields = Bronze + 5)
+
+**File**: `silver/BTC.parquet` (all instruments in single file)
+
+**Bronze fields (16) + Computed (5):**
+
+| Field | Type | Source | Description |
+|-------|------|--------|-------------|
+| futures_price | double | ASOF join | Forward price from futures (NULL if no match) |
+| delta | double | Black-76 | Option delta (NULL if no futures_price) |
+| gamma | double | Black-76 | Option gamma (NULL if no futures_price) |
+| vega | double | Black-76 | Vega per 1% vol change (NULL if no futures_price) |
+| theta | double | Black-76 | Theta per day (NULL if no futures_price) |
+| is_valid | boolean | Quality flag | TRUE = analytics-ready (has futures_price, IV>0, TTM>1day, valid Greeks) |
+
+**Greeks Formula (Black-76)**:
+- Inputs: F=futures_price, K=strike, T=time_to_expiry_years, σ=implied_volatility/100
+- Computed via DuckDB vectorized SQL (no UDFs)
+- **STRICT**: Greeks = NULL if no futures_price (no fallback to index_price)
+
+**ASOF Join (Forward Prices)**:
+```sql
+LEFT JOIN futures
+  ON regexp_extract(opt.instrument_name, '^([A-Z]+-[0-9]{1,2}[A-Z]{3}[0-9]{2})-', 1) = futures.instrument_name
+  AND futures.timestamp <= opt.timestamp
+QUALIFY ROW_NUMBER() OVER (PARTITION BY opt.trade_id ORDER BY futures.timestamp DESC) = 1
+```
+Each option trade matched to nearest prior futures trade by timestamp.
+
+**Data Quality (`is_valid` flag)**:
+- `TRUE` = Has futures_price, IV > 0, TTM > 1 day, valid Greeks (not NaN/Inf)
+- `FALSE` = Missing futures, IV=0, very short-dated (<1 day), or invalid Greeks
+- Recommendation: `WHERE is_valid = true` for analytics queries
+- All data preserved for audit (spot price available in `index_price` column)
 
 ---
 
 ## Data Lifecycle
 
 ```
-1. fetch-all BTC --kind option --min-expiration 3m
+1. bronze BTC --kind option --min-expiration 3m
    ↓
-   API getInstruments(expired=true) → filter by expiration
+   Job: fetch-instruments
+     - API getInstruments(BTC, option, expired=true)
+     - Filter: expiration_timestamp <= now AND >= 3m ago
+     - Returns list of instruments
    ↓
-   BunQueue: enqueue fetch-option jobs per instrument
+   Job: fetch-trades
+     - For each instrument:
+       if exists(bronze/instruments/BTC/{name}.parquet) → skip
+       else:
+         lastSeq ← API getLastTradeSeq(instrument)
+         trades ← getAllTradesBySeq(instrument, 1, lastSeq)
+         write bronze/instruments/BTC/{name}.parquet
    ↓
-   For each instrument:
-     - Check if Parquet exists → skip if yes (idempotent)
-     - Fetch all trades [1, lastSeq] in memory
-     - Write to Parquet → data/parquet-raw/BTC/{INSTRUMENT}.parquet
+   Job: fetch-dated-futures
+     - Extract expiries from option names: ^([A-Z]+-[0-9]{1,2}[A-Z]{3}[0-9]{2})-
+     - For each expiry (e.g., BTC-29MAY26):
+       if exists(bronze/futures/{expiry}.parquet) → skip
+       else:
+         fetch trades → write bronze/futures/{expiry}.parquet
 
-2. fetch-deliveries btc_usd
+2. silver BTC
    ↓
-   Write to data/parquet-raw/deliveries/btc_usd.parquet
+   Job: enrich-duckdb
+     - Single DuckDB SQL query:
+       Read: bronze/instruments/BTC/*.parquet (all files)
+       LEFT JOIN: bronze/futures/BTC-*.parquet (ASOF join on timestamp)
+       Compute: delta, gamma, vega, theta via Black-76 SQL
+       Compute: is_valid flag
+       Write: silver/BTC.parquet (single file)
+   ↓
+   Output: silver/BTC.parquet (all instruments, all trades, 21 fields)
 
-3. fetch-volatility BTC
+3. pipeline BTC
    ↓
-   Write to data/parquet-raw/volatility/BTC.parquet
-
-4. enrich-with-duckdb BTC
-   ↓
-   DuckDB bulk enrichment: Read ALL BTC/*.parquet files → Compute Greeks → Single output file
-   ↓
-   Output: data/parquet-duckdb/BTC.parquet (single file with all instruments)
-
-   ARCHITECTURE:
-   - Single SQL query processes ALL 3,478 files at once
-   - LEFT JOIN with futures data (ASOF join on timestamp)
-   - Uses COALESCE(futures_price, index_price) as forward price in Black-76
-   - Vectorized Greeks computation (944k trades/sec)
-   - 10-100x faster than per-file processing
-   - Standard data lakehouse pattern
-
-5. Futures forward prices (optional, for accurate Greeks)
-   ↓
-   Fetch dated futures matching option expiries → store in data/parquet-raw/futures/
-   ↓
-   Joined with options during enrichment via ASOF join
+   bronze BTC → silver BTC (sequential)
 ```
 
 ---
 
 ## Storage Sizes
 
-**Typical:** Single expiry (100 options) ~10-50MB Parquet
-**Large:** 4,640 expired options (3 months) ~500MB-2GB Parquet
-**Queue:** `data/queue.db` ~1-10MB (job state only)
+| Data | Typical Size | Example |
+|------|--------------|---------|
+| Single expiry (100 options) | 10-50 MB | bronze/instruments/BTC/ |
+| 3 months expired (3,478 options) | 500 MB - 2 GB | bronze/instruments/BTC/ |
+| Enriched (all instruments) | ~same as bronze | silver/BTC.parquet |
+| Queue state | 1-10 MB | queue.db |
 
+---
+
+## Usage Examples
+
+```sql
+-- Analytics (recommended: filter for quality)
+SELECT * FROM 'data/silver/BTC.parquet'
+WHERE is_valid = true
+  AND delta > 0.3
+
+-- Research (include edge cases)
+SELECT * FROM 'data/silver/BTC.parquet'
+
+-- Quality audit
+SELECT
+  is_valid,
+  COUNT(*) as count,
+  COUNT(futures_price) as has_futures,
+  COUNT(delta) as has_greeks
+FROM 'data/silver/BTC.parquet'
+GROUP BY is_valid
+```

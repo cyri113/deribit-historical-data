@@ -120,8 +120,8 @@ export class FuturesFetcher {
     const futuresSet = new Set<string>();
 
     for (const instrument of optionInstruments) {
-      // Extract BTC-10AUG26 from BTC-10AUG26-60000-C
-      const match = instrument.match(/^([A-Z]+-\d{2}[A-Z]{3}\d{2})-/);
+      // Extract BTC-10AUG26 or BTC-3JUN26 from BTC-10AUG26-60000-C or BTC-3JUN26-70000-P
+      const match = instrument.match(/^([A-Z]+-\d{1,2}[A-Z]{3}\d{2})-/);
       if (match) {
         futuresSet.add(match[1]);
       }

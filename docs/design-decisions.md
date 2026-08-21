@@ -2,25 +2,16 @@
 
 Core choices with rationale and trade-offs.
 
-1. [Seq-Based Pagination](#decision-1-seq-based-pagination)
-2. [Simplified Fetch Strategy](#decision-2-simplified-fetch-strategy)
-3. [Direct Parquet Storage](#decision-3-direct-parquet-storage)
-4. [Filesystem-Based Idempotency](#decision-4-filesystem-based-idempotency)
-5. [BunQueue Workflows](#decision-5-bunqueue-for-workflow-management)
-6. [DuckDB SQL Greeks](#decision-6-duckdb-sql-greeks-vs-typescript)
+## 1. Seq-Based Pagination
 
----
+**Decision**: Use `trade_seq` ranges (not timestamps) via history API.
 
-## Decision 1: Seq-Based Pagination
+**Rationale**:
+- Deterministic, monotonic, no overlaps/gaps
+- Resumable from precise `last_seq + 1`
+- Simple dedup by `trade_seq` only
 
-Use `trade_seq` ranges (not timestamps) via history API.
-
-**Why:**
-- **Deterministic:** Monotonic, no overlaps/gaps
-- **Resumable:** Precise from `last_seq + 1`
-- **Simple dedup:** By `trade_seq` only
-
-**Timestamp problem:**
+**Timestamp problem**:
 ```
 Request 1: 2024-01-01 00:00:00 to 00:00:01
 Returns: [trade A @ 00:00:00, trade B @ 00:00:00, trade C @ 00:00:01]
@@ -30,37 +21,24 @@ Returns: [trade C @ 00:00:01, trade D @ 00:00:01]
 Problem: trade C duplicated! If >10k trades at 00:00:01, some skipped.
 ```
 
-**Trade-offs:**
+**Trade-offs**:
 - ✅ Deterministic, reproducible, no gaps
 - ❌ Requires history API (not all exchanges)
 - ❌ Can't filter by time before fetching
 
-**Validation:**
-```typescript
-function validateSequences(trades: Trade[]): boolean {
-  for (let i = 1; i < trades.length; i++) {
-    if (trades[i].trade_seq !== trades[i-1].trade_seq + 1) {
-      console.error(`Gap: ${trades[i-1].trade_seq} → ${trades[i].trade_seq}`);
-      return false;
-    }
-  }
-  return true;
-}
-```
-
 ---
 
-## Decision 2: Simplified Fetch Strategy
+## 2. Simplified Fetch Strategy
 
-**Decision:** Single unified strategy for both futures and options - fetch all trades [1, lastSeq] in memory, write to Parquet.
+**Decision**: Fetch all trades [1, lastSeq] in memory, write to Parquet.
 
-**Rationale:**
-- **99% of instruments have <10k trades** (single API call)
-- **BTC-PERPETUAL is NOT fetched** (the only large outlier with 300M+ trades)
-- Chunking/streaming complexity not needed for typical instruments
-- Filesystem-based idempotency (check Parquet exists → skip) is sufficient
+**Rationale**:
+- 99% of instruments have <10k trades (single API call)
+- BTC-PERPETUAL not fetched (only large outlier, 300M+ trades)
+- Chunking/streaming complexity unnecessary for typical instruments
+- Filesystem idempotency (check Parquet exists → skip) sufficient
 
-**Strategy:**
+**Strategy**:
 ```typescript
 async fetchInstrument(instrumentName: string) {
   // 1. Check if already fetched (idempotent)
@@ -80,34 +58,26 @@ async fetchInstrument(instrumentName: string) {
 }
 ```
 
-**Trade-offs:**
+**Trade-offs**:
 - ✅ Simple, unified codebase (~135 lines per fetcher vs ~349 lines before)
-- ✅ No database needed for progress tracking
-- ✅ Idempotent via filesystem (re-run skips completed instruments)
-- ❌ Can't resume mid-instrument (but most are <10k trades, <10s fetch)
+- ✅ No database for progress tracking
+- ✅ Idempotent via filesystem (re-run skips completed)
+- ❌ Can't resume mid-instrument (but most <10k trades, <10s fetch)
 - ❌ Higher memory usage (but <10k trades = ~2MB)
 
 ---
 
-## Decision 3: Direct Parquet Storage
+## 3. Direct Parquet Storage
 
-**Decision:** Write trades directly to Parquet files, no JSONL intermediate layer.
+**Decision**: Write trades directly to Parquet, no JSONL intermediate layer.
 
-**Rationale:**
-- **99% of instruments complete in <10s** (single fetch, single write)
-- **Filesystem idempotency** makes crashes recoverable (re-run skips completed instruments)
-- **No need for append-only format** when most instruments finish in one operation
-- **Simpler pipeline:** Fetch → Parquet (vs Fetch → JSONL → Parquet → Delete JSONL)
+**Rationale**:
+- 99% of instruments complete in <10s (single fetch, single write)
+- Filesystem idempotency makes crashes recoverable
+- No need for append-only format when most finish in one operation
+- Simpler pipeline: Fetch → Parquet (vs Fetch → JSONL → Parquet → Delete)
 
-**Storage:**
-```
-data/parquet-raw/BTC/
-  BTC-25DEC24-50000-C.parquet    ✅ Complete (skip on re-run)
-  BTC-25DEC24-50000-P.parquet    ✅ Complete (skip on re-run)
-  [no partial/temp files]
-```
-
-**Crash Recovery:**
+**Crash Recovery**:
 ```
 [CRASH mid-fetch of BTC-25DEC24-50000-C]
 → Parquet file NOT created (atomic write)
@@ -115,7 +85,7 @@ data/parquet-raw/BTC/
 → No corrupted files, no cleanup needed
 ```
 
-**Trade-offs:**
+**Trade-offs**:
 - ✅ Simpler pipeline (1 write vs 2 writes + cleanup)
 - ✅ No JSONL disk usage (save ~140GB temporary space)
 - ✅ Atomic writes (Parquet only created on success)
@@ -123,138 +93,168 @@ data/parquet-raw/BTC/
 
 ---
 
-## Decision 4: Filesystem-Based Idempotency
+## 4. Filesystem-Based Idempotency
 
-**Decision:** Use Parquet file existence checks for idempotency, no SQLite database for progress tracking.
+**Decision**: Use Parquet file existence checks, no SQLite for progress tracking.
 
-**Rationale:**
-- **Simple and reliable:** `existsSync(parquetPath)` is atomic and fast
-- **No state management:** Filesystem IS the source of truth
-- **Re-runnable:** `fetch-all BTC` skips completed instruments automatically
-- **No schema migrations:** No database to maintain
-- **Embedded metadata:** All instrument metadata stored via `parseInstrumentName()` in Parquet
+**Rationale**:
+- `existsSync(parquetPath)` is atomic and fast
+- No state management: filesystem IS the source of truth
+- Re-runnable: `bronze BTC` skips completed instruments automatically
+- No schema migrations: no database to maintain
+- Embedded metadata: all instrument info via `parseInstrumentName()` from filename
 
-**Implementation:**
+**Implementation**:
 ```typescript
-// Check if already fetched (idempotent)
 const parquetPath = this.parquetStorage.getTradeFilePath(instrumentName);
 if (existsSync(parquetPath)) {
-  console.log(`✓ ${instrumentName} already complete (Parquet exists)`);
+  console.log(`✓ ${instrumentName} already complete`);
   return { skipped: true };
 }
 ```
 
-**Only SQLite usage:** BunQueue job queue (`data/queue.db`) for job state management
+**Only SQLite usage**: BunQueue job queue (`data/queue.db`)
 
-**Trade-offs:**
+**Trade-offs**:
 - ✅ Zero database schema to maintain
-- ✅ Perfect idempotency (re-run any time, skips completed)
-- ✅ No database migrations needed
+- ✅ Perfect idempotency (re-run anytime, skips completed)
 - ✅ Filesystem = single source of truth
 - ❌ Can't query progress via SQL (use filesystem stats instead)
 - ❌ No partial progress tracking (instrument-level only)
 
 ---
 
-## Decision 5: BunQueue for Workflow Management
+## 5. BunQueue Workflows
 
-**Decision:** Use BunQueue for job queue instead of custom web dashboard.
+**Decision**: Use BunQueue for job queue instead of custom web dashboard.
 
-**Rationale:**
+**Rationale**:
 
-**Custom Web Dashboard (Removed):**
-- Custom WebSocket server (255 lines)
-- React frontend (355 lines)
-- Real-time progress updates (100ms polling)
-- 4 React dependencies in package.json
-- Custom integration tests
+**Custom Dashboard (Removed)**:
+- 650+ lines (WebSocket server + React frontend)
+- 4 React dependencies
 - Single-purpose: progress monitoring only
 
-**BunQueue (Adopted):**
+**BunQueue (Adopted)**:
 - Zero external infrastructure (embedded SQLite)
-- Built-in web dashboard with full feature set
-- Job queue + retry logic + failure handling
-- Background job processing
-- No custom server code needed
+- Built-in dashboard + retry + failure handling + background jobs
 - Single dependency, MIT licensed
+- ~100 lines integration code
 
-**Feature Comparison:**
+**Feature Comparison**:
 
-| Feature | Custom Dashboard | BunQueue |
-|---------|-----------------|----------|
+| Feature | Custom | BunQueue |
+|---------|--------|----------|
 | Progress monitoring | ✅ | ✅ |
-| Job retry | ❌ | ✅ (3 attempts, exponential backoff) |
+| Job retry | ❌ | ✅ (3x, exponential backoff) |
 | Failure tracking | ❌ | ✅ (DLQ, error logs) |
 | Background jobs | ❌ | ✅ |
 | Cron scheduling | ❌ | ✅ |
-| SQLite persistence | Partial (metadata only) | ✅ (full job state) |
-| Web dashboard | Custom (355 lines) | Built-in |
-| Code to maintain | ~650 lines | ~100 lines |
+| Code to maintain | 650 lines | 100 lines |
 
-**Benefits:**
-- **Less code:** 650+ lines removed, ~100 lines added (net -550 lines)
-- **More features:** Retry logic, DLQ, cron, background processing
-- **Better UX:** Professional dashboard vs custom implementation
-- **Maintainability:** Upstream updates vs maintaining custom code
-- **Bun-native:** Designed for Bun runtime (embedded mode)
-
-**Trade-offs:**
-- ✅ Professional job queue infrastructure
-- ✅ 80% less code to maintain
-- ✅ Built-in retry and failure handling
-- ✅ Dashboard included (http://localhost:6790)
-- ❌ Adds external dependency (but minimal, MIT licensed)
-- ❌ Dashboard not custom-tailored (but feature-rich)
-
-**Use Cases:**
-- Monitor fetch progress via BunQueue dashboard
-- Automatic retry of failed chunks
-- Background enrichment jobs
-- Scheduled re-fetches (cron)
-
-**Commands:**
+**Commands**:
 ```bash
-# Launch dashboard
-bun src/cli/index.ts queue-dashboard
-
-# Check queue status
-bun src/cli/index.ts queue-status
+queue-worker      # Process jobs (run in separate terminal)
+queue-dashboard   # Web UI at http://localhost:6790
+queue-status      # CLI status
 ```
+
+**Trade-offs**:
+- ✅ Professional queue infrastructure, -550 lines code
+- ✅ Retry, DLQ, background processing built-in
+- ✅ Dashboard included
+- ❌ External dependency (minimal, MIT)
+- ❌ Dashboard not custom-tailored (but feature-rich)
 
 ---
 
-## Decision 6: DuckDB SQL Greeks
+## 6. DuckDB SQL Greeks
 
-Implement both: DuckDB SQL (default, 10-100x faster) and TypeScript (legacy).
+**Decision**: DuckDB SQL (default) + TypeScript (legacy fallback).
 
-**Performance:**
+**Performance**:
+
 | Method | Throughput | Memory | CPU |
 |--------|-----------|--------|-----|
 | TypeScript | 1-2k/sec | High | 1 core |
-| DuckDB | 20-50k/sec | Low (streaming) | All cores |
+| DuckDB SQL | 20-50k/sec | Low (streaming) | All cores |
 
-**Example:** 1M trades = 500s TypeScript vs 25s DuckDB (20x faster)
+**Example**: 1M trades = 500s TypeScript vs 25s DuckDB (20x faster)
 
-**How:** DuckDB WASM has no UDF → generate Black-76 as pure SQL templates (CDF via Abramowitz-Stegun)
+**Implementation**: DuckDB WASM has no UDF → Black-76 as pure SQL templates (CDF via Abramowitz-Stegun)
 
-**Use DuckDB when:** >100k trades, max performance, memory-constrained
-**Use TypeScript when:** <100k trades, debugging, custom logic
+**Use Cases**:
+- **DuckDB**: >100k trades, max performance, memory-constrained
+- **TypeScript**: <100k trades, debugging, custom logic
 
-**Trade-off:** 10-100x faster vs more complex SQL generation
+**Trade-offs**:
+- ✅ 10-100x faster
+- ❌ More complex SQL generation
+
+---
+
+## 7. Medallion Architecture
+
+**Decision**: Bronze (raw) → Silver (enriched) → Gold (analytics).
+
+**Structure**:
+```
+data/
+├── bronze/instruments/BTC/  # Raw trades, one file per instrument
+├── bronze/futures/          # Dated futures for forward prices
+├── silver/BTC.parquet       # Single file: all instruments + Greeks
+└── queue.db                 # BunQueue state
+```
+
+**Benefits**:
+- Standard data lakehouse pattern
+- Clear separation of concerns
+- Optimized for analytics (read one silver file, not thousands of bronze files)
+- Better compression (across all data)
+
+**Silver Layer Strategy**:
+- Single DuckDB query reads ALL bronze files → writes one silver file
+- 10-100x faster than per-file processing
+- Standard lakehouse pattern
+
+---
+
+## 8. Strict Data Quality
+
+**Decision**: Greeks = NULL if no futures_price (no fallback to spot index_price).
+
+**Rationale**:
+- Spot price ≠ forward price (basis risk, funding, time value)
+- Inaccurate Greeks worse than missing Greeks for analytics
+- Preserve all data: spot price available in `index_price` column for audit
+- Use `is_valid` flag to filter analytics-ready data
+
+**is_valid flag**:
+- `TRUE` = Has futures_price, IV > 0, TTM > 1 day, valid Greeks
+- `FALSE` = Missing futures, IV=0, very short-dated, or NaN Greeks
+
+**Recommendation**:
+```sql
+SELECT * FROM 'data/silver/BTC.parquet'
+WHERE is_valid = true  -- Analytics-ready data only
+```
+
+**Trade-offs**:
+- ✅ Accurate Greeks for backtesting
+- ✅ All data preserved for audit
+- ❌ Lower coverage (~82% with futures vs 100% with spot fallback)
 
 ---
 
 ## Summary
 
-| Decision | Choice | Key Benefit | Main Trade-off |
-|----------|--------|-------------|----------------|
+| Decision | Choice | Key Benefit | Trade-off |
+|----------|--------|-------------|-----------|
 | Pagination | Seq-based | Deterministic, no gaps | Can't filter by time before fetch |
-| Fetch Strategy | Unified (fetch all in memory) | Simple codebase (~135 lines/fetcher) | Can't resume mid-instrument |
-| Storage Format | Direct Parquet | Simple pipeline, atomic writes | Can't resume partial fetch |
-| Idempotency | Filesystem-based (Parquet exists) | Zero database maintenance | No partial progress tracking |
-| Workflow Management | BunQueue (embedded) | Professional queue, -550 lines | External dependency |
-| Greeks Method | DuckDB (default) | 10-100x faster | More complex SQL generation |
-
----
-
-**Next:** [Data Model →](data-model.md)
+| Fetch | Unified (all in memory) | Simple (~135 lines/fetcher) | Can't resume mid-instrument |
+| Storage | Direct Parquet | Atomic writes, simple pipeline | Can't resume partial fetch |
+| Idempotency | Filesystem (Parquet exists) | Zero DB maintenance | No partial progress tracking |
+| Workflow | BunQueue | -550 lines, retry/DLQ | External dependency |
+| Greeks | DuckDB SQL | 10-100x faster | Complex SQL generation |
+| Architecture | Medallion (bronze/silver) | Standard lakehouse pattern | More directories |
+| Quality | Strict (no fallback) | Accurate Greeks | Lower coverage (~82%) |

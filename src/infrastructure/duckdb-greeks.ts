@@ -246,7 +246,7 @@ export function generateBulkGreeksEnrichmentQuery(params: {
         price as futures_price
       FROM read_parquet('${params.futuresPattern}')
     ) futures
-    ON regexp_extract(opt.instrument_name, '^([A-Z]+-\\\\d{2}[A-Z]{3}\\\\d{2})-') = futures.futures_instrument
+    ON regexp_extract(opt.instrument_name, '^([A-Z]+-[0-9]{1,2}[A-Z]{3}[0-9]{2})-', 1) = futures.futures_instrument
     AND futures.futures_timestamp <= opt.timestamp
     QUALIFY ROW_NUMBER() OVER (
       PARTITION BY opt.trade_id

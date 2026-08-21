@@ -14,14 +14,14 @@ import { join, dirname } from "node:path";
  */
 
 export interface ParquetStorageConfig {
-  baseDir?: string; // Default: ./data/parquet-raw
+  baseDir?: string; // Default: ./data/bronze
 }
 
 export class ParquetStorage {
   private baseDir: string;
 
   constructor(config?: ParquetStorageConfig) {
-    this.baseDir = config?.baseDir ?? "./data/parquet-raw";
+    this.baseDir = config?.baseDir ?? "./data/bronze";
   }
 
   /**
@@ -42,9 +42,9 @@ export class ParquetStorage {
    * Get trade file path
    */
   getTradeFilePath(instrumentName: string): string {
-    // E.g., BTC-27MAR26-70000-C → data/parquet-raw/BTC/BTC-27MAR26-70000-C.parquet
+    // E.g., BTC-27MAR26-70000-C → data/bronze/instruments/BTC/BTC-27MAR26-70000-C.parquet
     const underlying = instrumentName.split("-")[0]!;
-    return join(this.baseDir, underlying, `${instrumentName}.parquet`);
+    return join(this.baseDir, "instruments", underlying, `${instrumentName}.parquet`);
   }
 
   /**
@@ -220,7 +220,7 @@ export class ParquetStorage {
    * Get futures trade file path
    */
   getFuturesFilePath(instrumentName: string): string {
-    // E.g., BTC-10AUG26 → data/parquet-raw/futures/BTC-10AUG26.parquet
+    // E.g., BTC-10AUG26 → data/bronze/futures/BTC-10AUG26.parquet
     return join(this.baseDir, "futures", `${instrumentName}.parquet`);
   }
 
@@ -309,7 +309,7 @@ export class ParquetStorage {
    * Get delivery price file path
    */
   private getDeliveryFilePath(indexName: string): string {
-    // E.g., btc_usd → data/parquet-raw/deliveries/btc_usd.parquet
+    // E.g., btc_usd → data/bronze/deliveries/btc_usd.parquet
     return join(this.baseDir, "deliveries", `${indexName}.parquet`);
   }
 
@@ -395,7 +395,7 @@ export class ParquetStorage {
    * Get historical volatility file path
    */
   private getHistoricalVolatilityFilePath(currency: string): string {
-    // E.g., BTC → data/parquet-raw/volatility/BTC.parquet
+    // E.g., BTC → data/bronze/volatility/BTC.parquet
     return join(this.baseDir, "volatility", `${currency}.parquet`);
   }
 
