@@ -1,7 +1,6 @@
 import { Bunqueue } from "bunqueue/client";
 import type { Job } from "bunqueue/client";
 import { DeribitClient } from "./deribit-client.ts";
-import { JSONLStorage } from "./jsonl-storage.ts";
 import { ParquetStorage } from "./parquet-storage.ts";
 import { FutureFetcher } from "../application/fetchers/future-fetcher.ts";
 import { OptionFetcher } from "../application/fetchers/option-fetcher.ts";
@@ -75,7 +74,6 @@ class QueueManager {
   private static instance: Bunqueue | null = null;
   private static sharedDeps: {
     client: DeribitClient;
-    storage: JSONLStorage;
     parquetStorage: ParquetStorage;
   } | null = null;
 
@@ -86,7 +84,6 @@ class QueueManager {
     if (!QueueManager.sharedDeps) {
       QueueManager.sharedDeps = {
         client: new DeribitClient(),
-        storage: new JSONLStorage(),
         parquetStorage: new ParquetStorage(),
       };
     }
