@@ -152,8 +152,8 @@ async function bronzeCommand(args: string[]) {
 
   console.log(`\n━━━ Bronze Layer: ${currency} ━━━\n`);
 
-  const { QueueManager } = await import("../infrastructure/queue.ts");
-  const queue = QueueManager.getQueue();
+  const { getQueue } = await import("../infrastructure/queue.ts");
+  const queue = getQueue();
 
   console.log(`📋 Enqueuing jobs...\n`);
 
@@ -223,8 +223,8 @@ async function silverCommand(args: string[]) {
 
   console.log(`\n━━━ Silver Layer: ${currency} ━━━\n`);
 
-  const { QueueManager } = await import("../infrastructure/queue.ts");
-  const queue = QueueManager.getQueue();
+  const { getQueue } = await import("../infrastructure/queue.ts");
+  const queue = getQueue();
 
   const job = await queue.add("enrich-duckdb", {
     currency,
@@ -255,8 +255,8 @@ async function goldCommand(args: string[]) {
 
   console.log(`\n━━━ Gold Layer: ${currency} ━━━\n`);
 
-  const { QueueManager } = await import("../infrastructure/queue.ts");
-  const queue = QueueManager.getQueue();
+  const { getQueue } = await import("../infrastructure/queue.ts");
+  const queue = getQueue();
 
   const job = await queue.add("enrich-gold", {
     currency,
@@ -388,26 +388,24 @@ async function pipelineCommand(args: string[]) {
 }
 
 async function queueWorkerCommand() {
-  const { QueueManager } = await import("../infrastructure/queue.ts");
+  const { getQueue, getWorker } = await import("../infrastructure/queue.ts");
 
   console.log("Starting BunQueue worker...");
-  console.log("Jobs will be processed automatically via routes.");
   console.log("Press Ctrl+C to stop.\n");
 
-  // Initialize the queue - this starts processing jobs automatically via routes
-  const queue = QueueManager.getQueue();
+  // Initialize queue and worker
+  const queue = getQueue();
+  const worker = getWorker();
 
-  console.log("✓ Queue worker ready and processing jobs");
-  console.log("Monitor progress with:");
-  console.log("  bun src/cli/index.ts queue-dashboard\n");
+  console.log("✓ Queue worker ready and processing jobs\n");
 
   // Keep the process alive
   await new Promise(() => {}); // Never resolves - keeps process running
 }
 
 async function queueStatusCommand() {
-  const { QueueManager } = await import("../infrastructure/queue.ts");
-  const queue = QueueManager.getQueue();
+  const { getQueue } = await import("../infrastructure/queue.ts");
+  const queue = getQueue();
 
   const counts = await queue.getJobCountsAsync();
 
