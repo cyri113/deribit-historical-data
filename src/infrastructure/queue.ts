@@ -144,9 +144,9 @@ export function getWorker(): Worker {
 
         case "fetch-trades": {
           const data = job.data as FetchTradesJobData;
-          const { currency, kind, minExpiration, maxExpiration, expired } = data;
+          const { currency, kind, minExpiration, maxExpiration, expired, concurrency = 3 } = data;
 
-          console.log(`\n📥 Fetching ${currency} instruments and enqueuing trade jobs...`);
+          console.log(`\n📥 Fetching ${currency} instruments and downloading all trades...`);
 
           // Fetch instruments from API (with expired flag for historical data)
           let instruments = await deps.client.getInstruments(currency, kind, expired ?? true);
@@ -168,19 +168,42 @@ export function getWorker(): Worker {
           const futures = instruments.filter(i => i.kind === "future");
           const options = instruments.filter(i => i.kind === "option");
 
-          // Enqueue individual fetch jobs
-          const q = getQueue();
+          console.log(`Found ${futures.length} futures + ${options.length} options to fetch`);
 
-          for (const future of futures) {
-            await q.add("fetch-future", { instrumentName: future.instrument_name });
+          // Fetch all instruments directly (not via child jobs)
+          let totalTrades = 0;
+          let completed = 0;
+
+          // Process in batches for concurrency
+          const allInstruments = [...futures, ...options];
+          for (let i = 0; i < allInstruments.length; i += concurrency) {
+            const batch = allInstruments.slice(i, i + concurrency);
+
+            await Promise.all(batch.map(async (instrument) => {
+              if (instrument.kind === "future") {
+                const futureFetcher = new FutureFetcher({
+                  client: deps.client,
+                  parquetStorage: deps.parquetStorage,
+                });
+                const result = await futureFetcher.fetchInstrument(instrument.instrument_name);
+                totalTrades += result.totalTrades;
+              } else {
+                const optionFetcher = new OptionFetcher({
+                  client: deps.client,
+                  parquetStorage: deps.parquetStorage,
+                });
+                const result = await optionFetcher.fetchInstrument(instrument.instrument_name);
+                totalTrades += result.totalTrades;
+              }
+              completed++;
+              if (completed % 100 === 0 || completed === allInstruments.length) {
+                console.log(`Progress: ${completed}/${allInstruments.length} instruments (${totalTrades.toLocaleString()} trades)`);
+              }
+            }));
           }
 
-          for (const option of options) {
-            await q.add("fetch-option", { instrumentName: option.instrument_name });
-          }
-
-          console.log(`✓ Enqueued ${futures.length} futures + ${options.length} options`);
-          return { futuresEnqueued: futures.length, optionsEnqueued: options.length };
+          console.log(`✓ Downloaded all ${allInstruments.length} instruments (${totalTrades.toLocaleString()} trades)`);
+          return { instrumentsDownloaded: allInstruments.length, totalTrades };
         }
 
         case "fetch-future": {
