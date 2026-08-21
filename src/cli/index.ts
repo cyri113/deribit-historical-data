@@ -293,12 +293,13 @@ async function pipelineCommand(args: string[]) {
 
   const flow = new FlowProducer({ embedded: true, dataPath: "./data/queue.db" });
 
-  console.log(`📋 Creating pipeline flow with job dependencies...\n`);
+  console.log(`📋 Creating sequential pipeline flow...\n`);
 
-  // Bronze layer children (run in parallel)
-  const bronzeChildren: any[] = [];
+  // Build sequential chain of jobs
+  const chain: any[] = [];
 
-  bronzeChildren.push({
+  // Step 1: fetch-instruments
+  chain.push({
     name: "fetch-instruments",
     queueName: "deribit-data",
     data: {
@@ -310,7 +311,8 @@ async function pipelineCommand(args: string[]) {
     },
   });
 
-  bronzeChildren.push({
+  // Step 2: fetch-trades (enqueues 9,936 option fetch jobs as children)
+  chain.push({
     name: "fetch-trades",
     queueName: "deribit-data",
     data: {
@@ -323,7 +325,8 @@ async function pipelineCommand(args: string[]) {
     },
   });
 
-  bronzeChildren.push({
+  // Step 3: fetch-dated-futures (scans completed option files)
+  chain.push({
     name: "fetch-dated-futures",
     queueName: "deribit-data",
     data: {
@@ -332,8 +335,9 @@ async function pipelineCommand(args: string[]) {
     },
   });
 
+  // Step 4: fetch-deliveries (optional)
   if (!skipDeliveries) {
-    bronzeChildren.push({
+    chain.push({
       name: "fetch-deliveries",
       queueName: "deribit-data",
       data: {
@@ -342,8 +346,9 @@ async function pipelineCommand(args: string[]) {
     });
   }
 
+  // Step 5: fetch-volatility (optional)
   if (!skipVolatility) {
-    bronzeChildren.push({
+    chain.push({
       name: "fetch-volatility",
       queueName: "deribit-data",
       data: {
@@ -352,26 +357,26 @@ async function pipelineCommand(args: string[]) {
     });
   }
 
-  // Create flow: Gold (parent) → Silver (parent) → Bronze children
-  const pipelineFlow = await flow.add({
+  // Step 6: enrich-duckdb (silver layer)
+  chain.push({
+    name: "enrich-duckdb",
+    queueName: "deribit-data",
+    data: { currency },
+  });
+
+  // Step 7: enrich-gold (gold layer)
+  chain.push({
     name: "enrich-gold",
     queueName: "deribit-data",
     data: { currency },
-    children: [
-      {
-        name: "enrich-duckdb",
-        queueName: "deribit-data",
-        data: { currency },
-        children: bronzeChildren,
-      },
-    ],
   });
 
-  console.log(`✓ Created pipeline flow with ${1 + 1 + bronzeChildren.length} jobs:`);
-  console.log(`  Gold (${pipelineFlow.job.id})`);
-  console.log(`    ↳ Silver (${pipelineFlow.children?.[0]?.job.id})`);
-  for (const child of pipelineFlow.children?.[0]?.children || []) {
-    console.log(`        ↳ Bronze: ${child.job.name} (${child.job.id})`);
+  // Create sequential flow using addChain
+  const { jobIds } = await flow.addChain(chain);
+
+  console.log(`✓ Created sequential pipeline with ${jobIds.length} steps:\n`);
+  for (let i = 0; i < chain.length; i++) {
+    console.log(`  ${i + 1}. ${chain[i].name} (${jobIds[i]})`);
   }
 
   await flow.close();
