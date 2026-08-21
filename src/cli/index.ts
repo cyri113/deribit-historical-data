@@ -283,14 +283,17 @@ async function pipelineCommand(args: string[]) {
 
   console.log(`\n━━━ Running Pipeline: ${currency} (Bronze → Silver → Gold) ━━━\n`);
 
+  const { getQueue, getWorker } = await import("../infrastructure/queue.ts");
   const { FlowProducer } = await import("bunqueue/client");
-  const flow = new FlowProducer({ embedded: true });
+
+  // Start worker first
+  console.log(`Starting worker...\n`);
+  const queue = getQueue();
+  const worker = getWorker();
+
+  const flow = new FlowProducer({ embedded: true, dataPath: "./data/queue.db" });
 
   console.log(`📋 Creating pipeline flow with job dependencies...\n`);
-
-  // Build pipeline using FlowProducer parent-child relationships
-  // Structure: Silver (parent) waits for all Bronze children to complete
-  //            Gold (parent) waits for Silver to complete
 
   // Bronze layer children (run in parallel)
   const bronzeChildren: any[] = [];
@@ -364,7 +367,7 @@ async function pipelineCommand(args: string[]) {
     ],
   });
 
-  console.log(`\n✓ Created pipeline flow with ${1 + 1 + bronzeChildren.length} jobs:`);
+  console.log(`✓ Created pipeline flow with ${1 + 1 + bronzeChildren.length} jobs:`);
   console.log(`  Gold (${pipelineFlow.job.id})`);
   console.log(`    ↳ Silver (${pipelineFlow.children?.[0]?.job.id})`);
   for (const child of pipelineFlow.children?.[0]?.children || []) {
@@ -373,18 +376,10 @@ async function pipelineCommand(args: string[]) {
 
   await flow.close();
 
-  console.log(`\n━━━ Pipeline flow created! ━━━`);
-  console.log(`\n⚠️  Jobs execute in order: Bronze → Silver → Gold`);
-  console.log(`   Bronze children run in parallel, Silver waits for all to complete.`);
+  console.log(`\n━━━ Processing jobs... ━━━\n`);
 
-  console.log(`\n⚠️  IMPORTANT: Start queue worker in another terminal to process jobs:`);
-  console.log(`   bun src/cli/index.ts queue-worker`);
-  console.log(`\nOr check job status with:`);
-  console.log(`   bun src/cli/index.ts queue-status`);
-  console.log(`\nOutput will be at:`);
-  console.log(`  Bronze: data/bronze/instruments/${currency}/`);
-  console.log(`  Silver: data/silver/${currency}.parquet`);
-  console.log(`  Gold: data/gold/${currency}.parquet\n`);
+  // Keep process alive - worker will process jobs
+  await new Promise(() => {}); // Never resolves
 }
 
 async function queueWorkerCommand() {
