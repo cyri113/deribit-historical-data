@@ -126,15 +126,36 @@ COPY (
   WITH silver_data AS (
     SELECT * FROM read_parquet('${inputPath}')
   ),
-  -- Compute IV percentiles within 30-day rolling window per currency
+  -- Compute price returns for realized volatility
+  price_returns AS (
+    SELECT *,
+      LN(futures_price / LAG(futures_price) OVER (
+        PARTITION BY SUBSTRING(instrument_name, 1, 3)
+        ORDER BY timestamp
+        ROWS BETWEEN 168 PRECEDING AND CURRENT ROW  -- 7 days of hourly data
+      )) as log_return
+    FROM silver_data
+    WHERE futures_price IS NOT NULL
+  ),
+  -- Compute 7-day realized volatility (annualized)
+  realized_vols AS (
+    SELECT *,
+      STDDEV(log_return) OVER (
+        PARTITION BY SUBSTRING(instrument_name, 1, 3)
+        ORDER BY timestamp
+        ROWS BETWEEN 168 PRECEDING AND CURRENT ROW  -- 7 days
+      ) * SQRT(365 * 24) as realized_vol_7day  -- Annualize hourly vol
+    FROM price_returns
+  ),
+  -- Compute IV percentiles within 90-day rolling window per currency
   iv_percentiles AS (
     SELECT *,
       PERCENT_RANK() OVER (
         PARTITION BY SUBSTRING(instrument_name, 1, 3)
         ORDER BY implied_volatility
-        ROWS BETWEEN 720 PRECEDING AND CURRENT ROW  -- ~30 days of hourly trades
-      ) as iv_percentile
-    FROM silver_data
+        ROWS BETWEEN 2160 PRECEDING AND CURRENT ROW  -- ~90 days of hourly trades
+      ) as iv_percentile_90day
+    FROM realized_vols
   )
   SELECT
     -- All silver layer fields (passthrough)
@@ -177,11 +198,22 @@ COPY (
 
     -- vol_regime: IV percentile classification (low/mid/high vol environment)
     CASE
-      WHEN implied_volatility IS NULL OR iv_percentile IS NULL THEN NULL
-      WHEN iv_percentile < 0.33 THEN 'low'
-      WHEN iv_percentile < 0.67 THEN 'mid'
+      WHEN implied_volatility IS NULL OR iv_percentile_90day IS NULL THEN NULL
+      WHEN iv_percentile_90day < 0.33 THEN 'low'
+      WHEN iv_percentile_90day < 0.67 THEN 'mid'
       ELSE 'high'
-    END as vol_regime
+    END as vol_regime,
+
+    -- Market condition metrics (at entry)
+
+    -- realized_vol_7day: 7-day realized volatility (annualized, in percentage)
+    realized_vol_7day,
+
+    -- iv_percentile_90day: Current IV rank vs 90-day history (0-1)
+    iv_percentile_90day,
+
+    -- iv_minus_rv_gap: IV - RV spread (volatility risk premium indicator)
+    (implied_volatility - realized_vol_7day) as iv_minus_rv_gap
 
   FROM iv_percentiles
 ) TO '${outputPath}' (FORMAT PARQUET);

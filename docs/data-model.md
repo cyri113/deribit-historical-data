@@ -86,22 +86,28 @@ Each option trade matched to nearest prior futures trade by timestamp.
 
 ---
 
-## Gold Schema (24 fields = Silver + 3)
+## Gold Schema (27 fields = Silver + 6)
 
 **File**: `gold/BTC.parquet` (analytics-ready, all instruments in single file)
 
-**Silver fields (21) + Trading Metrics (3):**
+**Silver fields (21) + Trading Metrics (3) + Market Conditions (3):**
 
 | Field | Type | Source | Description |
 |-------|------|--------|-------------|
 | days_to_expiry | integer | Calculated | Days until expiration at trade time (for DTE filtering: 0DTE, 7DTE, 30DTE) |
 | strike_delta | string | Delta buckets | Categorization: "5-delta", "10-delta", "25-delta", "50-delta", "deep-itm" |
-| vol_regime | string | IV percentile | Volatility environment: "low" (<33%), "mid" (33-67%), "high" (>67%) |
+| vol_regime | string | IV percentile | Volatility environment: "low" (<33%), "mid" (33-67%), "high" (>67%) based on 90-day window |
+| realized_vol_7day | double | Calculated | 7-day realized volatility (annualized, percentage, from futures price returns) |
+| iv_percentile_90day | double | Calculated | Current IV percentile rank vs 90-day history (0-1 scale) |
+| iv_minus_rv_gap | double | Calculated | IV - RV spread (volatility risk premium indicator, positive = IV > RV) |
 
 **Trading Metrics Formulas**:
 - `days_to_expiry` = (expiration_timestamp - timestamp) / 86400000 (milliseconds to days)
 - `strike_delta` = CASE buckets based on ABS(delta): ≤0.05, ≤0.10, ≤0.25, ≤0.50, else deep-itm
-- `vol_regime` = PERCENT_RANK over 720-row window (~30 days), then tertile classification
+- `vol_regime` = PERCENT_RANK over 2160-row window (~90 days of hourly trades), then tertile classification
+- `realized_vol_7day` = STDDEV(log_returns) over 168-hour window × √(365×24) - annualized percentage
+- `iv_percentile_90day` = PERCENT_RANK over 90-day window (0 = lowest IV in 90 days, 1 = highest)
+- `iv_minus_rv_gap` = implied_volatility - realized_vol_7day (NULL if no RV data)
 
 **Use Case**:
 - Strategy backtesting (filter by DTE, delta buckets, vol regimes)
@@ -110,12 +116,14 @@ Each option trade matched to nearest prior futures trade by timestamp.
 
 **Recommendation**:
 ```sql
--- Use gold layer for backtesting
+-- Use gold layer for backtesting with market condition filters
 SELECT * FROM 'data/gold/BTC.parquet'
 WHERE is_valid = true
   AND strike_delta = '25-delta'
   AND days_to_expiry BETWEEN 7 AND 30
-  AND vol_regime IN ('mid', 'high')
+  AND vol_regime = 'high'
+  AND iv_minus_rv_gap > 5  -- IV at least 5% above RV (vol premium)
+  AND realized_vol_7day IS NOT NULL  -- Has sufficient price history
 ```
 
 ---

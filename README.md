@@ -66,13 +66,16 @@ expiration_timestamp, option_type, time_to_expiry_years
 - `delta, gamma, vega, theta` - Black-76 Greeks
 - `is_valid` - Quality flag (TRUE = has futures_price, IV>0, TTM>1day, valid Greeks)
 
-### Gold Schema (24 fields = Silver + 3)
-`gold/BTC.parquet` - Analytics-ready with trading metrics
+### Gold Schema (27 fields = Silver + 6)
+`gold/BTC.parquet` - Analytics-ready with trading metrics + market conditions
 
-**Silver fields + Trading Metrics:**
+**Silver fields + Trading Metrics (3) + Market Conditions (3):**
 - `days_to_expiry` - Integer days until expiration (for DTE filtering: 0DTE, 7DTE, 30DTE)
 - `strike_delta` - Delta buckets: 5-delta, 10-delta, 25-delta, 50-delta, deep-itm
-- `vol_regime` - IV percentile classification: low (<33%), mid (33-67%), high (>67%)
+- `vol_regime` - IV percentile classification: low (<33%), mid (33-67%), high (>67%) based on 90-day window
+- `realized_vol_7day` - 7-day realized volatility (annualized, from futures price returns)
+- `iv_percentile_90day` - Current IV rank vs 90-day history (0-1 scale)
+- `iv_minus_rv_gap` - IV - RV spread (volatility risk premium, positive = IV > RV)
 
 **Greeks Formula (Black-76):**
 - Inputs: F=futures_price, K=strike, T=time_to_expiry_years, σ=implied_volatility/100
@@ -118,12 +121,13 @@ Each step waits for previous to complete (sequential waterfall)
 ## Use Cases
 
 ```sql
--- Analytics (recommended: use gold layer)
+-- Analytics (recommended: use gold layer with market condition filters)
 SELECT * FROM 'data/gold/BTC.parquet'
 WHERE is_valid = true
   AND strike_delta = '25-delta'
   AND days_to_expiry <= 30
   AND vol_regime = 'high'
+  AND iv_minus_rv_gap > 5  -- IV at least 5% above RV
 
 -- Research (silver layer for raw Greeks)
 SELECT * FROM 'data/silver/BTC.parquet'
