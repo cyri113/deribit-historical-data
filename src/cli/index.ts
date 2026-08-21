@@ -152,10 +152,13 @@ async function bronzeCommand(args: string[]) {
 
   console.log(`\n━━━ Bronze Layer: ${currency} ━━━\n`);
 
-  const { getQueue } = await import("../infrastructure/queue.ts");
+  const { getQueue, getWorker } = await import("../infrastructure/queue.ts");
   const queue = getQueue();
+  const worker = getWorker();
 
   console.log(`📋 Enqueuing jobs...\n`);
+
+  const jobIds: string[] = [];
 
   // Step 1: Fetch instruments
   const instrumentsJob = await queue.add("fetch-instruments", {
@@ -166,6 +169,7 @@ async function bronzeCommand(args: string[]) {
     maxExpiration: maxExpiration ? parseDate(maxExpiration) : undefined,
   });
   console.log(`✓ Enqueued: fetch-instruments (${instrumentsJob.id})`);
+  jobIds.push(instrumentsJob.id);
 
   // Step 2: Fetch trades
   const tradesJob = await queue.add("fetch-trades", {
@@ -177,6 +181,7 @@ async function bronzeCommand(args: string[]) {
     maxExpiration: maxExpiration ? parseDate(maxExpiration) : undefined,
   });
   console.log(`✓ Enqueued: fetch-trades (${tradesJob.id})`);
+  jobIds.push(tradesJob.id);
 
   // Step 3: Fetch dated futures (for forward prices)
   const futuresJob = await queue.add("fetch-dated-futures", {
@@ -184,6 +189,7 @@ async function bronzeCommand(args: string[]) {
     concurrency,
   });
   console.log(`✓ Enqueued: fetch-dated-futures (${futuresJob.id})`);
+  jobIds.push(futuresJob.id);
 
   // Step 4: Fetch deliveries (optional)
   if (!skipDeliveries) {
@@ -192,6 +198,7 @@ async function bronzeCommand(args: string[]) {
       indices: [indexName],
     });
     console.log(`✓ Enqueued: fetch-deliveries (${deliveriesJob.id})`);
+    jobIds.push(deliveriesJob.id);
   }
 
   // Step 5: Fetch volatility (optional)
@@ -200,11 +207,45 @@ async function bronzeCommand(args: string[]) {
       currencies: [currency],
     });
     console.log(`✓ Enqueued: fetch-volatility (${volatilityJob.id})`);
+    jobIds.push(volatilityJob.id);
   }
 
-  console.log(`\n✓ All jobs enqueued!`);
-  console.log(`\nMonitor progress:`);
-  console.log(`  bun src/cli/index.ts queue-dashboard\n`);
+  console.log(`\n━━━ Processing ${jobIds.length} jobs... ━━━\n`);
+
+  // Wait for all jobs to complete
+  let completedCount = 0;
+  await new Promise<void>((resolve, reject) => {
+    const completedHandler = (job: any) => {
+      if (jobIds.includes(job.id)) {
+        completedCount++;
+        console.log(`\n[${completedCount}/${jobIds.length}] ✓ ${job.name} completed`);
+
+        if (completedCount >= jobIds.length) {
+          worker.off("completed", completedHandler);
+          worker.off("failed", failedHandler);
+          resolve();
+        }
+      }
+    };
+
+    const failedHandler = (job: any, error: Error) => {
+      if (jobIds.includes(job.id)) {
+        console.error(`\n✗ ${job.name} failed:`, error);
+        worker.off("completed", completedHandler);
+        worker.off("failed", failedHandler);
+        reject(error);
+      }
+    };
+
+    worker.on("completed", completedHandler);
+    worker.on("failed", failedHandler);
+  });
+
+  console.log(`\n━━━ Bronze Layer Complete! ━━━\n`);
+
+  await worker.close();
+  await queue.close();
+  process.exit(0);
 }
 
 async function silverCommand(args: string[]) {
@@ -223,8 +264,9 @@ async function silverCommand(args: string[]) {
 
   console.log(`\n━━━ Silver Layer: ${currency} ━━━\n`);
 
-  const { getQueue } = await import("../infrastructure/queue.ts");
+  const { getQueue, getWorker } = await import("../infrastructure/queue.ts");
   const queue = getQueue();
+  const worker = getWorker();
 
   const job = await queue.add("enrich-duckdb", {
     currency,
@@ -235,8 +277,35 @@ async function silverCommand(args: string[]) {
   });
 
   console.log(`✓ Enqueued: enrich-duckdb (${job.id})`);
-  console.log(`\nMonitor progress:`);
-  console.log(`  bun src/cli/index.ts queue-dashboard\n`);
+  console.log(`\n━━━ Processing... ━━━\n`);
+
+  // Wait for job to complete
+  await new Promise<void>((resolve, reject) => {
+    const completedHandler = (completedJob: any) => {
+      if (completedJob.id === job.id) {
+        worker.off("completed", completedHandler);
+        worker.off("failed", failedHandler);
+        console.log(`\n━━━ Silver Layer Complete! ━━━\n`);
+        resolve();
+      }
+    };
+
+    const failedHandler = (failedJob: any, error: Error) => {
+      if (failedJob.id === job.id) {
+        console.error(`\n✗ Silver enrichment failed:`, error);
+        worker.off("completed", completedHandler);
+        worker.off("failed", failedHandler);
+        reject(error);
+      }
+    };
+
+    worker.on("completed", completedHandler);
+    worker.on("failed", failedHandler);
+  });
+
+  await worker.close();
+  await queue.close();
+  process.exit(0);
 }
 
 async function goldCommand(args: string[]) {
@@ -255,8 +324,9 @@ async function goldCommand(args: string[]) {
 
   console.log(`\n━━━ Gold Layer: ${currency} ━━━\n`);
 
-  const { getQueue } = await import("../infrastructure/queue.ts");
+  const { getQueue, getWorker } = await import("../infrastructure/queue.ts");
   const queue = getQueue();
+  const worker = getWorker();
 
   const job = await queue.add("enrich-gold", {
     currency,
@@ -267,8 +337,35 @@ async function goldCommand(args: string[]) {
   });
 
   console.log(`✓ Enqueued: enrich-gold (${job.id})`);
-  console.log(`\nMonitor progress:`);
-  console.log(`  bun src/cli/index.ts queue-dashboard\n`);
+  console.log(`\n━━━ Processing... ━━━\n`);
+
+  // Wait for job to complete
+  await new Promise<void>((resolve, reject) => {
+    const completedHandler = (completedJob: any) => {
+      if (completedJob.id === job.id) {
+        worker.off("completed", completedHandler);
+        worker.off("failed", failedHandler);
+        console.log(`\n━━━ Gold Layer Complete! ━━━\n`);
+        resolve();
+      }
+    };
+
+    const failedHandler = (failedJob: any, error: Error) => {
+      if (failedJob.id === job.id) {
+        console.error(`\n✗ Gold enrichment failed:`, error);
+        worker.off("completed", completedHandler);
+        worker.off("failed", failedHandler);
+        reject(error);
+      }
+    };
+
+    worker.on("completed", completedHandler);
+    worker.on("failed", failedHandler);
+  });
+
+  await worker.close();
+  await queue.close();
+  process.exit(0);
 }
 
 async function pipelineCommand(args: string[]) {
