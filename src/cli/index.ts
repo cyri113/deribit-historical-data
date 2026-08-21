@@ -3,7 +3,7 @@
 import { DeribitClient } from "../infrastructure/deribit-client.ts";
 import { ParquetStorage } from "../infrastructure/parquet-storage.ts";
 
-const COMMANDS = ["bronze", "silver", "gold", "pipeline", "queue-worker", "queue-status", "queue-dashboard", "help"] as const;
+const COMMANDS = ["bronze", "silver", "gold", "pipeline", "queue-worker", "queue-status", "help"] as const;
 type Command = typeof COMMANDS[number];
 
 // Argument parsing
@@ -128,12 +128,6 @@ Queue Management:
 
     Examples:
       bun src/cli/index.ts queue-status
-
-  queue-dashboard
-    Start web dashboard at http://localhost:6790
-
-    Examples:
-      bun src/cli/index.ts queue-dashboard
 
   help
     Show this help message
@@ -382,8 +376,11 @@ async function pipelineCommand(args: string[]) {
   console.log(`\n━━━ Pipeline flow created! ━━━`);
   console.log(`\n⚠️  Jobs execute in order: Bronze → Silver → Gold`);
   console.log(`   Bronze children run in parallel, Silver waits for all to complete.`);
-  console.log(`Monitor progress with:`);
-  console.log(`  bun src/cli/index.ts queue-dashboard`);
+
+  console.log(`\n⚠️  IMPORTANT: Start queue worker in another terminal to process jobs:`);
+  console.log(`   bun src/cli/index.ts queue-worker`);
+  console.log(`\nOr check job status with:`);
+  console.log(`   bun src/cli/index.ts queue-status`);
   console.log(`\nOutput will be at:`);
   console.log(`  Bronze: data/bronze/instruments/${currency}/`);
   console.log(`  Silver: data/silver/${currency}.parquet`);
@@ -412,31 +409,22 @@ async function queueStatusCommand() {
   const { QueueManager } = await import("../infrastructure/queue.ts");
   const queue = QueueManager.getQueue();
 
-  const jobs = await queue.getJobs();
+  const counts = await queue.getJobCountsAsync();
 
   console.log("\n━━━ Queue Status ━━━\n");
-  console.log(`Total jobs: ${jobs.length}\n`);
+  console.log(`Waiting:   ${counts.waiting || 0}`);
+  console.log(`Active:    ${counts.active || 0}`);
+  console.log(`Completed: ${counts.completed || 0}`);
+  console.log(`Failed:    ${counts.failed || 0}`);
+  console.log(`Delayed:   ${counts.delayed || 0}`);
 
-  for (const job of jobs) {
-    console.log(`[${job.status}] ${job.type} (${job.id})`);
-    if (job.error) {
-      console.log(`  Error: ${job.error}`);
-    }
+  if (counts.waiting && counts.waiting > 0 && counts.active === 0) {
+    console.log(`\n⚠️  Jobs are waiting but none are active. Start a worker:`);
+    console.log(`   bun src/cli/index.ts queue-worker`);
   }
   console.log();
 }
 
-async function queueDashboardCommand() {
-  const { QueueManager } = await import("../infrastructure/queue.ts");
-  const queue = QueueManager.getQueue();
-
-  console.log("Starting BunQueue dashboard...");
-  console.log("Dashboard available at: http://localhost:6790");
-  console.log("Press Ctrl+C to stop.\n");
-
-  // Start the dashboard server
-  await queue.ui({ port: 6790 });
-}
 
 async function main() {
   const args = process.argv.slice(2);
@@ -473,9 +461,6 @@ async function main() {
       break;
     case "queue-status":
       await queueStatusCommand();
-      break;
-    case "queue-dashboard":
-      await queueDashboardCommand();
       break;
     case "help":
       printHelp();
