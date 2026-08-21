@@ -44,7 +44,36 @@ export const INSTRUMENT_SCHEMA = new parquet.ParquetSchema({
 });
 
 /**
- * RAW_TRADE_SCHEMA - Silver Layer (Ingestion: API → Parquet)
+ * FUTURES_TRADE_SCHEMA - Bronze Layer (Ingestion: API → Parquet)
+ *
+ * Dated futures trades (e.g., BTC-10AUG26) used to derive forward prices for options Greeks.
+ * Stored separately from options trades for efficient joins in DuckDB.
+ *
+ * Purpose:
+ * - Provide forward prices for Black-76 Greeks calculations
+ * - One file per dated futures contract (e.g., BTC-10AUG26.parquet)
+ * - Joined with options via ASOF join on timestamp + expiry match
+ */
+export const FUTURES_TRADE_SCHEMA = new parquet.ParquetSchema({
+  // Trade identifiers
+  trade_id: { type: "UTF8" },
+  trade_seq: { type: "INT64" },
+  instrument_name: { type: "UTF8" }, // e.g., "BTC-10AUG26"
+  timestamp: { type: "TIMESTAMP_MILLIS" },
+
+  // Trade data
+  price: { type: "DOUBLE" }, // This is the forward price we need!
+  amount: { type: "DOUBLE" },
+  direction: { type: "UTF8" },
+  tick_direction: { type: "INT32" },
+
+  // Market data (from API)
+  index_price: { type: "DOUBLE" }, // Spot price for reference
+  mark_price: { type: "DOUBLE", optional: true },
+});
+
+/**
+ * RAW_TRADE_SCHEMA - Bronze Layer (Ingestion: API → Parquet)
  *
  * Contains only raw trade data from Deribit API with basic instrument metadata.
  * No computed fields (Greeks, moneyness, trading metrics) - those are in Gold layer.
@@ -71,6 +100,7 @@ export const RAW_TRADE_SCHEMA = new parquet.ParquetSchema({
   index_price: { type: "DOUBLE" },
   mark_price: { type: "DOUBLE", optional: true },
   implied_volatility: { type: "DOUBLE", optional: true },
+  futures_price: { type: "DOUBLE", optional: true }, // Forward price from dated futures contract
 
   // Instrument metadata (parsed from name)
   // Note: These are optional to support futures/perpetuals (which don't have strike/option_type)

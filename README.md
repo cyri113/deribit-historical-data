@@ -21,6 +21,7 @@ bun src/cli/index.ts queue-dashboard  # http://localhost:6790
 
 **Output:**
 - `data/parquet-raw/BTC/*.parquet` - Bronze: Raw trades (one file per instrument)
+- `data/parquet-raw/futures/*.parquet` - Bronze: Dated futures for forward prices
 - `data/parquet-raw/deliveries/*.parquet` - Delivery/settlement prices
 - `data/parquet-raw/volatility/*.parquet` - Historical volatility
 - `data/parquet-duckdb/BTC.parquet` - Silver/Gold: Enriched with Greeks (single file per currency)
@@ -31,7 +32,7 @@ bun src/cli/index.ts queue-dashboard  # http://localhost:6790
 **Data:** Expired instruments with expiration filters, seq-based pagination (no gaps), idempotent re-runs
 **Performance:** BunQueue concurrent jobs (3 parallel), 15 req/s shared rate limiting
 **Storage:** Direct Parquet writes, filesystem-based idempotency (skip completed instruments)
-**Analytics:** DuckDB vectorized Greeks (20-50k/sec, 10-100x faster than TypeScript)
+**Analytics:** DuckDB vectorized Greeks with forward prices (944k trades/sec, 10-100x faster than TypeScript)
 **Workflows:** BunQueue job queue, retry logic (3 attempts), web dashboard
 **Reliability:** Atomic Parquet writes, shared rate limiter, crash recovery via re-run
 
@@ -80,10 +81,11 @@ Infrastructure:
 
 Storage (Medallion Architecture):
 1. data/parquet-raw/BTC/*.parquet         - Bronze: Raw trades (one file per instrument)
-2. data/parquet-raw/deliveries/*.parquet  - Delivery/settlement prices
-3. data/parquet-raw/volatility/*.parquet  - Historical volatility
-4. data/parquet-duckdb/BTC.parquet        - Silver/Gold: Enriched with Greeks (single file)
-5. data/queue.db                          - BunQueue job queue (only SQLite)
+2. data/parquet-raw/futures/*.parquet     - Bronze: Dated futures (forward prices for Greeks)
+3. data/parquet-raw/deliveries/*.parquet  - Delivery/settlement prices
+4. data/parquet-raw/volatility/*.parquet  - Historical volatility
+5. data/parquet-duckdb/BTC.parquet        - Silver/Gold: Enriched with Greeks (single file)
+6. data/queue.db                          - BunQueue job queue (only SQLite)
 
 No instrument metadata database - All metadata embedded in Parquet files via parseInstrumentName()
 ```
@@ -104,8 +106,21 @@ No instrument metadata database - All metadata embedded in Parquet files via par
 4. **Filesystem-based idempotency:** Check Parquet exists → skip (no SQLite database for progress tracking)
 5. **BunQueue workflows:** Professional queue vs custom dashboard (-550 lines code)
 6. **DuckDB SQL Greeks:** 10-100x faster via vectorized execution
+7. **Forward prices for Greeks:** Use dated futures instead of spot index for accurate Black-76 pricing
 
 See [Design Decisions](docs/design-decisions.md) for rationale.
+
+## Forward Prices for Greeks
+
+Greeks calculations use **forward prices** from dated futures contracts instead of spot index prices:
+
+- **Fetches:** Dated futures (e.g., `BTC-10AUG26`) matching option expiries
+- **Storage:** `data/parquet-raw/futures/*.parquet`
+- **Join:** DuckDB ASOF join matches futures trades to option trades by timestamp
+- **Fallback:** Uses spot `index_price` if futures data unavailable
+- **Accuracy:** Forward price typically $5-50 different from spot → more accurate Greeks
+
+**Why it matters:** Deribit uses forward prices for Greeks calculations. Using spot price (index_price) instead of forward price can cause delta/gamma errors, especially when futures trade at premium/discount to spot.
 
 ## Data Model
 

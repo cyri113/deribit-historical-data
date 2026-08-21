@@ -594,6 +594,13 @@ async function fetchAllCommand(args: string[]) {
     });
     console.log(`✓ Enqueued: fetch-trades (${tradesJob.id})`);
 
+    // Step 2.5: Fetch dated futures (for forward prices in Greeks)
+    const futuresJob = await queue.add("fetch-dated-futures", {
+      currency,
+      concurrency,
+    });
+    console.log(`✓ Enqueued: fetch-dated-futures (${futuresJob.id})`);
+
     // Step 3: Fetch deliveries
     if (!skipDeliveries) {
       const indexName = `${currency.toLowerCase()}_usd`;

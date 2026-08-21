@@ -1,5 +1,5 @@
 import parquet from "parquetjs";
-import { DELIVERY_PRICE_SCHEMA, HISTORICAL_VOLATILITY_SCHEMA, INSTRUMENT_SCHEMA, RAW_TRADE_SCHEMA } from "./schemas.ts";
+import { DELIVERY_PRICE_SCHEMA, HISTORICAL_VOLATILITY_SCHEMA, INSTRUMENT_SCHEMA, RAW_TRADE_SCHEMA, FUTURES_TRADE_SCHEMA } from "./schemas.ts";
 import type { DeribitTrade, DeribitDeliveryPrice, DeribitInstrument, DeribitHistoricalVolatility } from "../domain/models.ts";
 import { parseInstrumentName } from "../domain/models.ts";
 import { mkdir } from "node:fs/promises";
@@ -203,6 +203,95 @@ export class ParquetStorage {
         index_price: row.index_price,
         mark_price: row.mark_price ?? undefined,
         iv: row.implied_volatility ?? undefined,
+      });
+
+      row = await cursor.next();
+    }
+
+    await reader.close();
+    return trades;
+  }
+
+  // ========================================
+  // Futures Trade Storage (for Forward Prices)
+  // ========================================
+
+  /**
+   * Get futures trade file path
+   */
+  getFuturesFilePath(instrumentName: string): string {
+    // E.g., BTC-10AUG26 → data/parquet-raw/futures/BTC-10AUG26.parquet
+    return join(this.baseDir, "futures", `${instrumentName}.parquet`);
+  }
+
+  /**
+   * Check if futures trades exist for an instrument
+   */
+  async futuresExist(instrumentName: string): Promise<boolean> {
+    const filePath = this.getFuturesFilePath(instrumentName);
+    return existsSync(filePath);
+  }
+
+  /**
+   * Write futures trades to Parquet file
+   */
+  async writeFuturesTrades(
+    instrumentName: string,
+    trades: DeribitTrade[]
+  ): Promise<void> {
+    if (trades.length === 0) return;
+
+    const filePath = this.getFuturesFilePath(instrumentName);
+    await this.ensureDir(filePath);
+
+    const writer = await parquet.ParquetWriter.openFile(FUTURES_TRADE_SCHEMA, filePath);
+
+    for (const trade of trades) {
+      await writer.appendRow({
+        trade_id: trade.trade_id,
+        trade_seq: trade.trade_seq,
+        instrument_name: trade.instrument_name,
+        timestamp: trade.timestamp,
+        price: trade.price, // This is the forward price!
+        amount: trade.amount,
+        direction: trade.direction,
+        tick_direction: trade.tick_direction,
+        index_price: trade.index_price,
+        mark_price: trade.mark_price ?? null,
+      });
+    }
+
+    await writer.close();
+  }
+
+  /**
+   * Read futures trades from Parquet file
+   */
+  async readFuturesTrades(instrumentName: string): Promise<DeribitTrade[]> {
+    const filePath = this.getFuturesFilePath(instrumentName);
+
+    if (!existsSync(filePath)) {
+      return [];
+    }
+
+    const reader = await parquet.ParquetReader.openFile(filePath);
+    const cursor = reader.getCursor();
+
+    const trades: DeribitTrade[] = [];
+    let row = await cursor.next();
+
+    while (row) {
+      trades.push({
+        trade_id: row.trade_id,
+        trade_seq: Number(row.trade_seq),
+        instrument_name: row.instrument_name,
+        timestamp: row.timestamp,
+        price: row.price,
+        amount: row.amount,
+        direction: row.direction as "buy" | "sell",
+        tick_direction: row.tick_direction,
+        index_price: row.index_price,
+        mark_price: row.mark_price ?? undefined,
       });
 
       row = await cursor.next();

@@ -64,10 +64,11 @@ Layered: CLI → Application → Domain → Infrastructure
 
 **Filesystem-based medallion architecture:**
 1. `data/parquet-raw/BTC/*.parquet` - **Bronze**: Raw trades (one file per instrument)
-2. `data/parquet-raw/deliveries/*.parquet` - Delivery/settlement prices
-3. `data/parquet-raw/volatility/*.parquet` - Historical volatility
-4. `data/parquet-duckdb/BTC.parquet` - **Silver/Gold**: Enriched with Greeks (single file per currency, DuckDBEnricher)
-5. `data/queue.db` - BunQueue job queue (only SQLite database)
+2. `data/parquet-raw/futures/*.parquet` - **Bronze**: Dated futures (forward prices for Greeks)
+3. `data/parquet-raw/deliveries/*.parquet` - Delivery/settlement prices
+4. `data/parquet-raw/volatility/*.parquet` - Historical volatility
+5. `data/parquet-duckdb/BTC.parquet` - **Silver/Gold**: Enriched with Greeks (single file per currency, DuckDBEnricher)
+6. `data/queue.db` - BunQueue job queue (only SQLite database)
 
 **No instrument metadata database** - All metadata embedded in Parquet files via `parseInstrumentName()`
 

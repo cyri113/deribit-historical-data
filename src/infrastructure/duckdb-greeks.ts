@@ -210,13 +210,17 @@ END
 /**
  * Generate bulk enrichment query for all instruments in a currency
  * Reads ALL Parquet files at once, computes Greeks in single vectorized pass
+ *
+ * NEW: Joins with dated futures to get forward prices for accurate Greeks
  */
 export function generateBulkGreeksEnrichmentQuery(params: {
-  inputPattern: string;  // e.g., 'data/parquet-raw/BTC/*.parquet'
-  outputPath: string;    // e.g., 'data/parquet-duckdb/BTC.parquet'
+  inputPattern: string;       // e.g., 'data/parquet-raw/BTC/*.parquet'
+  futuresPattern?: string;    // e.g., 'data/parquet-raw/futures/BTC-*.parquet'
+  outputPath: string;         // e.g., 'data/parquet-duckdb/BTC.parquet'
 }): string {
   const greeksParams = {
-    forwardPrice: "index_price",
+    // Use futures forward price if available, fallback to index (spot) price
+    forwardPrice: "COALESCE(futures_price, index_price)",
     strike: "strike",
     timeToExpiry: "time_to_expiry_years",
     volatility: "implied_volatility / 100.0", // Convert from percentage to decimal
@@ -228,54 +232,74 @@ export function generateBulkGreeksEnrichmentQuery(params: {
   const vegaSQL = generateVegaSQL(greeksParams);
   const thetaSQL = generateThetaSQL(greeksParams);
 
+  // Build query with optional futures join
+  const futuresJoin = params.futuresPattern ? `
+    -- LEFT JOIN with futures to get forward prices
+    LEFT JOIN (
+      SELECT
+        instrument_name as futures_instrument,
+        timestamp as futures_timestamp,
+        price as futures_price
+      FROM read_parquet('${params.futuresPattern}')
+    ) futures
+    ON regexp_extract(opt.instrument_name, '^([A-Z]+-\\\\d{2}[A-Z]{3}\\\\d{2})-') = futures.futures_instrument
+    AND futures.futures_timestamp <= opt.timestamp
+    QUALIFY ROW_NUMBER() OVER (
+      PARTITION BY opt.trade_id
+      ORDER BY futures.futures_timestamp DESC
+    ) = 1
+  ` : '';
+
   return `
 COPY (
   SELECT
     -- Extract instrument name from filename
-    regexp_extract(filename, '/([^/]+)\\.parquet$', 1) as instrument_name,
+    regexp_extract(opt.filename, '/([^/]+)\\.parquet$', 1) as instrument_name,
 
     -- Original trade data
-    trade_id,
-    trade_seq,
-    timestamp,
-    price,
-    amount,
-    direction,
-    tick_direction,
-    index_price,
-    mark_price,
-    implied_volatility,
-    strike,
-    expiration_timestamp,
-    option_type,
-    time_to_expiry_years,
+    opt.trade_id,
+    opt.trade_seq,
+    opt.timestamp,
+    opt.price,
+    opt.amount,
+    opt.direction,
+    opt.tick_direction,
+    opt.index_price,
+    opt.mark_price,
+    opt.implied_volatility,
+    opt.strike,
+    opt.expiration_timestamp,
+    opt.option_type,
+    opt.time_to_expiry_years,
+    ${params.futuresPattern ? 'futures.futures_price,' : ''}
 
-    -- Computed Greeks (vectorized over ALL files at once)
+    -- Computed Greeks (using forward price from futures when available)
     CASE
-      WHEN implied_volatility IS NOT NULL AND time_to_expiry_years > 0
+      WHEN opt.implied_volatility IS NOT NULL AND opt.time_to_expiry_years > 0
       THEN ${deltaSQL}
       ELSE NULL
     END as delta,
 
     CASE
-      WHEN implied_volatility IS NOT NULL AND time_to_expiry_years > 0
+      WHEN opt.implied_volatility IS NOT NULL AND opt.time_to_expiry_years > 0
       THEN ${gammaSQL}
       ELSE NULL
     END as gamma,
 
     CASE
-      WHEN implied_volatility IS NOT NULL AND time_to_expiry_years > 0
+      WHEN opt.implied_volatility IS NOT NULL AND opt.time_to_expiry_years > 0
       THEN ${vegaSQL}
       ELSE NULL
     END as vega,
 
     CASE
-      WHEN implied_volatility IS NOT NULL AND time_to_expiry_years > 0
+      WHEN opt.implied_volatility IS NOT NULL AND opt.time_to_expiry_years > 0
       THEN ${thetaSQL}
       ELSE NULL
     END as theta
 
-  FROM read_parquet('${params.inputPattern}', filename=true)
+  FROM read_parquet('${params.inputPattern}', filename=true) opt
+  ${futuresJoin}
 ) TO '${params.outputPath}' (FORMAT PARQUET, COMPRESSION ZSTD)
 `;
 }

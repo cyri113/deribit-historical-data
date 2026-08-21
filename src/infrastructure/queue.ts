@@ -5,6 +5,7 @@ import { JSONLStorage } from "./jsonl-storage.ts";
 import { ParquetStorage } from "./parquet-storage.ts";
 import { FutureFetcher } from "../application/fetchers/future-fetcher.ts";
 import { OptionFetcher } from "../application/fetchers/option-fetcher.ts";
+import { FuturesFetcher } from "../application/fetchers/futures-fetcher.ts";
 import { DeliveryFetcher } from "../application/fetchers/delivery-fetcher.ts";
 import { VolatilityFetcher } from "../application/fetchers/volatility-fetcher.ts";
 import { DuckDBEnricher } from "../application/analytics/duckdb-enricher.ts";
@@ -51,6 +52,12 @@ export interface FetchDeliveriesJobData {
 export interface FetchVolatilityJobData {
   currencies: string[];
   concurrency?: number;
+}
+
+export interface FetchDatedFuturesJobData {
+  currency: string;
+  concurrency?: number;
+  // Note: Automatically scans option parquet files to determine which futures to fetch
 }
 
 export interface EnrichWithDuckDBJobData {
@@ -243,6 +250,55 @@ class QueueManager {
 
             console.log(`✓ Fetched ${totalRecords} volatility records`);
             return { totalRecords, currencies: currencies.length };
+          },
+
+          "fetch-dated-futures": async (job: Job<FetchDatedFuturesJobData>) => {
+            const { currency, concurrency = 3 } = job.data;
+
+            console.log(`\n📥 Fetching dated futures for forward prices...`);
+
+            const fetcher = new FuturesFetcher({
+              client: deps.client,
+              parquetStorage: deps.parquetStorage,
+            });
+
+            // Scan existing option parquet files to extract required futures
+            const { readdirSync } = await import("node:fs");
+            const { join } = await import("node:path");
+            const optionsDir = join(deps.parquetStorage.getTradeFilePath(`${currency}-dummy`), "..");
+
+            let optionInstruments: string[] = [];
+            try {
+              const files = readdirSync(optionsDir);
+              optionInstruments = files
+                .filter(f => f.endsWith(".parquet"))
+                .map(f => f.replace(".parquet", ""));
+              console.log(`Scanned ${optionInstruments.length} option instruments`);
+            } catch (error) {
+              console.warn(`⚠️  Could not scan options directory: ${error}`);
+              return { currency, totalTrades: 0, futuresCount: 0 };
+            }
+
+            if (optionInstruments.length === 0) {
+              console.log(`No options found - skipping futures fetch`);
+              return { currency, totalTrades: 0, futuresCount: 0 };
+            }
+
+            // Extract unique dated futures from option instruments
+            const datedFutures = fetcher.extractDatedFutures(optionInstruments);
+            console.log(`Found ${datedFutures.length} unique dated futures contracts`);
+
+            // Fetch each dated futures contract
+            let totalTrades = 0;
+            for (const futuresInstrument of datedFutures) {
+              const result = await fetcher.fetchInstrument(futuresInstrument);
+              if (!result.skipped) {
+                totalTrades += result.totalTrades;
+              }
+            }
+
+            console.log(`✓ Fetched ${totalTrades.toLocaleString()} futures trades`);
+            return { currency, totalTrades, futuresCount: datedFutures.length };
           },
 
           "enrich-duckdb": async (job: Job<EnrichWithDuckDBJobData>) => {

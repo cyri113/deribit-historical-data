@@ -171,11 +171,30 @@ export class DuckDBEnricher {
       }
 
       console.log(`Found ${fileCount} files, ${instrumentCount} instruments, ${inputTradeCount.toLocaleString()} trades`);
+
+      // Check if futures data exists
+      const futuresPattern = join(this.inputDir, "..", "futures", `${currency}-*.parquet`);
+      const futuresCheckQuery = `SELECT COUNT(*) as count FROM read_parquet('${futuresPattern}')`;
+      let hasFuturesData = false;
+      try {
+        const futuresCheck = await executeSQLQuery<{ count: bigint }>(futuresCheckQuery);
+        const futuresCount = Number(futuresCheck[0]?.count ?? 0);
+        hasFuturesData = futuresCount > 0;
+        if (hasFuturesData) {
+          console.log(`✓ Found ${futuresCount.toLocaleString()} futures trades for forward pricing`);
+        } else {
+          console.log(`⚠️  No futures data found - using spot index price (less accurate)`);
+        }
+      } catch {
+        console.log(`⚠️  No futures data found - using spot index price (less accurate)`);
+      }
+
       console.log(`\nEnriching ALL data in single vectorized SQL query...`);
 
       // Generate and execute bulk enrichment SQL
       const sql = generateBulkGreeksEnrichmentQuery({
         inputPattern,
+        futuresPattern: hasFuturesData ? futuresPattern : undefined,
         outputPath: outputFile,
       });
 

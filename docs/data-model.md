@@ -5,10 +5,11 @@ Parquet storage formats, relationships, no SQLite database for trade metadata.
 ## Storage
 
 1. **Parquet Raw** `data/parquet-raw/BTC/*.parquet` - Bronze layer (raw trades, one file per instrument)
-2. **Parquet Deliveries** `data/parquet-raw/deliveries/*.parquet` - Delivery/settlement prices
-3. **Parquet Volatility** `data/parquet-raw/volatility/*.parquet` - Historical volatility
-4. **Parquet Enriched** `data/parquet-duckdb/BTC.parquet` - Silver/Gold layer (single file per currency with Greeks)
-5. **Queue** `data/queue.db` - BunQueue job queue (only SQLite database)
+2. **Parquet Futures** `data/parquet-raw/futures/*.parquet` - Bronze layer (dated futures for forward prices)
+3. **Parquet Deliveries** `data/parquet-raw/deliveries/*.parquet` - Delivery/settlement prices
+4. **Parquet Volatility** `data/parquet-raw/volatility/*.parquet` - Historical volatility
+5. **Parquet Enriched** `data/parquet-duckdb/BTC.parquet` - Silver/Gold layer (single file per currency with Greeks)
+6. **Queue** `data/queue.db` - BunQueue job queue (only SQLite database)
 
 ---
 
@@ -82,9 +83,17 @@ Parquet storage formats, relationships, no SQLite database for trade metadata.
 
    ARCHITECTURE:
    - Single SQL query processes ALL 3,478 files at once
+   - LEFT JOIN with futures data (ASOF join on timestamp)
+   - Uses COALESCE(futures_price, index_price) as forward price in Black-76
    - Vectorized Greeks computation (944k trades/sec)
    - 10-100x faster than per-file processing
    - Standard data lakehouse pattern
+
+5. Futures forward prices (optional, for accurate Greeks)
+   ↓
+   Fetch dated futures matching option expiries → store in data/parquet-raw/futures/
+   ↓
+   Joined with options during enrichment via ASOF join
 ```
 
 ---
