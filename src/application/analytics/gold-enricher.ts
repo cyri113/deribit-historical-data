@@ -156,6 +156,56 @@ COPY (
         ROWS BETWEEN 2160 PRECEDING AND CURRENT ROW  -- ~90 days of hourly trades
       ) as iv_percentile_90day
     FROM realized_vols
+  ),
+  -- Compute execution quality metrics
+  execution_metrics AS (
+    SELECT *,
+      -- Trade volume: 7-day rolling count
+      COUNT(*) OVER (
+        PARTITION BY instrument_name
+        ORDER BY timestamp
+        ROWS BETWEEN 168 PRECEDING AND CURRENT ROW
+      ) as trade_volume_7day,
+
+      -- Bid-ask spread estimate: infer from tick_direction clustering
+      STDDEV(tick_direction) OVER (
+        PARTITION BY instrument_name
+        ORDER BY timestamp
+        ROWS BETWEEN 20 PRECEDING AND CURRENT ROW
+      ) * price * 0.01 as bid_ask_spread_estimate,
+
+      -- Slippage: entry_price vs mark_price
+      CASE
+        WHEN mark_price IS NOT NULL AND mark_price > 0
+        THEN (price - mark_price) / mark_price
+        ELSE NULL
+      END as slippage_per_contract,
+
+      -- Expected premium: delta-weighted from Greeks at entry
+      CASE
+        WHEN delta IS NOT NULL AND price IS NOT NULL
+        THEN ABS(delta) * price * amount
+        ELSE NULL
+      END as expected_premium,
+
+      -- Actual premium collected: 7-day rolling sum
+      SUM(price * amount) OVER (
+        PARTITION BY instrument_name
+        ORDER BY timestamp
+        ROWS BETWEEN 168 PRECEDING AND CURRENT ROW
+      ) as actual_premium_collected
+    FROM iv_percentiles
+  ),
+  -- Compute premium collection ratio (requires expected_premium first)
+  final_metrics AS (
+    SELECT *,
+      -- Premium collection ratio: actual / expected
+      CASE
+        WHEN expected_premium IS NOT NULL AND expected_premium > 0
+        THEN actual_premium_collected / expected_premium
+        ELSE NULL
+      END as premium_collection_ratio
+    FROM execution_metrics
   )
   SELECT
     -- All silver layer fields (passthrough)
@@ -213,9 +263,29 @@ COPY (
     iv_percentile_90day,
 
     -- iv_minus_rv_gap: IV - RV spread (volatility risk premium indicator)
-    (implied_volatility - realized_vol_7day) as iv_minus_rv_gap
+    (implied_volatility - realized_vol_7day) as iv_minus_rv_gap,
 
-  FROM iv_percentiles
+    -- Execution quality metrics
+
+    -- trade_volume_7day: Count of trades in 7-day rolling window
+    trade_volume_7day,
+
+    -- bid_ask_spread_estimate: Inferred spread from tick_direction clustering
+    bid_ask_spread_estimate,
+
+    -- slippage_per_contract: Entry price vs mark price (execution quality)
+    slippage_per_contract,
+
+    -- expected_premium: Delta-weighted premium from Greeks at entry
+    expected_premium,
+
+    -- actual_premium_collected: Sum of filled premium in 7-day window
+    actual_premium_collected,
+
+    -- premium_collection_ratio: Actual / expected premium (efficiency metric)
+    premium_collection_ratio
+
+  FROM final_metrics
 ) TO '${outputPath}' (FORMAT PARQUET);
 `;
   }
