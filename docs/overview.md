@@ -51,7 +51,7 @@ Output:
   data/parquet-raw/BTC/         (Bronze: raw trades, one file per instrument)
   data/parquet-raw/deliveries/  (Delivery/settlement prices)
   data/parquet-raw/volatility/  (Historical volatility)
-  data/parquet-duckdb/BTC/      (Silver/Gold: enriched with Greeks)
+  data/parquet-duckdb/BTC.parquet  (Silver/Gold: single file per currency with Greeks)
   data/queue.db                 (BunQueue job queue - only SQLite)
 ```
 

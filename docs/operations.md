@@ -79,13 +79,17 @@ bun src/cli/index.ts fetch-all BTC
 bun src/cli/index.ts enrich-with-duckdb BTC
 ```
 
-**Output:** `data/parquet-duckdb/BTC/*.parquet`
+**Output:** `data/parquet-duckdb/BTC.parquet` (single file per currency)
 
 **Performance:**
-- **DuckDB:** ~20-50k trades/sec, all CPU cores, low memory (streaming)
-- **TypeScript:** ~1-2k trades/sec, 1 core, high memory
+- **DuckDB Bulk:** ~944k trades/sec (single query processes ALL files at once)
+- **DuckDB Per-file:** ~20-50k trades/sec (deprecated approach)
+- **TypeScript:** ~1-2k trades/sec, 1 core, high memory (deprecated)
 
-**Note:** TypeScript enrichment (`merge-to-parquet`) is deprecated. Use `enrich-with-duckdb` for 10-100x better performance.
+**Architecture:**
+- Processes 3,478 input files in one vectorized SQL query
+- 10-100x faster than per-file processing
+- Standard data lakehouse pattern (single large file instead of many small files)
 
 ### Enriched Fields
 
@@ -101,13 +105,13 @@ Each trade includes:
 ```sql
 -- High delta OTM calls
 SELECT instrument_name, AVG(delta), COUNT(*) as trades
-FROM 'data/parquet-duckdb/BTC/*.parquet'
+FROM 'data/parquet-duckdb/BTC.parquet'
 WHERE option_type = 'call' AND moneyness = 'OTM' AND delta > 0.3
 GROUP BY instrument_name ORDER BY AVG(delta) DESC;
 
 -- High IV rank opportunities (mean reversion)
 SELECT instrument_name, AVG(iv_rank_52w), AVG(annualized_premium_yield), COUNT(*)
-FROM 'data/parquet-duckdb/BTC/*.parquet'
+FROM 'data/parquet-duckdb/BTC.parquet'
 WHERE iv_rank_52w > 80 AND annualized_premium_yield > 30
 GROUP BY instrument_name ORDER BY AVG(annualized_premium_yield) DESC;
 ```
@@ -116,7 +120,7 @@ GROUP BY instrument_name ORDER BY AVG(annualized_premium_yield) DESC;
 ```python
 import pandas as pd
 
-df = pd.read_parquet('data/parquet-duckdb/BTC/')
+df = pd.read_parquet('data/parquet-duckdb/BTC.parquet')
 
 # High delta calls
 high_delta = df[(df['option_type'] == 'call') & (df['delta'] > 0.7)]

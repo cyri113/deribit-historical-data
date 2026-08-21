@@ -23,7 +23,7 @@ bun src/cli/index.ts queue-dashboard  # http://localhost:6790
 - `data/parquet-raw/BTC/*.parquet` - Bronze: Raw trades (one file per instrument)
 - `data/parquet-raw/deliveries/*.parquet` - Delivery/settlement prices
 - `data/parquet-raw/volatility/*.parquet` - Historical volatility
-- `data/parquet-duckdb/BTC/*.parquet` - Silver/Gold: Enriched with Greeks
+- `data/parquet-duckdb/BTC.parquet` - Silver/Gold: Enriched with Greeks (single file per currency)
 - `data/queue.db` - BunQueue job queue (only SQLite database)
 
 ## Features
@@ -82,7 +82,7 @@ Storage (Medallion Architecture):
 1. data/parquet-raw/BTC/*.parquet         - Bronze: Raw trades (one file per instrument)
 2. data/parquet-raw/deliveries/*.parquet  - Delivery/settlement prices
 3. data/parquet-raw/volatility/*.parquet  - Historical volatility
-4. data/parquet-duckdb/BTC/*.parquet      - Silver/Gold: Enriched with Greeks
+4. data/parquet-duckdb/BTC.parquet        - Silver/Gold: Enriched with Greeks (single file)
 5. data/queue.db                          - BunQueue job queue (only SQLite)
 
 No instrument metadata database - All metadata embedded in Parquet files via parseInstrumentName()

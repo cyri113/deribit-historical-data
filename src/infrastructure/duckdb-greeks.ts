@@ -208,7 +208,81 @@ END
 }
 
 /**
- * Generate complete SELECT statement for Greeks enrichment
+ * Generate bulk enrichment query for all instruments in a currency
+ * Reads ALL Parquet files at once, computes Greeks in single vectorized pass
+ */
+export function generateBulkGreeksEnrichmentQuery(params: {
+  inputPattern: string;  // e.g., 'data/parquet-raw/BTC/*.parquet'
+  outputPath: string;    // e.g., 'data/parquet-duckdb/BTC.parquet'
+}): string {
+  const greeksParams = {
+    forwardPrice: "index_price",
+    strike: "strike",
+    timeToExpiry: "time_to_expiry_years",
+    volatility: "implied_volatility / 100.0", // Convert from percentage to decimal
+    optionType: "option_type",
+  };
+
+  const deltaSQL = generateDeltaSQL(greeksParams);
+  const gammaSQL = generateGammaSQL(greeksParams);
+  const vegaSQL = generateVegaSQL(greeksParams);
+  const thetaSQL = generateThetaSQL(greeksParams);
+
+  return `
+COPY (
+  SELECT
+    -- Extract instrument name from filename
+    regexp_extract(filename, '/([^/]+)\\.parquet$', 1) as instrument_name,
+
+    -- Original trade data
+    trade_id,
+    trade_seq,
+    timestamp,
+    price,
+    amount,
+    direction,
+    tick_direction,
+    index_price,
+    mark_price,
+    implied_volatility,
+    strike,
+    expiration_timestamp,
+    option_type,
+    time_to_expiry_years,
+
+    -- Computed Greeks (vectorized over ALL files at once)
+    CASE
+      WHEN implied_volatility IS NOT NULL AND time_to_expiry_years > 0
+      THEN ${deltaSQL}
+      ELSE NULL
+    END as delta,
+
+    CASE
+      WHEN implied_volatility IS NOT NULL AND time_to_expiry_years > 0
+      THEN ${gammaSQL}
+      ELSE NULL
+    END as gamma,
+
+    CASE
+      WHEN implied_volatility IS NOT NULL AND time_to_expiry_years > 0
+      THEN ${vegaSQL}
+      ELSE NULL
+    END as vega,
+
+    CASE
+      WHEN implied_volatility IS NOT NULL AND time_to_expiry_years > 0
+      THEN ${thetaSQL}
+      ELSE NULL
+    END as theta
+
+  FROM read_parquet('${params.inputPattern}', filename=true)
+) TO '${params.outputPath}' (FORMAT PARQUET, COMPRESSION ZSTD)
+`;
+}
+
+/**
+ * Generate complete SELECT statement for Greeks enrichment (single file)
+ * DEPRECATED: Use generateBulkGreeksEnrichmentQuery for better performance
  */
 export function generateGreeksEnrichmentQuery(params: {
   inputPath: string;

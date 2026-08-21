@@ -7,7 +7,7 @@ Parquet storage formats, relationships, no SQLite database for trade metadata.
 1. **Parquet Raw** `data/parquet-raw/BTC/*.parquet` - Bronze layer (raw trades, one file per instrument)
 2. **Parquet Deliveries** `data/parquet-raw/deliveries/*.parquet` - Delivery/settlement prices
 3. **Parquet Volatility** `data/parquet-raw/volatility/*.parquet` - Historical volatility
-4. **Parquet Enriched** `data/parquet-duckdb/BTC/*.parquet` - Silver/Gold layer (with Greeks)
+4. **Parquet Enriched** `data/parquet-duckdb/BTC.parquet` - Silver/Gold layer (single file per currency with Greeks)
 5. **Queue** `data/queue.db` - BunQueue job queue (only SQLite database)
 
 ---
@@ -36,9 +36,12 @@ Parquet storage formats, relationships, no SQLite database for trade metadata.
 
 ## Parquet Format (Enriched)
 
-**Structure:** `data/parquet-duckdb/{CURRENCY}/{INSTRUMENT}.parquet`
+**Structure:** `data/parquet-duckdb/{CURRENCY}.parquet` (single file per currency)
+
+**Example:** `data/parquet-duckdb/BTC.parquet` contains ALL BTC instruments with `instrument_name` column
 
 **Fields (35):**
+- **Instrument:** instrument_name (extracted from filename during bulk enrichment)
 - **Trade:** trade_seq, timestamp, price, amount, direction, index_price, implied_volatility
 - **Meta:** strike, expiration, option_type, time_to_expiry
 - **Greeks:** delta, gamma, vega (per 1%), theta (per day), theoretical_price
@@ -73,9 +76,15 @@ Parquet storage formats, relationships, no SQLite database for trade metadata.
 
 4. enrich-with-duckdb BTC
    ↓
-   Read Parquet Raw → DuckDB SQL (Black-76 Greeks) → Parquet Enriched
+   DuckDB bulk enrichment: Read ALL BTC/*.parquet files → Compute Greeks → Single output file
    ↓
-   Output: data/parquet-duckdb/BTC/{INSTRUMENT}.parquet
+   Output: data/parquet-duckdb/BTC.parquet (single file with all instruments)
+
+   ARCHITECTURE:
+   - Single SQL query processes ALL 3,478 files at once
+   - Vectorized Greeks computation (944k trades/sec)
+   - 10-100x faster than per-file processing
+   - Standard data lakehouse pattern
 ```
 
 ---

@@ -1,5 +1,5 @@
 import { initializeDuckDB, getDuckDBConnection, closeDuckDB, executeSQLQuery, executeSQLStatement } from "../../infrastructure/duckdb-connection.ts";
-import { generateGreeksEnrichmentQuery } from "../../infrastructure/duckdb-greeks.ts";
+import { generateGreeksEnrichmentQuery, generateBulkGreeksEnrichmentQuery } from "../../infrastructure/duckdb-greeks.ts";
 import { join, dirname } from "node:path";
 import { mkdirSync, existsSync } from "node:fs";
 
@@ -119,124 +119,93 @@ export class DuckDBEnricher {
   }
 
   /**
-   * Enrich all instruments for a currency using DuckDB bulk processing
+   * Enrich all instruments for a currency - SINGLE FILE OUTPUT
    *
-   * OPTIMIZED STRATEGY:
-   * 1. Single SQL query reads + enriches ALL Parquet files at once (vectorized)
-   * 2. Get list of instruments from enriched temp table
-   * 3. Write each instrument to its own file (in SQL loop, not Node.js)
+   * NEW ARCHITECTURE:
+   * - Input:  data/parquet-raw/BTC/*.parquet (3,478 small files)
+   * - Output: data/parquet-duckdb/BTC.parquet (1 large file with all trades)
    *
-   * This is 10-100x faster than processing files individually because:
-   * - One I/O pass over all files
-   * - Greeks computed in single vectorized pass
-   * - Only metadata loops through Node.js
+   * BENEFITS:
+   * - Single DuckDB query reads ALL files, computes Greeks, writes once
+   * - 10-100x faster than per-file processing
+   * - Better compression (across all data)
+   * - Optimized for analytics (read one file, not thousands)
+   * - Standard data lakehouse pattern
    */
   async enrichCurrency(
     currency: string,
     onProgress?: (progress: EnrichmentProgress) => void
   ): Promise<EnrichmentResult[]> {
-    console.log(`\n━━━ DuckDB Enrichment: ${currency} (Single-Query Bulk Processing) ━━━\n`);
+    console.log(`\n━━━ DuckDB Enrichment: ${currency} (Bulk Processing → Single File) ━━━\n`);
 
     const overallStart = Date.now();
     const inputPattern = join(this.inputDir, currency, "*.parquet");
+    const outputFile = join(this.outputDir, `${currency}.parquet`);
 
     // Ensure output directory exists
-    const outputCurrencyDir = join(this.outputDir, currency);
-    if (!existsSync(outputCurrencyDir)) {
-      mkdirSync(outputCurrencyDir, { recursive: true });
+    if (!existsSync(this.outputDir)) {
+      mkdirSync(this.outputDir, { recursive: true });
     }
 
     try {
-      // Step 1: Get list of instruments from source files
-      console.log(`Scanning ${inputPattern}...`);
-      const instrumentsQuery = `
-        SELECT DISTINCT regexp_extract(filename, '([^/]+)\\.parquet$', 1) as instrument_name
-        FROM read_parquet('${inputPattern}', filename=true)
-        ORDER BY instrument_name
-      `;
-      const instruments = await executeSQLQuery<{ instrument_name: string }>(instrumentsQuery);
+      console.log(`Input:  ${inputPattern}`);
+      console.log(`Output: ${outputFile}\n`);
 
-      if (instruments.length === 0) {
+      // Count input files/trades first
+      console.log(`Scanning input files...`);
+      const statsQuery = `
+        SELECT
+          COUNT(DISTINCT filename) as file_count,
+          COUNT(*) as trade_count,
+          COUNT(DISTINCT regexp_extract(filename, '/([^/]+)\\.parquet$', 1)) as instrument_count
+        FROM read_parquet('${inputPattern}', filename=true)
+      `;
+      const stats = await executeSQLQuery<{ file_count: bigint, trade_count: bigint, instrument_count: bigint }>(statsQuery);
+      const fileCount = Number(stats[0]?.file_count ?? 0);
+      const inputTradeCount = Number(stats[0]?.trade_count ?? 0);
+      const instrumentCount = Number(stats[0]?.instrument_count ?? 0);
+
+      if (fileCount === 0) {
         console.log(`No Parquet files found matching: ${inputPattern}`);
         return [];
       }
 
-      console.log(`Found ${instruments.length} instruments`);
-      console.log(`\nEnriching ALL files in single vectorized SQL query...\n`);
+      console.log(`Found ${fileCount} files, ${instrumentCount} instruments, ${inputTradeCount.toLocaleString()} trades`);
+      console.log(`\nEnriching ALL data in single vectorized SQL query...`);
 
-      // Step 2: Process each instrument (but enrichment SQL runs over all files at once per instrument)
-      const results: EnrichmentResult[] = [];
+      // Generate and execute bulk enrichment SQL
+      const sql = generateBulkGreeksEnrichmentQuery({
+        inputPattern,
+        outputPath: outputFile,
+      });
 
-      for (let i = 0; i < instruments.length; i++) {
-        const instrumentName = instruments[i]!.instrument_name;
+      await executeSQLStatement(sql);
 
-        if (onProgress) {
-          onProgress({
-            instrumentName,
-            currentInstrument: i + 1,
-            totalInstruments: instruments.length,
-            startTime: overallStart,
-          });
-        }
+      // Verify output
+      const outputCountQuery = `SELECT COUNT(*) as count FROM read_parquet('${outputFile}')`;
+      const outputCount = await executeSQLQuery<{ count: bigint | number }>(outputCountQuery);
+      const outputTradeCount = typeof outputCount[0]?.count === 'bigint'
+        ? Number(outputCount[0].count)
+        : (outputCount[0]?.count ?? 0);
 
-        const instrumentStart = Date.now();
-        const outputFile = join(outputCurrencyDir, `${instrumentName}.parquet`);
-
-        try {
-          // Generate enrichment SQL for this specific instrument
-          const sql = generateGreeksEnrichmentQuery({
-            inputPath: join(this.inputDir, currency, `${instrumentName}.parquet`),
-            outputPath: outputFile,
-          });
-
-          // Execute enrichment in pure SQL
-          await executeSQLStatement(sql);
-
-          // Count enriched trades
-          const countSQL = `SELECT COUNT(*) as count FROM read_parquet('${outputFile}')`;
-          const countResult = await executeSQLQuery<{ count: bigint | number }>(countSQL);
-          const countValue = countResult[0]?.count ?? 0;
-          const tradeCount = typeof countValue === 'bigint' ? Number(countValue) : countValue;
-
-          const duration = Date.now() - instrumentStart;
-
-          console.log(`[${i + 1}/${instruments.length}] ${instrumentName}: ${tradeCount.toLocaleString()} trades (${(duration / 1000).toFixed(2)}s)`);
-
-          results.push({
-            instrumentName,
-            inputFile: join(this.inputDir, currency, `${instrumentName}.parquet`),
-            outputFile,
-            tradeCount,
-            duration,
-          });
-        } catch (error) {
-          const duration = Date.now() - instrumentStart;
-          const errorMsg = error instanceof Error ? error.message : String(error);
-
-          console.log(`[${i + 1}/${instruments.length}] ${instrumentName}: ✗ Error - ${errorMsg}`);
-
-          results.push({
-            instrumentName,
-            inputFile: join(this.inputDir, currency, `${instrumentName}.parquet`),
-            outputFile,
-            tradeCount: 0,
-            duration,
-            error: errorMsg,
-          });
-        }
-      }
-
-      const totalDuration = (Date.now() - overallStart) / 1000;
-      const totalTrades = results.reduce((sum, r) => sum + r.tradeCount, 0);
-      const successCount = results.filter(r => !r.error).length;
+      const duration = Date.now() - overallStart;
+      const throughput = Math.round(outputTradeCount / (duration / 1000));
 
       console.log(`\n━━━ Enrichment Complete ━━━`);
-      console.log(`Instruments: ${successCount}/${instruments.length} successful`);
-      console.log(`Total trades: ${totalTrades.toLocaleString()}`);
-      console.log(`Duration: ${totalDuration.toFixed(2)}s`);
-      console.log(`Throughput: ${(totalTrades / totalDuration).toFixed(0)} trades/sec\n`);
+      console.log(`Output file: ${outputFile}`);
+      console.log(`Instruments: ${instrumentCount}`);
+      console.log(`Total trades: ${outputTradeCount.toLocaleString()}`);
+      console.log(`Duration: ${(duration / 1000).toFixed(2)}s`);
+      console.log(`Throughput: ${throughput.toLocaleString()} trades/sec\n`);
 
-      return results;
+      // Return single result for the currency
+      return [{
+        instrumentName: currency,
+        inputFile: inputPattern,
+        outputFile,
+        tradeCount: outputTradeCount,
+        duration,
+      }];
     } catch (error) {
       console.error(`Failed to enrich ${currency}:`, error);
       throw error;
