@@ -299,7 +299,25 @@ COPY (
       WHEN opt.implied_volatility IS NOT NULL AND opt.time_to_expiry_years > 0
       THEN ${thetaSQL}
       ELSE NULL
-    END as theta
+    END as theta,
+
+    -- Data quality flag for analytics filtering
+    -- TRUE = valid for backtesting/analysis (good IV, sufficient time, valid Greeks)
+    -- FALSE = edge case data (IV=0, very short-dated, NaN Greeks)
+    (
+      opt.implied_volatility > 0
+      AND opt.time_to_expiry_years > 0.0027  -- > 1 day
+      AND opt.implied_volatility IS NOT NULL
+      AND opt.time_to_expiry_years > 0
+      AND CASE
+            WHEN opt.implied_volatility IS NOT NULL AND opt.time_to_expiry_years > 0
+            THEN NOT (
+              isnan(${deltaSQL}) OR isinf(${deltaSQL}) OR
+              isnan(${gammaSQL}) OR isinf(${gammaSQL})
+            )
+            ELSE false
+          END
+    ) as is_valid
 
   FROM read_parquet('${params.inputPattern}', filename=true) opt
   ${futuresJoin}

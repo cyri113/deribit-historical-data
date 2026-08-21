@@ -41,15 +41,21 @@ Parquet storage formats, relationships, no SQLite database for trade metadata.
 
 **Example:** `data/parquet-duckdb/BTC.parquet` contains ALL BTC instruments with `instrument_name` column
 
-**Fields (35):**
+**Fields (16 core):**
 - **Instrument:** instrument_name (extracted from filename during bulk enrichment)
-- **Trade:** trade_seq, timestamp, price, amount, direction, index_price, implied_volatility
-- **Meta:** strike, expiration, option_type, time_to_expiry
-- **Greeks:** delta, gamma, vega (per 1%), theta (per day), theoretical_price
-- **Moneyness:** delivery_price, moneyness (ITM/ATM/OTM), intrinsic_value
-- **Metrics:** annualized_yield, iv_rank_52w, expected_value, win_probability, sharpe_ratio
+- **Trade:** trade_seq, timestamp, price, amount, direction, index_price, mark_price, implied_volatility
+- **Meta:** strike, expiration_timestamp, option_type, time_to_expiry_years
+- **Greeks:** delta, gamma, vega (per 1%), theta (per day)
+- **Forward Price:** futures_price (when futures data available, else NULL)
+- **Quality:** is_valid (boolean flag for analytics-ready data)
 
 **Generation:** `enrich-with-duckdb BTC` (DuckDB SQL vectorized, 10-100x faster than TypeScript)
+
+**Data Quality Flag (`is_valid`):**
+- `TRUE` = Valid for backtesting/analysis (IV > 0, TTM > 1 day, valid Greeks)
+- `FALSE` = Edge case data (IV=0, very short-dated <1 day, or NaN Greeks)
+- Recommendation: Use `WHERE is_valid = true` for most analytics queries
+- Preserves all data for specialized research (e.g., near-expiry behavior, microstructure)
 
 ---
 

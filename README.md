@@ -129,10 +129,10 @@ Greeks calculations use **forward prices** from dated futures contracts instead 
 - One file per instrument: `BTC-25DEC24-60000-C.parquet`
 - Metadata embedded via `parseInstrumentName()` from filename
 
-**Parquet Enriched (Silver/Gold - 35 fields):**
+**Parquet Enriched (Silver/Gold - 16 fields):**
 - Trade data + Greeks (delta, gamma, vega, theta)
-- Moneyness (ITM/ATM/OTM, delivery_price, intrinsic_value)
-- Metrics (iv_rank, yield, expected_value, sharpe)
+- Forward prices (from futures when available)
+- Data quality flag (`is_valid` for filtering analytics-ready data)
 
 **BunQueue (only SQLite):**
 - Job queue state in `data/queue.db`
@@ -184,10 +184,24 @@ bun test --coverage         # With coverage report
 
 ## Use Cases
 
-**Backtest:** Fetch options → compute Greeks → filter (delta > 0.3) → P&L
+**Backtest:** Fetch options → compute Greeks → filter (`WHERE is_valid = true AND delta > 0.3`) → P&L
 **IV Research:** Trade-level IV → volatility surface → model validation
-**Microstructure:** Bid-ask spreads, order flow, market impact
+**Microstructure:** Bid-ask spreads, order flow, market impact (may include `is_valid = false` for near-expiry)
 **Greeks:** Track delta/gamma decay over lifetimes
+
+**Data Quality Filtering:**
+```sql
+-- High-quality analytics (recommended)
+SELECT * FROM read_parquet('data/parquet-duckdb/BTC.parquet')
+WHERE is_valid = true  -- Filters out IV=0, very short-dated, NaN Greeks
+
+-- All data (research, including edge cases)
+SELECT * FROM read_parquet('data/parquet-duckdb/BTC.parquet')
+
+-- Quality audit
+SELECT is_valid, COUNT(*) FROM read_parquet('data/parquet-duckdb/BTC.parquet')
+GROUP BY is_valid
+```
 
 ## Stack
 
