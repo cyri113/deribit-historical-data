@@ -210,12 +210,19 @@ COPY (
   -- Compute outcome metrics (forward-looking)
   outcome_metrics AS (
     SELECT *,
+      -- days_to_expiry: Compute early for use in assignment logic
+      CAST((epoch_ms(expiration_timestamp) - epoch_ms(timestamp)) / (1000.0 * 86400.0) AS INTEGER) as days_to_expiry,
+
       -- realized_move_7day: 7-day forward price return
       (LEAD(futures_price, 168) OVER (
         PARTITION BY SUBSTRING(instrument_name, 1, 3)
         ORDER BY timestamp
-      ) - futures_price) / NULLIF(futures_price, 0) as realized_move_7day,
-
+      ) - futures_price) / NULLIF(futures_price, 0) as realized_move_7day
+    FROM premium_metrics
+  ),
+  -- Compute assignment inference (requires days_to_expiry)
+  assignment_metrics AS (
+    SELECT *,
       -- assignment_inferred: Infer assignment from ITM at expiry
       CASE
         WHEN days_to_expiry = 0 THEN
@@ -226,7 +233,7 @@ COPY (
           END
         ELSE NULL
       END as assignment_inferred
-    FROM premium_metrics
+    FROM outcome_metrics
   ),
   -- Compute days_to_assignment (requires assignment_inferred)
   final_metrics AS (
@@ -234,10 +241,10 @@ COPY (
       -- days_to_assignment: Days from entry to assignment (if assigned)
       CASE
         WHEN assignment_inferred = TRUE
-        THEN CAST((epoch_ms(expiration_timestamp) - epoch_ms(timestamp)) / (1000.0 * 86400.0) AS INTEGER)
+        THEN days_to_expiry
         ELSE NULL
       END as days_to_assignment
-    FROM outcome_metrics
+    FROM assignment_metrics
   )
   SELECT
     -- All silver layer fields (passthrough)
@@ -265,8 +272,8 @@ COPY (
 
     -- Gold layer: Trading metrics
 
-    -- days_to_expiry: Integer days until expiration (for DTE filtering)
-    CAST((epoch_ms(expiration_timestamp) - epoch_ms(timestamp)) / (1000.0 * 86400.0) AS INTEGER) as days_to_expiry,
+    -- days_to_expiry: Integer days until expiration (already computed in CTE)
+    days_to_expiry,
 
     -- strike_delta: Categorize by delta buckets (common trading terminology)
     CASE
