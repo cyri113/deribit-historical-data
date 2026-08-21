@@ -353,13 +353,27 @@ class QueueManager {
 
       // Log job lifecycle events
       QueueManager.instance.on("completed", (job, result) => {
-        console.log(`✓ Job ${job.name} (${job.id}) completed:`, JSON.stringify(result));
+        // Log completion without dumping entire result object
+        const summary = typeof result === 'object' && result !== null
+          ? Object.keys(result).reduce((acc, key) => {
+              const value = result[key];
+              // Show counts/numbers, skip large arrays
+              if (Array.isArray(value)) {
+                acc[key] = `[${value.length} items]`;
+              } else if (typeof value === 'object' && value !== null) {
+                acc[key] = '[object]';
+              } else {
+                acc[key] = value;
+              }
+              return acc;
+            }, {} as any)
+          : result;
+        console.log(`✓ Job ${job.name} (${job.id}) completed:`, summary);
       });
 
       QueueManager.instance.on("failed", (job, error) => {
         console.error(`✗ Job ${job.name} (${job.id}) failed:`, error);
         console.error(`  Attempt ${job.attemptsMade} of ${job.opts?.attempts || 3}`);
-        console.error(`  Error:`, error);
       });
 
       QueueManager.instance.on("progress", (job, progress) => {
