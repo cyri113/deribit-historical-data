@@ -421,8 +421,16 @@ export class DeribitClient {
     batchSize: number = 10000
   ): AsyncGenerator<DeribitTrade[]> {
     let currentSeq = startSeq;
+    let previousSeq = -1; // Loop detection
 
     while (currentSeq <= endSeq) {
+      // Safety: detect infinite loop
+      if (currentSeq === previousSeq) {
+        console.error(`🚨 LOOP DETECTED: ${instrumentName} stuck at seq=${currentSeq} - breaking to prevent infinite loop`);
+        break;
+      }
+      previousSeq = currentSeq;
+
       const { trades, hasMore } = await this.getTradesBySeq(
         instrumentName,
         currentSeq,
@@ -432,8 +440,10 @@ export class DeribitClient {
 
       if (trades.length > 0) {
         yield trades;
-        // Move to next seq after the last trade
-        currentSeq = trades[trades.length - 1]!.trade_seq + 1;
+        // API returns trades in descending order (newest first)
+        // Use Math.max() to find highest trade_seq regardless of order
+        const lastTradeSeq = Math.max(...trades.map(t => t.trade_seq));
+        currentSeq = lastTradeSeq + 1;
       }
 
       // hasMore means "more within requested range", not "beyond it"
