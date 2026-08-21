@@ -219,11 +219,12 @@ export function generateBulkGreeksEnrichmentQuery(params: {
   outputPath: string;         // e.g., 'data/parquet-duckdb/BTC.parquet'
 }): string {
   const greeksParams = {
-    // Use futures forward price if available, fallback to index (spot) price
-    // When no futures data exists, use index_price directly to avoid column not found error
+    // STRICT: Use futures forward price ONLY (no fallback to spot)
+    // Without futures data, Greeks will be NULL (garbage in = garbage out)
+    // This ensures Greeks are only calculated with correct Black-76 inputs
     forwardPrice: params.futuresPattern
-      ? "COALESCE(futures_price, index_price)"
-      : "index_price",
+      ? "futures_price"
+      : "NULL",  // No futures data = no Greeks calculation
     strike: "strike",
     timeToExpiry: "time_to_expiry_years",
     volatility: "implied_volatility / 100.0", // Convert from percentage to decimal
@@ -302,9 +303,11 @@ COPY (
     END as theta,
 
     -- Data quality flag for analytics filtering
-    -- TRUE = valid for backtesting/analysis (good IV, sufficient time, valid Greeks)
-    -- FALSE = edge case data (IV=0, very short-dated, NaN Greeks)
+    -- STRICT: Requires futures forward price for accurate Greeks
+    -- TRUE = valid for backtesting/analysis (futures price, good IV, sufficient time, valid Greeks)
+    -- FALSE = missing futures data, IV=0, very short-dated, or NaN Greeks
     (
+      ${params.futuresPattern ? 'futures.futures_price IS NOT NULL AND' : 'false AND'}
       opt.implied_volatility > 0
       AND opt.time_to_expiry_years > 0.0027  -- > 1 day
       AND opt.implied_volatility IS NOT NULL

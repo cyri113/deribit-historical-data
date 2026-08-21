@@ -117,10 +117,12 @@ Greeks calculations use **forward prices** from dated futures contracts instead 
 - **Fetches:** Dated futures (e.g., `BTC-10AUG26`) matching option expiries
 - **Storage:** `data/parquet-raw/futures/*.parquet`
 - **Join:** DuckDB ASOF join matches futures trades to option trades by timestamp
-- **Fallback:** Uses spot `index_price` if futures data unavailable
+- **No fallback:** Greeks = NULL if futures data unavailable (strict quality)
 - **Accuracy:** Forward price typically $5-50 different from spot → more accurate Greeks
 
 **Why it matters:** Deribit uses forward prices for Greeks calculations. Using spot price (index_price) instead of forward price can cause delta/gamma errors, especially when futures trade at premium/discount to spot.
+
+**STRICT QUALITY:** Greeks are calculated ONLY when futures forward prices are available. Without futures data, `delta/gamma/vega/theta = NULL` to avoid incorrect calculations with spot prices. This ensures "garbage in = garbage out" principle is enforced.
 
 ## Data Model
 

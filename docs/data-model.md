@@ -52,10 +52,12 @@ Parquet storage formats, relationships, no SQLite database for trade metadata.
 **Generation:** `enrich-with-duckdb BTC` (DuckDB SQL vectorized, 10-100x faster than TypeScript)
 
 **Data Quality Flag (`is_valid`):**
-- `TRUE` = Valid for backtesting/analysis (IV > 0, TTM > 1 day, valid Greeks)
-- `FALSE` = Edge case data (IV=0, very short-dated <1 day, or NaN Greeks)
-- Recommendation: Use `WHERE is_valid = true` for most analytics queries
-- Preserves all data for specialized research (e.g., near-expiry behavior, microstructure)
+- `TRUE` = Valid for backtesting/analysis (has futures forward price, IV > 0, TTM > 1 day, valid Greeks)
+- `FALSE` = Missing futures data, IV=0, very short-dated <1 day, or NaN Greeks
+- **STRICT**: Greeks calculated ONLY with futures forward prices (no fallback to spot index_price)
+- Without futures data: `delta/gamma/vega/theta = NULL`, `is_valid = false`
+- Recommendation: Use `WHERE is_valid = true` for analytics queries
+- All data preserved for audit/research (can see spot price in `index_price` column)
 
 ---
 
