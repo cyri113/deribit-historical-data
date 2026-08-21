@@ -13,6 +13,8 @@ data/
 │   └── volatility/*.parquet         # Historical volatility (BTC.parquet)
 ├── silver/                          # Enriched with Greeks (medallion layer 2)
 │   └── BTC.parquet                  # Single file: all instruments + Greeks
+├── gold/                            # Analytics-ready with trading metrics (medallion layer 3)
+│   └── BTC.parquet                  # Single file: silver + trading metrics
 └── queue.db                         # BunQueue job state (only SQLite)
 ```
 
@@ -84,6 +86,40 @@ Each option trade matched to nearest prior futures trade by timestamp.
 
 ---
 
+## Gold Schema (24 fields = Silver + 3)
+
+**File**: `gold/BTC.parquet` (analytics-ready, all instruments in single file)
+
+**Silver fields (21) + Trading Metrics (3):**
+
+| Field | Type | Source | Description |
+|-------|------|--------|-------------|
+| days_to_expiry | integer | Calculated | Days until expiration at trade time (for DTE filtering: 0DTE, 7DTE, 30DTE) |
+| strike_delta | string | Delta buckets | Categorization: "5-delta", "10-delta", "25-delta", "50-delta", "deep-itm" |
+| vol_regime | string | IV percentile | Volatility environment: "low" (<33%), "mid" (33-67%), "high" (>67%) |
+
+**Trading Metrics Formulas**:
+- `days_to_expiry` = (expiration_timestamp - timestamp) / 86400000 (milliseconds to days)
+- `strike_delta` = CASE buckets based on ABS(delta): ≤0.05, ≤0.10, ≤0.25, ≤0.50, else deep-itm
+- `vol_regime` = PERCENT_RANK over 720-row window (~30 days), then tertile classification
+
+**Use Case**:
+- Strategy backtesting (filter by DTE, delta buckets, vol regimes)
+- Research analysis (regime-based studies)
+- Portfolio analytics (exposure by delta/DTE/regime)
+
+**Recommendation**:
+```sql
+-- Use gold layer for backtesting
+SELECT * FROM 'data/gold/BTC.parquet'
+WHERE is_valid = true
+  AND strike_delta = '25-delta'
+  AND days_to_expiry BETWEEN 7 AND 30
+  AND vol_regime IN ('mid', 'high')
+```
+
+---
+
 ## Data Lifecycle
 
 ```
@@ -121,9 +157,19 @@ Each option trade matched to nearest prior futures trade by timestamp.
    ↓
    Output: silver/BTC.parquet (all instruments, all trades, 21 fields)
 
-3. pipeline BTC
+3. gold BTC
    ↓
-   bronze BTC → silver BTC (sequential)
+   Job: enrich-gold
+     - Single DuckDB SQL query:
+       Read: silver/BTC.parquet (single file)
+       Compute: days_to_expiry, strike_delta, vol_regime
+       Write: gold/BTC.parquet (single file)
+   ↓
+   Output: gold/BTC.parquet (all instruments, all trades, 24 fields)
+
+4. pipeline BTC
+   ↓
+   bronze BTC → silver BTC → gold BTC (sequential)
 ```
 
 ---

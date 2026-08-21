@@ -23,6 +23,7 @@ data/
 ├── bronze/instruments/{ASSET}/*.parquet  # Raw trades
 ├── bronze/futures/*.parquet              # Dated futures
 ├── silver/{ASSET}.parquet                # Enriched with Greeks
+├── gold/{ASSET}.parquet                  # Analytics-ready with trading metrics
 └── queue.db                              # BunQueue state
 ```
 
@@ -31,7 +32,8 @@ data/
 ### CLI (`src/cli/index.ts`)
 - `bronze <currency>` → Enqueues: fetch-instruments, fetch-trades, fetch-dated-futures
 - `silver <currency>` → Enqueues: enrich-duckdb
-- `pipeline <currency>` → Runs bronze + silver sequentially
+- `gold <currency>` → Enqueues: enrich-gold
+- `pipeline <currency>` → Runs bronze + silver + gold sequentially
 - `queue-worker` → Processes jobs from queue.db
 
 ### Application Layer
@@ -42,7 +44,8 @@ data/
 - Write atomically to Parquet
 
 **Analytics:**
-- `DuckDBEnricher` - Single SQL query processes ALL files → single output
+- `DuckDBEnricher` - Single SQL query processes ALL files → single output (silver layer)
+- `GoldEnricher` - Adds trading metrics to silver data (gold layer)
 
 ### Domain Layer (Pure Functions)
 - `parseInstrumentName(str)` - Extract strike, expiry, type from filename
@@ -112,6 +115,22 @@ Job: enrich-duckdb
     Write: silver/BTC.parquet (single file, all instruments)
   ↓
 Output: silver/BTC.parquet (894k trades, 21 fields)
+```
+
+### Gold Pipeline
+
+```
+gold BTC
+  ↓
+Job: enrich-gold
+  DuckDB single SQL query:
+    Read: silver/BTC.parquet (single file, 21 fields)
+    Compute: days_to_expiry (integer days until expiration)
+    Compute: strike_delta (5Δ, 10Δ, 25Δ, 50Δ buckets)
+    Compute: vol_regime (low/mid/high via IV percentile)
+    Write: gold/BTC.parquet (single file, all instruments)
+  ↓
+Output: gold/BTC.parquet (894k trades, 24 fields)
 ```
 
 ### ASOF Join (Forward Prices)

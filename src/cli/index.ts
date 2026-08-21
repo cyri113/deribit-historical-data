@@ -3,7 +3,7 @@
 import { DeribitClient } from "../infrastructure/deribit-client.ts";
 import { ParquetStorage } from "../infrastructure/parquet-storage.ts";
 
-const COMMANDS = ["bronze", "silver", "pipeline", "queue-worker", "queue-status", "queue-dashboard", "help"] as const;
+const COMMANDS = ["bronze", "silver", "gold", "pipeline", "queue-worker", "queue-status", "queue-dashboard", "help"] as const;
 type Command = typeof COMMANDS[number];
 
 // Argument parsing
@@ -91,8 +91,22 @@ Commands:
       bun src/cli/index.ts silver BTC
       bun src/cli/index.ts silver ETH --max-memory 8GB --threads 8
 
+  gold <currency> [options]
+    Add trading metrics to silver data (Gold layer)
+    Adds: strike_delta, days_to_expiry, vol_regime
+
+    Options:
+      --input-dir <path>      Input directory for silver Parquet (default: ./data/silver)
+      --output-dir <path>     Output directory for gold Parquet (default: ./data/gold)
+      --max-memory <size>     DuckDB memory limit (default: 4GB)
+      --threads <n>           Number of threads (default: CPU cores)
+
+    Examples:
+      bun src/cli/index.ts gold BTC
+      bun src/cli/index.ts gold ETH --max-memory 8GB
+
   pipeline <currency> [options]
-    Run complete pipeline: bronze → silver (end-to-end)
+    Run complete pipeline: bronze → silver → gold (end-to-end)
 
     Options:
       Same as bronze command
@@ -231,23 +245,60 @@ async function silverCommand(args: string[]) {
   console.log(`  bun src/cli/index.ts queue-dashboard\n`);
 }
 
+async function goldCommand(args: string[]) {
+  const parsed = parseArgs(args);
+
+  if (parsed.positional.length < 1) {
+    console.error("Usage: gold <currency> [--input-dir <path>] [--output-dir <path>] [--max-memory <size>] [--threads <n>]");
+    process.exit(1);
+  }
+
+  const currency = parsed.positional[0]!.toUpperCase();
+  const inputDir = parsed.flags["input-dir"] as string | undefined;
+  const outputDir = parsed.flags["output-dir"] as string | undefined;
+  const maxMemory = parsed.flags["max-memory"] as string | undefined;
+  const threads = parsed.flags["threads"] ? parseInt(parsed.flags["threads"] as string) : undefined;
+
+  console.log(`\n━━━ Gold Layer: ${currency} ━━━\n`);
+
+  const { QueueManager } = await import("../infrastructure/queue.ts");
+  const queue = QueueManager.getQueue();
+
+  const job = await queue.add("enrich-gold", {
+    currency,
+    inputDir,
+    outputDir,
+    maxMemory,
+    threads,
+  });
+
+  console.log(`✓ Enqueued: enrich-gold (${job.id})`);
+  console.log(`\nMonitor progress:`);
+  console.log(`  bun src/cli/index.ts queue-dashboard\n`);
+}
+
 async function pipelineCommand(args: string[]) {
   const parsed = parseArgs(args);
   const currency = parsed.positional[0]!.toUpperCase();
 
-  console.log(`\n━━━ Running Pipeline: ${currency} (Bronze → Silver) ━━━\n`);
+  console.log(`\n━━━ Running Pipeline: ${currency} (Bronze → Silver → Gold) ━━━\n`);
 
   // Step 1: Bronze layer
-  console.log(`📥 Step 1/2: Bronze layer (fetching raw data)...`);
+  console.log(`📥 Step 1/3: Bronze layer (fetching raw data)...`);
   await bronzeCommand(args);
 
   // Step 2: Silver layer
-  console.log(`\n🧮 Step 2/2: Silver layer (enriching with Greeks)...`);
+  console.log(`\n🧮 Step 2/3: Silver layer (enriching with Greeks)...`);
   await silverCommand([currency]);
+
+  // Step 3: Gold layer
+  console.log(`\n📊 Step 3/3: Gold layer (trading metrics)...`);
+  await goldCommand([currency]);
 
   console.log(`\n━━━ Pipeline Complete ━━━`);
   console.log(`Bronze: data/bronze/instruments/${currency}/`);
   console.log(`Silver: data/silver/${currency}.parquet`);
+  console.log(`Gold: data/gold/${currency}.parquet`);
 }
 
 async function queueWorkerCommand() {
@@ -324,6 +375,9 @@ async function main() {
       break;
     case "silver":
       await silverCommand(commandArgs);
+      break;
+    case "gold":
+      await goldCommand(commandArgs);
       break;
     case "pipeline":
       await pipelineCommand(commandArgs);

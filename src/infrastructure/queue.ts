@@ -8,6 +8,7 @@ import { FuturesFetcher } from "../application/fetchers/futures-fetcher.ts";
 import { DeliveryFetcher } from "../application/fetchers/delivery-fetcher.ts";
 import { VolatilityFetcher } from "../application/fetchers/volatility-fetcher.ts";
 import { DuckDBEnricher } from "../application/analytics/duckdb-enricher.ts";
+import { GoldEnricher } from "../application/analytics/gold-enricher.ts";
 import { mkdirSync, existsSync } from "node:fs";
 import { dirname } from "node:path";
 
@@ -60,6 +61,14 @@ export interface FetchDatedFuturesJobData {
 }
 
 export interface EnrichWithDuckDBJobData {
+  currency: string;
+  inputDir?: string;
+  outputDir?: string;
+  maxMemory?: string;
+  threads?: number;
+}
+
+export interface EnrichGoldJobData {
   currency: string;
   inputDir?: string;
   outputDir?: string;
@@ -318,6 +327,25 @@ class QueueManager {
             );
 
             console.log(`✓ Enriched ${result.totalTrades.toLocaleString()} trades`);
+            return result;
+          },
+
+          "enrich-gold": async (job: Job<EnrichGoldJobData>) => {
+            const { currency, inputDir, outputDir, maxMemory, threads } = job.data;
+
+            console.log(`\n📊 Enriching ${currency} with Gold trading metrics...`);
+
+            const enricher = new GoldEnricher();
+
+            const result = await enricher.enrich(
+              currency,
+              inputDir,
+              outputDir,
+              maxMemory,
+              threads
+            );
+
+            console.log(`✓ Enriched ${result.tradeCount.toLocaleString()} trades`);
             return result;
           },
         },
