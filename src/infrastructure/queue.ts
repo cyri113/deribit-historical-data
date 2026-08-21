@@ -173,6 +173,7 @@ export function getWorker(): Worker {
           // Fetch all instruments directly (not via child jobs)
           let totalTrades = 0;
           let completed = 0;
+          let failed = 0;
 
           // Process in batches for concurrency
           const allInstruments = [...futures, ...options];
@@ -180,30 +181,37 @@ export function getWorker(): Worker {
             const batch = allInstruments.slice(i, i + concurrency);
 
             await Promise.all(batch.map(async (instrument) => {
-              if (instrument.kind === "future") {
-                const futureFetcher = new FutureFetcher({
-                  client: deps.client,
-                  parquetStorage: deps.parquetStorage,
-                });
-                const result = await futureFetcher.fetchInstrument(instrument.instrument_name);
-                totalTrades += result.totalTrades;
-              } else {
-                const optionFetcher = new OptionFetcher({
-                  client: deps.client,
-                  parquetStorage: deps.parquetStorage,
-                });
-                const result = await optionFetcher.fetchInstrument(instrument.instrument_name);
-                totalTrades += result.totalTrades;
+              try {
+                if (instrument.kind === "future") {
+                  const futureFetcher = new FutureFetcher({
+                    client: deps.client,
+                    parquetStorage: deps.parquetStorage,
+                  });
+                  const result = await futureFetcher.fetchInstrument(instrument.instrument_name);
+                  totalTrades += result.totalTrades;
+                } else {
+                  const optionFetcher = new OptionFetcher({
+                    client: deps.client,
+                    parquetStorage: deps.parquetStorage,
+                  });
+                  const result = await optionFetcher.fetchInstrument(instrument.instrument_name);
+                  totalTrades += result.totalTrades;
+                }
+                completed++;
+              } catch (error) {
+                failed++;
+                console.error(`✗ Failed to fetch ${instrument.instrument_name}:`, error instanceof Error ? error.message : error);
               }
-              completed++;
-              if (completed % 100 === 0 || completed === allInstruments.length) {
-                console.log(`Progress: ${completed}/${allInstruments.length} instruments (${totalTrades.toLocaleString()} trades)`);
+
+              const total = completed + failed;
+              if (total % 100 === 0 || total === allInstruments.length) {
+                console.log(`Progress: ${total}/${allInstruments.length} instruments (${completed} ok, ${failed} failed, ${totalTrades.toLocaleString()} trades)`);
               }
             }));
           }
 
-          console.log(`✓ Downloaded all ${allInstruments.length} instruments (${totalTrades.toLocaleString()} trades)`);
-          return { instrumentsDownloaded: allInstruments.length, totalTrades };
+          console.log(`✓ Downloaded ${completed}/${allInstruments.length} instruments (${failed} failed, ${totalTrades.toLocaleString()} trades)`);
+          return { instrumentsDownloaded: completed, failed, totalTrades };
         }
 
         case "fetch-future": {
