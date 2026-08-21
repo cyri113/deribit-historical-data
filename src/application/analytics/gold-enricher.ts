@@ -197,7 +197,7 @@ COPY (
     FROM iv_percentiles
   ),
   -- Compute premium collection ratio (requires expected_premium first)
-  final_metrics AS (
+  premium_metrics AS (
     SELECT *,
       -- Premium collection ratio: actual / expected
       CASE
@@ -206,6 +206,38 @@ COPY (
         ELSE NULL
       END as premium_collection_ratio
     FROM execution_metrics
+  ),
+  -- Compute outcome metrics (forward-looking)
+  outcome_metrics AS (
+    SELECT *,
+      -- realized_move_7day: 7-day forward price return
+      (LEAD(futures_price, 168) OVER (
+        PARTITION BY SUBSTRING(instrument_name, 1, 3)
+        ORDER BY timestamp
+      ) - futures_price) / NULLIF(futures_price, 0) as realized_move_7day,
+
+      -- assignment_inferred: Infer assignment from ITM at expiry
+      CASE
+        WHEN days_to_expiry = 0 THEN
+          CASE
+            WHEN option_type = 'call' AND futures_price > strike THEN TRUE
+            WHEN option_type = 'put' AND futures_price < strike THEN TRUE
+            ELSE FALSE
+          END
+        ELSE NULL
+      END as assignment_inferred
+    FROM premium_metrics
+  ),
+  -- Compute days_to_assignment (requires assignment_inferred)
+  final_metrics AS (
+    SELECT *,
+      -- days_to_assignment: Days from entry to assignment (if assigned)
+      CASE
+        WHEN assignment_inferred = TRUE
+        THEN CAST((epoch_ms(expiration_timestamp) - epoch_ms(timestamp)) / (1000.0 * 86400.0) AS INTEGER)
+        ELSE NULL
+      END as days_to_assignment
+    FROM outcome_metrics
   )
   SELECT
     -- All silver layer fields (passthrough)
@@ -283,7 +315,18 @@ COPY (
     actual_premium_collected,
 
     -- premium_collection_ratio: Actual / expected premium (efficiency metric)
-    premium_collection_ratio
+    premium_collection_ratio,
+
+    -- Outcome metrics (what happened)
+
+    -- realized_move_7day: 7-day forward price return
+    realized_move_7day,
+
+    -- assignment_inferred: Binary flag for option assignment
+    assignment_inferred,
+
+    -- days_to_assignment: Holding period until assignment (if assigned)
+    days_to_assignment
 
   FROM final_metrics
 ) TO '${outputPath}' (FORMAT PARQUET);
