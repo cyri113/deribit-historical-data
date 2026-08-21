@@ -387,8 +387,8 @@ async function pipelineCommand(args: string[]) {
   const totalJobs = chain.length;
   let completedJobs = 0;
 
-  await new Promise<void>((resolve) => {
-    worker.on("completed", (job) => {
+  await new Promise<void>((resolve, reject) => {
+    const completedHandler = (job: any) => {
       // Only count jobs from this pipeline (match job names in chain)
       if (chain.some(step => step.name === job.name)) {
         completedJobs++;
@@ -396,22 +396,31 @@ async function pipelineCommand(args: string[]) {
 
         if (completedJobs >= totalJobs) {
           console.log(`\n━━━ Pipeline Complete! ━━━\n`);
+          worker.off("completed", completedHandler);
+          worker.off("failed", failedHandler);
           resolve();
         }
       }
-    });
+    };
 
-    worker.on("failed", (job, error) => {
+    const failedHandler = (job: any, error: Error) => {
       if (chain.some(step => step.name === job.name)) {
         console.error(`\n✗ ${job.name} failed:`, error);
         console.error(`\n━━━ Pipeline Failed ━━━\n`);
-        process.exit(1);
+        worker.off("completed", completedHandler);
+        worker.off("failed", failedHandler);
+        reject(error);
       }
-    });
+    };
+
+    worker.on("completed", completedHandler);
+    worker.on("failed", failedHandler);
   });
 
   await worker.close();
   await queue.close();
+
+  process.exit(0);
 }
 
 async function queueWorkerCommand() {
