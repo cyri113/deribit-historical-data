@@ -280,23 +280,108 @@ async function goldCommand(args: string[]) {
 async function pipelineCommand(args: string[]) {
   const parsed = parseArgs(args);
   const currency = parsed.positional[0]!.toUpperCase();
+  const kindFilter = parsed.flags["kind"] as "option" | "future" | undefined;
+  const concurrency = parsed.flags["concurrency"] ? parseInt(parsed.flags["concurrency"] as string) : 3;
+  const skipDeliveries = parsed.flags["skip-deliveries"] === true;
+  const skipVolatility = parsed.flags["skip-volatility"] === true;
+  const minExpiration = parsed.flags["min-expiration"] as string | undefined;
+  const maxExpiration = parsed.flags["max-expiration"] as string | undefined;
 
   console.log(`\n━━━ Running Pipeline: ${currency} (Bronze → Silver → Gold) ━━━\n`);
 
-  // Step 1: Bronze layer
-  console.log(`📥 Step 1/3: Bronze layer (fetching raw data)...`);
-  await bronzeCommand(args);
+  const { FlowProducer } = await import("bunqueue/client");
+  const flow = new FlowProducer({ embedded: true });
 
-  // Step 2: Silver layer
-  console.log(`\n🧮 Step 2/3: Silver layer (enriching with Greeks)...`);
-  await silverCommand([currency]);
+  console.log(`📋 Creating pipeline flow with job dependencies...\n`);
 
-  // Step 3: Gold layer
-  console.log(`\n📊 Step 3/3: Gold layer (trading metrics)...`);
-  await goldCommand([currency]);
+  // Build pipeline using FlowProducer parent-child relationships
+  // Structure: Silver (parent) waits for all Bronze children to complete
+  //            Gold (parent) waits for Silver to complete
 
-  console.log(`\n━━━ Pipeline jobs enqueued! ━━━`);
-  console.log(`\n⚠️  Note: Jobs are processing in the background via BunQueue.`);
+  // Bronze layer children (run in parallel)
+  const bronzeChildren: any[] = [];
+
+  bronzeChildren.push({
+    name: "fetch-instruments",
+    queueName: "deribit-data",
+    data: {
+      currency,
+      kind: kindFilter,
+      expired: true,
+      minExpiration: minExpiration ? parseDate(minExpiration) : undefined,
+      maxExpiration: maxExpiration ? parseDate(maxExpiration) : undefined,
+    },
+  });
+
+  bronzeChildren.push({
+    name: "fetch-trades",
+    queueName: "deribit-data",
+    data: {
+      currency,
+      kind: kindFilter,
+      expired: true,
+      concurrency,
+      minExpiration: minExpiration ? parseDate(minExpiration) : undefined,
+      maxExpiration: maxExpiration ? parseDate(maxExpiration) : undefined,
+    },
+  });
+
+  bronzeChildren.push({
+    name: "fetch-dated-futures",
+    queueName: "deribit-data",
+    data: {
+      currency,
+      concurrency,
+    },
+  });
+
+  if (!skipDeliveries) {
+    bronzeChildren.push({
+      name: "fetch-deliveries",
+      queueName: "deribit-data",
+      data: {
+        indices: [`${currency.toLowerCase()}_usd`],
+      },
+    });
+  }
+
+  if (!skipVolatility) {
+    bronzeChildren.push({
+      name: "fetch-volatility",
+      queueName: "deribit-data",
+      data: {
+        currencies: [currency],
+      },
+    });
+  }
+
+  // Create flow: Gold (parent) → Silver (parent) → Bronze children
+  const pipelineFlow = await flow.add({
+    name: "enrich-gold",
+    queueName: "deribit-data",
+    data: { currency },
+    children: [
+      {
+        name: "enrich-duckdb",
+        queueName: "deribit-data",
+        data: { currency },
+        children: bronzeChildren,
+      },
+    ],
+  });
+
+  console.log(`\n✓ Created pipeline flow with ${1 + 1 + bronzeChildren.length} jobs:`);
+  console.log(`  Gold (${pipelineFlow.job.id})`);
+  console.log(`    ↳ Silver (${pipelineFlow.children?.[0]?.job.id})`);
+  for (const child of pipelineFlow.children?.[0]?.children || []) {
+    console.log(`        ↳ Bronze: ${child.job.name} (${child.job.id})`);
+  }
+
+  await flow.close();
+
+  console.log(`\n━━━ Pipeline flow created! ━━━`);
+  console.log(`\n⚠️  Jobs execute in order: Bronze → Silver → Gold`);
+  console.log(`   Bronze children run in parallel, Silver waits for all to complete.`);
   console.log(`Monitor progress with:`);
   console.log(`  bun src/cli/index.ts queue-dashboard`);
   console.log(`\nOutput will be at:`);
