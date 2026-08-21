@@ -223,12 +223,12 @@ export function generateBulkGreeksEnrichmentQuery(params: {
     // Without futures data, Greeks will be NULL (garbage in = garbage out)
     // This ensures Greeks are only calculated with correct Black-76 inputs
     forwardPrice: params.futuresPattern
-      ? "futures_price"
+      ? "futures.futures_price"
       : "NULL",  // No futures data = no Greeks calculation
-    strike: "strike",
-    timeToExpiry: "time_to_expiry_years",
-    volatility: "implied_volatility / 100.0", // Convert from percentage to decimal
-    optionType: "option_type",
+    strike: "opt.strike",
+    timeToExpiry: "opt.time_to_expiry_years",
+    volatility: "opt.implied_volatility / 100.0", // Convert from percentage to decimal
+    optionType: "opt.option_type",
   };
 
   const deltaSQL = generateDeltaSQL(greeksParams);
