@@ -163,7 +163,7 @@ COPY (
     -- Gold layer: Trading metrics
 
     -- days_to_expiry: Integer days until expiration (for DTE filtering)
-    CAST((expiration_timestamp::DOUBLE - timestamp::DOUBLE) / (1000.0 * 86400.0) AS INTEGER) as days_to_expiry,
+    CAST((epoch_ms(expiration_timestamp) - epoch_ms(timestamp)) / (1000.0 * 86400.0) AS INTEGER) as days_to_expiry,
 
     -- strike_delta: Categorize by delta buckets (common trading terminology)
     CASE
