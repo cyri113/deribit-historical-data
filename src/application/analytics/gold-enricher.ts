@@ -220,20 +220,33 @@ COPY (
       ) - futures_price) / NULLIF(futures_price, 0) as realized_move_7day
     FROM premium_metrics
   ),
-  -- Compute assignment inference (requires days_to_expiry)
+  -- Get futures price at expiration for each instrument
+  expiration_prices AS (
+    SELECT
+      instrument_name,
+      LAST(futures_price) OVER (
+        PARTITION BY instrument_name
+        ORDER BY timestamp
+        ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+      ) as futures_price_at_expiry
+    FROM outcome_metrics
+  ),
+  -- Compute assignment inference (check ITM at expiration for all trades)
   assignment_metrics AS (
-    SELECT *,
-      -- assignment_inferred: Infer assignment from ITM at expiry
+    SELECT o.*,
+      e.futures_price_at_expiry,
+      -- assignment_inferred: Check if ITM at expiration (for all trades)
       CASE
-        WHEN days_to_expiry = 0 THEN
+        WHEN e.futures_price_at_expiry IS NOT NULL THEN
           CASE
-            WHEN option_type = 'call' AND futures_price > strike THEN TRUE
-            WHEN option_type = 'put' AND futures_price < strike THEN TRUE
+            WHEN o.option_type = 'call' AND e.futures_price_at_expiry > o.strike THEN TRUE
+            WHEN o.option_type = 'put' AND e.futures_price_at_expiry < o.strike THEN TRUE
             ELSE FALSE
           END
         ELSE NULL
       END as assignment_inferred
-    FROM outcome_metrics
+    FROM outcome_metrics o
+    LEFT JOIN expiration_prices e USING (instrument_name)
   ),
   -- Compute days_to_assignment (requires assignment_inferred)
   final_metrics AS (
@@ -325,6 +338,9 @@ COPY (
     premium_collection_ratio,
 
     -- Outcome metrics (what happened)
+
+    -- futures_price_at_expiry: Underlying price at expiration
+    futures_price_at_expiry,
 
     -- realized_move_7day: 7-day forward price return
     realized_move_7day,
