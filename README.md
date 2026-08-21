@@ -8,9 +8,8 @@ Deribit options/futures historical trade data pipeline. TypeScript/Bun, medallio
 
 ```bash
 bun install
-bun src/cli/index.ts queue-worker  # Terminal 1: Start worker
 
-# Terminal 2: Run pipeline
+# Run complete pipeline (single command with live progress)
 bun src/cli/index.ts pipeline BTC --kind option --min-expiration 3m
 # Fetches bronze → enriches silver → adds gold → outputs data/gold/BTC.parquet
 ```
@@ -18,16 +17,18 @@ bun src/cli/index.ts pipeline BTC --kind option --min-expiration 3m
 ## Commands
 
 ```bash
-# Medallion layers
+# Pipeline (recommended - runs all layers sequentially)
+pipeline BTC [--kind option|future] [--min-expiration 3m] [--concurrency 3]
+# Bronze → Silver → Gold with live progress logs
+
+# Individual layers (advanced)
 bronze BTC [--kind option|future] [--min-expiration 3m]  # Fetch raw data
 silver BTC [--max-memory 8GB]                            # Compute Greeks
 gold BTC                                                 # Add trading metrics
-pipeline BTC                                             # Bronze → Silver → Gold
 
-# Queue
-queue-worker      # Process jobs (run in separate terminal)
-queue-dashboard   # Web UI at http://localhost:6790
-queue-status      # CLI status
+# Queue management
+queue-worker      # Start background worker (for bronze/silver/gold commands)
+queue-status      # Show job counts
 ```
 
 ## Storage
@@ -96,12 +97,17 @@ QUALIFY ROW_NUMBER() OVER (PARTITION BY option.trade_id ORDER BY futures.timesta
 - Metadata in filename (parseInstrumentName, no instrument DB)
 - Forward prices from futures (accurate Greeks vs spot price)
 
-**Data Flow:**
+**Data Flow (Pipeline):**
 ```
-bronze BTC → API fetch → bronze/instruments/BTC/*.parquet + bronze/futures/*.parquet
-silver BTC → DuckDB SQL → silver/BTC.parquet (Greeks via vectorized SQL)
-gold BTC → DuckDB SQL → gold/BTC.parquet (trading metrics)
-pipeline BTC → bronze + silver + gold sequentially
+1. fetch-instruments → Get instrument list from API
+2. fetch-trades → Download all option/future trades (9k+ files, batched)
+3. fetch-dated-futures → Scan option files, fetch required futures
+4. fetch-deliveries → Settlement prices (optional)
+5. fetch-volatility → Historical vol data (optional)
+6. enrich-duckdb → Compute Greeks via DuckDB SQL → silver/BTC.parquet
+7. enrich-gold → Add trading metrics → gold/BTC.parquet
+
+Each step waits for previous to complete (sequential waterfall)
 ```
 
 **Performance:**
