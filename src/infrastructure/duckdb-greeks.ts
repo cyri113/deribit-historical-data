@@ -220,7 +220,10 @@ export function generateBulkGreeksEnrichmentQuery(params: {
 }): string {
   const greeksParams = {
     // Use futures forward price if available, fallback to index (spot) price
-    forwardPrice: "COALESCE(futures_price, index_price)",
+    // When no futures data exists, use index_price directly to avoid column not found error
+    forwardPrice: params.futuresPattern
+      ? "COALESCE(futures_price, index_price)"
+      : "index_price",
     strike: "strike",
     timeToExpiry: "time_to_expiry_years",
     volatility: "implied_volatility / 100.0", // Convert from percentage to decimal
