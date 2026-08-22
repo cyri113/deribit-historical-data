@@ -113,7 +113,7 @@ Each option trade matched to nearest prior futures trade by timestamp.
 
 ---
 
-## Gold Schema (38 fields = Silver 21 + Trading Metrics 7 + Execution Quality 6 + Outcome Metrics 4)
+## Gold Schema (39 fields = Silver 21 + Trading Metrics 8 + Execution Quality 6 + Outcome Metrics 4)
 
 **File**: `gold/BTC.parquet` (analytics-ready, all instruments in single file)
 
@@ -135,6 +135,7 @@ bias.
 | strike_delta | string | Delta buckets | Categorization: "5-delta", "10-delta", "25-delta", "50-delta", "deep-itm" |
 | vol_regime | string | IV percentile | Volatility environment: "low" (<33%), "mid" (33-67%), "high" (>67%) based on `iv_percentile_90day`; NULL if `iv_percentile_90day` is NULL |
 | realized_vol_7day | double | Calculated | Trailing 7-calendar-day realized volatility (annualized, percentage, from futures price returns) |
+| deribit_realized_vol | double | `bronze/volatility/{currency}.parquet` | Deribit's own historical volatility reading (index-price-based, hourly cadence), ASOF-joined to the nearest-preceding reading at or before the trade's timestamp. An independent cross-check against `realized_vol_7day` (different price source and windowing) — not a replacement. NULL if no volatility data was fetched for this currency, or before the earliest reading on record |
 | iv_percentile_90day | double | Calculated | Current IV percentile rank vs trailing 90-calendar-day history (0-1 scale); NULL if the window has fewer than 20 trades (see `iv_percentile_sample_size`) |
 | iv_percentile_sample_size | integer | Calculated | Trade count backing `iv_percentile_90day`/`vol_regime` — use to apply a stricter cutoff than the pipeline's built-in 20-trade minimum if needed |
 | iv_minus_rv_gap | double | Calculated | IV - RV spread (volatility risk premium indicator, positive = IV > RV) |

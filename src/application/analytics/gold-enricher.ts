@@ -7,6 +7,7 @@ export interface GoldEnricherConfig {
   inputDir?: string;    // Default: ./data/silver
   outputDir?: string;   // Default: ./data/gold
   deliveryDir?: string; // Default: ./data/bronze/deliveries
+  volatilityDir?: string; // Default: ./data/bronze/volatility
   maxMemory?: string;   // Default: 4GB
   threads?: number;     // Default: CPU cores
 }
@@ -40,6 +41,7 @@ export class GoldEnricher {
   private inputDir: string;
   private outputDir: string;
   private deliveryDir: string;
+  private volatilityDir: string;
   private maxMemory: string;
   private threads?: number;
 
@@ -47,6 +49,7 @@ export class GoldEnricher {
     this.inputDir = config.inputDir ?? "./data/silver";
     this.outputDir = config.outputDir ?? "./data/gold";
     this.deliveryDir = config.deliveryDir ?? "./data/bronze/deliveries";
+    this.volatilityDir = config.volatilityDir ?? "./data/bronze/volatility";
     this.maxMemory = config.maxMemory ?? "4GB";
     this.threads = config.threads;
   }
@@ -115,13 +118,34 @@ export class GoldEnricher {
         console.log(`⚠️  No settlement/delivery data found for ${currency} — outcome_assignment_inferred, outcome_days_to_assignment, and outcome_settlement_price will be NULL (run \`bronze ${currency}\` delivery fetch to populate)`);
       }
 
+      // Deribit's own historical volatility series (index-price-based realized
+      // vol), used as an independent cross-check against this pipeline's own
+      // futures-trade-derived realized_vol_7day -- not a replacement for it.
+      const volatilityFile = join(this.volatilityDir, `${currency}.parquet`);
+      let hasVolatilityData = false;
+      if (existsSync(volatilityFile)) {
+        const volatilityCheck = await executeSQLQuery<{ count: bigint | number }>(
+          `SELECT COUNT(*) as count FROM read_parquet('${volatilityFile}')`
+        );
+        const volatilityCount = typeof volatilityCheck[0]?.count === 'bigint'
+          ? Number(volatilityCheck[0].count)
+          : (volatilityCheck[0]?.count ?? 0);
+        hasVolatilityData = volatilityCount > 0;
+      }
+      if (hasVolatilityData) {
+        console.log(`✓ Found Deribit historical volatility at ${volatilityFile} — deribit_realized_vol will be populated`);
+      } else {
+        console.log(`⚠️  No historical volatility data found for ${currency} — deribit_realized_vol will be NULL (run \`bronze ${currency}\` volatility fetch to populate)`);
+      }
+
       console.log(`\nComputing trading metrics...`);
 
       // Generate and execute gold enrichment SQL
       const sql = this.generateGoldEnrichmentQuery(
         inputFile,
         outputFile,
-        hasDeliveryData ? deliveryFile : undefined
+        hasDeliveryData ? deliveryFile : undefined,
+        hasVolatilityData ? volatilityFile : undefined
       );
       await executeSQLStatement(sql);
 
@@ -157,7 +181,7 @@ export class GoldEnricher {
   /**
    * Generate DuckDB SQL for gold layer enrichment
    */
-  private generateGoldEnrichmentQuery(inputPath: string, outputPath: string, deliveryPath?: string): string {
+  private generateGoldEnrichmentQuery(inputPath: string, outputPath: string, deliveryPath?: string, volatilityPath?: string): string {
     // Black-76 theoretical price for expected_premium, using the same inputs
     // Silver used for Greeks (futures_price as forward, IV/100 as decimal vol).
     // Output is a fraction of the forward price, matching Deribit's inverse-option
@@ -216,6 +240,22 @@ COPY (
     FROM read_parquet('${deliveryPath}')
   ),
   ` : ''}
+  ${volatilityPath ? `
+  -- Deribit's own historical volatility series (index-price-based realized
+  -- vol, hourly cadence). This is a THIRD, independently-computed realized-vol
+  -- signal alongside this pipeline's own trailing-window realized_vol_7day
+  -- (computed below from futures-trade returns) -- kept as a separate
+  -- cross-check column (deribit_realized_vol) rather than replacing
+  -- realized_vol_7day, since the two use different underlying price sources
+  -- (Deribit's index vs. this pipeline's futures trades) and different
+  -- windowing methodology.
+  volatility_readings AS (
+    SELECT
+      timestamp as vol_timestamp,
+      volatility_value
+    FROM read_parquet('${volatilityPath}')
+  ),
+  ` : ''}
   -- Compute price returns for realized volatility, over a genuine trailing
   -- 7-calendar-day window per currency (see time-windowed CTEs below for why
   -- "N PRECEDING rows" is NOT used here).
@@ -264,6 +304,24 @@ COPY (
       ) as actual_premium_collected
     FROM price_returns
   ),
+  ${volatilityPath ? `
+  -- Attach the nearest-preceding Deribit historical volatility reading to
+  -- each trade (ASOF JOIN: currency-agnostic since the volatility file is
+  -- already scoped to this currency). NULL for trades before the earliest
+  -- volatility reading on record.
+  with_deribit_vol AS (
+    SELECT t.*,
+      v.volatility_value as deribit_realized_vol
+    FROM time_windowed t
+    ASOF LEFT JOIN volatility_readings v
+      ON v.vol_timestamp <= t.timestamp
+  ),
+  ` : `
+  with_deribit_vol AS (
+    SELECT *, CAST(NULL AS DOUBLE) as deribit_realized_vol
+    FROM time_windowed
+  ),
+  `}
   -- Compute IV percentiles within a genuine trailing-90-calendar-day window per currency.
   --
   -- A plain PERCENT_RANK() OVER (ORDER BY implied_volatility ROWS BETWEEN N PRECEDING ...)
@@ -336,7 +394,7 @@ COPY (
         ))
       END as iv_percentile_90day,
       h.window_total as iv_percentile_sample_size
-    FROM time_windowed rv
+    FROM with_deribit_vol rv
     LEFT JOIN rolling_iv_hist h
       ON h.currency = rv.currency
       AND h.day = date_trunc('day', rv.timestamp)
@@ -593,8 +651,16 @@ COPY (
 
     -- Market condition metrics (at entry)
 
-    -- realized_vol_7day: trailing 7-calendar-day realized volatility (annualized, in percentage)
+    -- realized_vol_7day: trailing 7-calendar-day realized volatility (annualized, in percentage),
+    -- computed from this pipeline's own futures-trade returns
     realized_vol_7day,
+
+    -- deribit_realized_vol: Deribit's own historical volatility reading (index-price-based,
+    -- hourly cadence), nearest-preceding this trade. An independent cross-check against
+    -- realized_vol_7day above -- NOT a replacement (different price source and windowing).
+    -- NULL if no volatility data was fetched for this currency, or before the earliest
+    -- reading on record.
+    deribit_realized_vol,
 
     -- iv_percentile_90day: Current IV rank vs trailing 90-calendar-day history (0-1)
     iv_percentile_90day,

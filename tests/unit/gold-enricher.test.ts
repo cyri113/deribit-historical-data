@@ -69,6 +69,7 @@ describe("GoldEnricher (executed against real DuckDB with synthetic fixtures)", 
       inputDir: silverDir,
       outputDir: goldDir,
       deliveryDir,
+      volatilityDir: join(workDir, "no-volatility-for-main-fixture"), // does not exist; isolate from repo's real ./data/bronze/volatility
     });
     await enricher.initialize();
     await enricher.enrichCurrency("BTC");
@@ -246,5 +247,79 @@ describe("GoldEnricher (executed against real DuckDB with synthetic fixtures)", 
       expect(row.iv_percentile_90day).toBeNull();
       expect(row.vol_regime).toBeNull();
     }
+  });
+
+  test("deribit_realized_vol is NULL when no historical volatility data exists", async () => {
+    const noVolatilityDir = join(workDir, "no-volatility"); // does not exist
+    const goldNoVolDir = join(workDir, "gold-no-volatility");
+    const enricher = new GoldEnricher({
+      inputDir: silverDir,
+      outputDir: goldNoVolDir,
+      deliveryDir,
+      volatilityDir: noVolatilityDir,
+    });
+    await enricher.initialize();
+    await enricher.enrichCurrency("BTC");
+    await enricher.cleanup();
+
+    await initializeDuckDB();
+    const rows = await executeSQLQuery<{ deribit_realized_vol: number | null }>(`
+      SELECT deribit_realized_vol FROM read_parquet('${join(goldNoVolDir, "BTC.parquet")}')
+    `);
+    await closeDuckDB();
+
+    expect(rows.length).toBeGreaterThan(0);
+    for (const row of rows) {
+      expect(row.deribit_realized_vol).toBeNull();
+    }
+  });
+
+  test("deribit_realized_vol is populated via ASOF (nearest-preceding) join to Deribit's historical volatility series", async () => {
+    const volatilityDir = join(workDir, "volatility");
+    mkdirSync(volatilityDir, { recursive: true });
+
+    // Readings straddle the fixture's trades (2023-12-25 through 2023-12-31).
+    // Each trade should pick up the latest reading at or before its own timestamp.
+    await initializeDuckDB();
+    await executeSQLStatement(`
+      COPY (
+        SELECT * FROM (VALUES
+          (TIMESTAMP '2023-12-24 00:00:00', CAST(50.0 AS DOUBLE)),
+          (TIMESTAMP '2023-12-26 00:00:00', CAST(55.0 AS DOUBLE)),
+          (TIMESTAMP '2023-12-29 00:00:00', CAST(60.0 AS DOUBLE))
+        ) AS t(timestamp, volatility_value)
+      ) TO '${join(volatilityDir, "BTC.parquet")}' (FORMAT PARQUET)
+    `);
+    await closeDuckDB();
+
+    const goldWithVolDir = join(workDir, "gold-with-vol");
+    const enricher = new GoldEnricher({
+      inputDir: silverDir,
+      outputDir: goldWithVolDir,
+      deliveryDir,
+      volatilityDir,
+    });
+    await enricher.initialize();
+    await enricher.enrichCurrency("BTC");
+    await enricher.cleanup();
+
+    await initializeDuckDB();
+    const rows = await executeSQLQuery<{
+      trade_id: string;
+      timestamp: string;
+      deribit_realized_vol: number | null;
+    }>(`
+      SELECT trade_id, timestamp, deribit_realized_vol
+      FROM read_parquet('${join(goldWithVolDir, "BTC.parquet")}')
+      ORDER BY timestamp
+    `);
+    await closeDuckDB();
+
+    // t1 @ 2023-12-25 -> nearest-preceding reading is 2023-12-24 (50.0)
+    expect(rows.find(r => r.trade_id === "t1")!.deribit_realized_vol).toBe(50.0);
+    // t2 @ 2023-12-27 -> nearest-preceding reading is 2023-12-26 (55.0)
+    expect(rows.find(r => r.trade_id === "t2")!.deribit_realized_vol).toBe(55.0);
+    // t3 @ 2023-12-30 -> nearest-preceding reading is 2023-12-29 (60.0)
+    expect(rows.find(r => r.trade_id === "t3")!.deribit_realized_vol).toBe(60.0);
   });
 });
