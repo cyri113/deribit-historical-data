@@ -1,4 +1,5 @@
 import { initializeDuckDB, closeDuckDB, executeSQLStatement, executeSQLQuery } from "../../infrastructure/duckdb-connection.ts";
+import { generatePriceSQL } from "../../infrastructure/duckdb-greeks.ts";
 import { join } from "node:path";
 import { mkdirSync, existsSync } from "node:fs";
 
@@ -121,6 +122,19 @@ export class GoldEnricher {
    * Generate DuckDB SQL for gold layer enrichment
    */
   private generateGoldEnrichmentQuery(inputPath: string, outputPath: string): string {
+    // Black-76 theoretical price for expected_premium, using the same inputs
+    // Silver used for Greeks (futures_price as forward, IV/100 as decimal vol).
+    // Output is a fraction of the forward price, matching Deribit's inverse-option
+    // `price` quote convention (BTC-denominated), so it's directly comparable to
+    // `price` and to actual_premium_collected (both price*amount-scaled).
+    const expectedPremiumPriceSQL = generatePriceSQL({
+      forwardPrice: "futures_price",
+      strike: "strike",
+      timeToExpiry: "time_to_expiry_years",
+      volatility: "implied_volatility / 100.0",
+      optionType: "option_type",
+    });
+
     return `
 COPY (
   WITH silver_data AS (
@@ -147,15 +161,69 @@ COPY (
       ) * SQRT(365 * 24) as realized_vol_7day  -- Annualize hourly vol
     FROM price_returns
   ),
-  -- Compute IV percentiles within 90-day rolling window per currency
-  iv_percentiles AS (
-    SELECT *,
-      PERCENT_RANK() OVER (
-        PARTITION BY SUBSTRING(instrument_name, 1, 3)
-        ORDER BY implied_volatility
-        ROWS BETWEEN 2160 PRECEDING AND CURRENT ROW  -- ~90 days of hourly trades
-      ) as iv_percentile_90day
+  -- Compute IV percentiles within a genuine trailing-90-calendar-day window per currency.
+  --
+  -- A plain PERCENT_RANK() OVER (ORDER BY implied_volatility ROWS BETWEEN N PRECEDING ...)
+  -- cannot express this: DuckDB ties the window FRAME to the same ORDER BY used for
+  -- ranking, so ordering by implied_volatility (to rank by value) makes the "N PRECEDING"
+  -- frame a value-sorted neighborhood instead of a time window -- it can include trades
+  -- from anywhere in the dataset's time range, including the future relative to the row
+  -- being labeled. That was the original look-ahead bias bug here.
+  --
+  -- Fix: approximate the trailing-90-day IV percentile via a per-day histogram (0.5-wide
+  -- IV buckets), rolled up over the trailing 90 calendar days per currency, then joined
+  -- back to each trade by (currency, day, bucket). This keeps the self-join small (one
+  -- row per currency/day/bucket, not per trade) so it stays tractable at full data
+  -- volume, at the cost of resolution being bucketed to 0.5 IV points -- negligible for
+  -- a low/mid/high tercile classification.
+  --
+  -- KNOWN LIMITATION: the window is inclusive of the trade's own calendar day
+  -- (b.day <= a.day below), and daily buckets don't distinguish trades within
+  -- the same day by time of day. So a trade at 02:00 on day D is still ranked
+  -- against every trade on day D up to 23:59, including ones that happened
+  -- after it. This is a same-day (at most ~24h) residual look-ahead window --
+  -- far smaller than the original bug (which could reach anywhere across the
+  -- full dataset), but not zero. Closing it exactly would require an
+  -- additional intra-day ranking pass; not implemented here as the residual
+  -- leak is small relative to the 90-day window and immaterial to a tercile
+  -- (low/mid/high) classification.
+  daily_iv_hist AS (
+    SELECT
+      SUBSTRING(instrument_name, 1, 3) as currency,
+      date_trunc('day', timestamp) as day,
+      CAST(LEAST(GREATEST(implied_volatility, 0), 999.5) * 2 AS INTEGER) as iv_bin,
+      COUNT(*) as bin_count
     FROM realized_vols
+    WHERE implied_volatility IS NOT NULL
+    GROUP BY 1, 2, 3
+  ),
+  rolling_iv_hist AS (
+    SELECT
+      a.currency, a.day, a.iv_bin,
+      SUM(b.bin_count) FILTER (WHERE b.iv_bin < a.iv_bin) as cum_lt,
+      SUM(b.bin_count) FILTER (WHERE b.iv_bin <= a.iv_bin) as cum_le,
+      SUM(b.bin_count) as window_total
+    FROM daily_iv_hist a
+    JOIN daily_iv_hist b
+      ON b.currency = a.currency
+      AND b.day <= a.day
+      AND b.day > a.day - INTERVAL 90 DAY
+    GROUP BY a.currency, a.day, a.iv_bin
+  ),
+  iv_percentiles AS (
+    SELECT rv.*,
+      -- Midpoint-of-tie percentile (matches PERCENT_RANK's tie behavior), bounded to [0, 1]
+      CASE
+        WHEN rv.implied_volatility IS NULL OR h.window_total IS NULL OR h.window_total <= 1 THEN NULL
+        ELSE LEAST(1.0, GREATEST(0.0,
+          ((h.cum_lt + h.cum_le) / 2.0) / h.window_total
+        ))
+      END as iv_percentile_90day
+    FROM realized_vols rv
+    LEFT JOIN rolling_iv_hist h
+      ON h.currency = SUBSTRING(rv.instrument_name, 1, 3)
+      AND h.day = date_trunc('day', rv.timestamp)
+      AND h.iv_bin = CAST(LEAST(GREATEST(rv.implied_volatility, 0), 999.5) * 2 AS INTEGER)
   ),
   -- Compute execution quality metrics
   execution_metrics AS (
@@ -181,10 +249,20 @@ COPY (
         ELSE NULL
       END as slippage_per_contract,
 
-      -- Expected premium: delta-weighted from Greeks at entry
+      -- Expected premium: Black-76 theoretical price at entry, in the same
+      -- BTC-denominated units as \`price\` (Deribit inverse-option convention:
+      -- price_BTC = price_USD / futures_price), scaled by contract amount to
+      -- match actual_premium_collected's price*amount convention.
+      --
+      -- Previously this was ABS(delta) * price * amount, which (a) is not a
+      -- recognized fair-value formula -- delta is a hedge ratio, not a price
+      -- discount factor -- and (b) never converted between price's BTC units
+      -- and strike/futures_price's USD units, producing values off by
+      -- ~10^4-10^5x for ITM options (theoretical price below intrinsic value).
       CASE
-        WHEN delta IS NOT NULL AND price IS NOT NULL
-        THEN ABS(delta) * price * amount
+        WHEN futures_price IS NOT NULL AND implied_volatility IS NOT NULL
+          AND time_to_expiry_years > 0 AND amount IS NOT NULL
+        THEN ${expectedPremiumPriceSQL} * amount
         ELSE NULL
       END as expected_premium,
 

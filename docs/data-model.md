@@ -106,7 +106,8 @@ Each option trade matched to nearest prior futures trade by timestamp.
 - `strike_delta` = CASE buckets based on ABS(delta): ≤0.05, ≤0.10, ≤0.25, ≤0.50, else deep-itm
 - `vol_regime` = PERCENT_RANK over 2160-row window (~90 days of hourly trades), then tertile classification
 - `realized_vol_7day` = STDDEV(log_returns) over 168-hour window × √(365×24) - annualized percentage
-- `iv_percentile_90day` = PERCENT_RANK over 90-day window (0 = lowest IV in 90 days, 1 = highest)
+- `iv_percentile_90day` = trailing 90-calendar-day IV percentile (0 = lowest IV in 90 days, 1 = highest), computed via a per-currency/per-day 0.5-wide IV histogram rolled up over the trailing 90 days and joined back to each trade — not a plain `PERCENT_RANK() OVER (ORDER BY implied_volatility ROWS BETWEEN N PRECEDING)`, which ties its window frame to the value-ordering and can look ahead in time (see `gold-enricher.ts` for details)
+- `expected_premium` = Black-76 theoretical price (via `generatePriceSQL`) at entry — F=futures_price, K=strike, T=time_to_expiry_years, σ=implied_volatility/100 — converted to BTC-denominated units (÷ futures_price, matching Deribit's inverse-option `price` convention) and scaled by `amount`; NULL if futures_price, implied_volatility, or amount missing, or time_to_expiry_years ≤ 0
 - `iv_minus_rv_gap` = implied_volatility - realized_vol_7day (NULL if no RV data)
 
 **Use Case**:

@@ -5,7 +5,9 @@ import {
   generateVegaSQL,
   generateThetaSQL,
   generateGreeksEnrichmentQuery,
+  generatePriceSQL,
 } from "../../src/infrastructure/duckdb-greeks.ts";
+import { initializeDuckDB, executeSQLQuery, closeDuckDB } from "../../src/infrastructure/duckdb-connection.ts";
 
 describe("DuckDB Greeks SQL Generation", () => {
   const testParams = {
@@ -168,5 +170,74 @@ describe("DuckDB Greeks SQL Generation", () => {
 
     // Should divide implied volatility by 100
     expect(query).toContain("implied_volatility / 100.0");
+  });
+
+  test("generatePriceSQL produces valid SQL", () => {
+    const sql = generatePriceSQL(testParams);
+
+    expect(sql).toContain("CASE");
+    expect(sql).toContain("WHEN");
+    expect(sql).toContain("END");
+    expect(sql).toContain("index_price");
+    expect(sql).toContain("strike");
+    expect(sql).toContain("time_to_expiry_years");
+    expect(sql).toContain("implied_volatility");
+    expect(sql).toContain("'call'");
+
+    // Should handle time to expiry = 0 with an intrinsic-value fallback
+    expect(sql).toContain("<= 0");
+
+    // Should normalize to a fraction of the forward price (Deribit inverse-option convention)
+    expect(sql).toContain("/ index_price");
+  });
+});
+
+describe("Black-76 price correctness (executed against real DuckDB)", () => {
+  test("theoretical price is never below intrinsic value (regression for expected_premium bug)", async () => {
+    await initializeDuckDB();
+
+    const priceSQL = generatePriceSQL({
+      forwardPrice: "F",
+      strike: "K",
+      timeToExpiry: "T",
+      volatility: "sigma",
+      optionType: "opt_type",
+    });
+
+    // A deep-ITM call: F=110000, K=20000, high IV, short-dated -- the case that
+    // previously produced expected_premium ~64,000x below intrinsic value.
+    const rows = await executeSQLQuery<{ price_frac: number }>(`
+      SELECT (${priceSQL}) as price_frac
+      FROM (SELECT 110000.0 as F, 20000.0 as K, 0.005 as T, 0.65 as sigma, 'call' as opt_type)
+    `);
+
+    const priceUsd = rows[0]!.price_frac * 110000.0;
+    const intrinsicUsd = 110000.0 - 20000.0;
+
+    expect(priceUsd).toBeGreaterThanOrEqual(intrinsicUsd);
+
+    await closeDuckDB();
+  });
+
+  test("theoretical price matches intrinsic value at expiry (T=0)", async () => {
+    await initializeDuckDB();
+
+    const priceSQL = generatePriceSQL({
+      forwardPrice: "F",
+      strike: "K",
+      timeToExpiry: "T",
+      volatility: "sigma",
+      optionType: "opt_type",
+    });
+
+    const rows = await executeSQLQuery<{ price_frac: number }>(`
+      SELECT (${priceSQL}) as price_frac
+      FROM (SELECT 66000.0 as F, 60000.0 as K, 0.0 as T, 0.5 as sigma, 'put' as opt_type)
+    `);
+
+    // Put at expiry, F > K: worthless
+    expect(rows[0]!.price_frac).toBeCloseTo(0, 5);
+
+    await closeDuckDB();
   });
 });

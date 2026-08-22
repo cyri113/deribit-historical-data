@@ -208,6 +208,54 @@ END
 }
 
 /**
+ * Generate SQL for Black-76 theoretical option price, expressed as a fraction
+ * of the forward price (i.e. in the same BTC-denominated units Deribit quotes
+ * `price` in for inverse options: price_BTC = price_USD / F).
+ *
+ * Call = [F*N(d1) - K*N(d2)] / F
+ * Put  = [K*N(-d2) - F*N(-d1)] / F
+ */
+export function generatePriceSQL(params: {
+  forwardPrice: string;
+  strike: string;
+  timeToExpiry: string;
+  volatility: string;
+  optionType: string;
+}): string {
+  const d1 = D1_SQL
+    .replace(/{forward_price}/g, params.forwardPrice)
+    .replace(/{strike}/g, params.strike)
+    .replace(/{time_to_expiry}/g, params.timeToExpiry)
+    .replace(/{volatility}/g, params.volatility);
+
+  const d2 = D2_SQL
+    .replace(/{d1}/g, `(${d1})`)
+    .replace(/{volatility}/g, params.volatility)
+    .replace(/{time_to_expiry}/g, params.timeToExpiry);
+
+  const cdfD1 = NORMAL_CDF_SQL.replace(/{x}/g, `(${d1})`);
+  const cdfD2 = NORMAL_CDF_SQL.replace(/{x}/g, `(${d2})`);
+  const cdfMinusD1 = NORMAL_CDF_SQL.replace(/{x}/g, `-(${d1})`);
+  const cdfMinusD2 = NORMAL_CDF_SQL.replace(/{x}/g, `-(${d2})`);
+
+  return `
+CASE
+  WHEN ${params.timeToExpiry} <= 0 THEN
+    CASE
+      WHEN ${params.optionType} = 'call' THEN
+        greatest(${params.forwardPrice} - ${params.strike}, 0.0) / ${params.forwardPrice}
+      ELSE
+        greatest(${params.strike} - ${params.forwardPrice}, 0.0) / ${params.forwardPrice}
+    END
+  WHEN ${params.optionType} = 'call' THEN
+    (${params.forwardPrice} * ${cdfD1} - ${params.strike} * ${cdfD2}) / ${params.forwardPrice}
+  ELSE
+    (${params.strike} * ${cdfMinusD2} - ${params.forwardPrice} * ${cdfMinusD1}) / ${params.forwardPrice}
+END
+`;
+}
+
+/**
  * Generate bulk enrichment query for all instruments in a currency
  * Reads ALL Parquet files at once, computes Greeks in single vectorized pass
  *
