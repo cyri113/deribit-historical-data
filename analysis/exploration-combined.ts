@@ -20,6 +20,17 @@
  * exploration-early-close.ts, same look-ahead-safe logic), same margin
  * sizing/utilization/delta targets throughout.
  *
+ * FIX (see exploration-early-close.ts header for full detail): the early-
+ * close buyback now fills at the crossing row's real traded `price`, not
+ * `mark_price` -- mark_price is Deribit's fair-value reference, not a
+ * tradable quote, and deviates from real price by double- to quadruple-
+ * digit percentages at the near-worthless premium levels this trigger
+ * fires on (confirmed: avg 148% relative deviation across this backtest's
+ * 283 crossings, though the dollar impact per leg is small since absolute
+ * premiums are near Deribit's 0.0001 BTC tick floor). This changed the
+ * reported combined APR from 21.82% (flawed) to a fixed value -- rerun to
+ * see the corrected number logged below.
+ *
  * Run with: bun analysis/exploration-combined.ts
  */
 import { initializeDuckDB, executeSQLQuery, closeDuckDB } from "../src/infrastructure/duckdb-connection.ts";
@@ -171,8 +182,12 @@ async function main() {
     let earlyClosedCount = 0;
     let earlyClosedPnl = 0;
     for (const leg of legs) {
-      const crossing = await executeSQLQuery<{ mark_price: number }>(`
-        SELECT mark_price
+      // mark_price detects the trigger (what a trader would monitor in real
+      // time); the fill uses that same row's real executed `price` -- mark_price
+      // is Deribit's fair-value reference, not a tradable quote, and can deviate
+      // from real price by 10s-to-1000s of percent for near-worthless options.
+      const crossing = await executeSQLQuery<{ mark_price: number; price: number }>(`
+        SELECT mark_price, price
         FROM read_parquet('${GOLD_PATH}')
         WHERE is_valid = true AND instrument_name = '${leg.instrument}'
           AND timestamp < TIMESTAMP '${expIso}'
@@ -180,7 +195,7 @@ async function main() {
         ORDER BY timestamp ASC LIMIT 1
       `);
       if (crossing.length === 0) continue;
-      const buybackCostUsd = crossing[0]!.mark_price * leg.amount * futuresPriceAtEntry;
+      const buybackCostUsd = crossing[0]!.price * leg.amount * futuresPriceAtEntry;
       const legPnl = leg.entryPremiumUsd - buybackCostUsd;
       available += leg.marginUsd - buybackCostUsd;
       (leg as any).__closedEarly = true;
@@ -221,7 +236,7 @@ async function main() {
   console.log(`APR: ${(apr * 100).toFixed(2)}%`);
   console.log(`\nBASELINE (v4): 10.13% APR`);
   console.log(`DAILY ENTRY ALONE: 21.04% APR (+10.91pp)`);
-  console.log(`EARLY CLOSE ALONE: 24.64% APR (+14.51pp)`);
+  console.log(`EARLY CLOSE ALONE: 24.39% APR (+14.26pp) -- from exploration-early-close.ts, real-price fill`);
   console.log(`COMBINED (daily entry + early close): ${(apr * 100).toFixed(2)}%`);
   console.log(`Delta vs baseline: ${((apr - 0.1013) * 100).toFixed(2)}pp`);
   console.log(`Naive sum would predict: ${(10.13 + 10.91 + 14.51).toFixed(2)}%`);
