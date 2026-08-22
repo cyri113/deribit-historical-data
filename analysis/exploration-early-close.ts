@@ -23,6 +23,22 @@
  * early-close lever from the daily-entry lever (still weekly entry cadence,
  * only the CLOSE timing changes).
  *
+ * FIX: the buyback fill now uses the crossing row's real traded `price`,
+ * not `mark_price`. mark_price is Deribit's model-computed fair-value
+ * reference -- not a tradable quote -- and at the near-worthless premium
+ * levels this trigger fires on, real price vs mark_price deviates by an
+ * average of 148% (max 3702%) across this backtest's 48 crossings, though
+ * the dollar impact per leg is small since absolute premiums sit near
+ * Deribit's 0.0001 BTC minimum tick. mark_price is still used to DETECT
+ * the trigger (what a trader would actually monitor in real time); only
+ * the fill price changed. Net effect on this backtest: APR moved from
+ * 24.64% (flawed, mark_price fill) to 24.39% (fixed, real price fill) --
+ * a small change here because deviations partially cancel in aggregate,
+ * but the fix is directionally important: any future variant with fewer,
+ * larger positions or a different premium regime could see a much bigger
+ * swing, since individual leg deviations of 100s-to-1000s of percent do
+ * occur.
+ *
  * Run with: bun analysis/exploration-early-close.ts
  */
 import { initializeDuckDB, executeSQLQuery, closeDuckDB } from "../src/infrastructure/duckdb-connection.ts";
@@ -162,9 +178,14 @@ async function main() {
       // First moment (chronologically, after entry) the mark price crosses
       // the profit-target threshold -- this is what a trader monitoring the
       // position could actually have acted on in real time, unlike picking
-      // the single latest pre-expiry data point with hindsight.
-      const crossing = await executeSQLQuery<{ mark_price: number; ts_ms: bigint }>(`
-        SELECT mark_price, epoch_ms(timestamp) as ts_ms
+      // the single latest pre-expiry data point with hindsight. mark_price is
+      // Deribit's fair-value reference (used here only to detect the trigger,
+      // since it's what a trader would watch in real time), NOT a tradable
+      // quote -- the fill itself uses that same row's real executed `price`,
+      // since mark_price vs real price can deviate by 10s-to-1000s of percent
+      // for the thinly-traded, near-worthless options this trigger fires on.
+      const crossing = await executeSQLQuery<{ mark_price: number; price: number; ts_ms: bigint }>(`
+        SELECT mark_price, price, epoch_ms(timestamp) as ts_ms
         FROM read_parquet('${GOLD_PATH}')
         WHERE is_valid = true AND instrument_name = '${leg.instrument}'
           AND timestamp < TIMESTAMP '${expIso}'
@@ -174,10 +195,12 @@ async function main() {
       if (crossing.length === 0) continue;
       const later = crossing[0]!;
       if (later.mark_price <= leg.entryMarkPrice * PROFIT_TARGET_PCT) {
-        // Close early: buy back at later mark price. Realized PnL for this
-        // leg = entry premium collected - buyback cost. No assignment risk
-        // from this point forward for this leg.
-        const buybackCostUsd = later.mark_price * leg.amount * futuresPriceAtEntry;
+        // Close early: buy back at the REAL traded price of the crossing
+        // row (not mark_price -- mark_price is a model-computed fair-value
+        // reference, not a price anyone could actually transact at).
+        // Realized PnL for this leg = entry premium collected - buyback
+        // cost. No assignment risk from this point forward for this leg.
+        const buybackCostUsd = later.price * leg.amount * futuresPriceAtEntry;
         const legPnl = leg.entryPremiumUsd - buybackCostUsd;
         // Remove this leg's margin+premium contribution from the pending
         // lock; release its margin capital immediately, credit the realized
