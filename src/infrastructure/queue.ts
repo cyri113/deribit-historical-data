@@ -349,17 +349,39 @@ export function getWorker(): Worker {
           const datedFutures = fetcher.extractDatedFutures(optionInstruments);
           console.log(`Found ${datedFutures.length} unique dated futures contracts`);
 
-          // Fetch each dated futures contract
+          // Fetch each dated futures contract. A single bad/nonexistent
+          // contract name (e.g. an expiry format Deribit's API rejects with
+          // a fatal 400, confirmed to happen in practice) must not abort
+          // the whole batch -- missing one futures contract only means
+          // Greeks are unavailable (is_valid=false) for that one expiry's
+          // options, which is already the correct, visible degradation
+          // mode; it should not block every other expiry's forward prices
+          // from being fetched. Mirrors the fetch-trades fix: collect named
+          // failures instead of swallowing a bare count, but do NOT throw
+          // on partial failure here -- unlike a fully-missing option
+          // instrument's trade history (a real gap in the dataset),
+          // futures-contract failures are individually recoverable by
+          // re-running this job, and other currencies/expiries' Greeks
+          // must not be held hostage by one bad contract.
           let totalTrades = 0;
+          const failedFutures: string[] = [];
           for (const futuresInstrument of datedFutures) {
-            const result = await fetcher.fetchInstrument(futuresInstrument);
-            if (!result.skipped) {
-              totalTrades += result.totalTrades;
+            try {
+              const result = await fetcher.fetchInstrument(futuresInstrument);
+              if (!result.skipped) {
+                totalTrades += result.totalTrades;
+              }
+            } catch (error) {
+              failedFutures.push(futuresInstrument);
+              console.error(`✗ Failed to fetch futures ${futuresInstrument}:`, error instanceof Error ? error.message : error);
             }
           }
 
           console.log(`✓ Fetched ${totalTrades.toLocaleString()} futures trades`);
-          return { currency, totalTrades, futuresCount: datedFutures.length };
+          if (failedFutures.length > 0) {
+            console.log(`⚠️  ${failedFutures.length}/${datedFutures.length} dated futures contracts failed: ${failedFutures.slice(0, 20).join(", ")}${failedFutures.length > 20 ? ` (+${failedFutures.length - 20} more)` : ""}`);
+          }
+          return { currency, totalTrades, futuresCount: datedFutures.length, failedFutures };
         }
 
         case "enrich-duckdb": {

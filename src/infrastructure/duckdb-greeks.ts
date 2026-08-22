@@ -256,122 +256,274 @@ END
 }
 
 /**
+ * Maximum age (in hours) a matched futures trade may be relative to the
+ * option trade it's being used as a forward price for. The ASOF join always
+ * finds the nearest futures trade AT OR BEFORE the option trade -- for an
+ * illiquid dated-futures contract that "nearest prior" trade can genuinely
+ * be very old (observed up to ~1.42 days on real production data, with a
+ * p90 of ~2 hours). A stale forward price silently degrades every Greek fed
+ * from it while still being labeled `is_valid = true`, since staleness was
+ * previously unchecked. 1 hour was chosen to cut off the long tail (which
+ * starts past the p90) while keeping the bulk of matches (median gap in
+ * practice is ~4 minutes).
+ */
+const MAX_FUTURES_STALENESS_HOURS = 1;
+
+/**
  * Generate bulk enrichment query for all instruments in a currency
  * Reads ALL Parquet files at once, computes Greeks in single vectorized pass
  *
- * NEW: Joins with dated futures to get forward prices for accurate Greeks
+ * Joins with dated futures to get forward prices for accurate Greeks.
+ *
+ * Design notes (see also design-decisions.md and data-model.md):
+ *
+ * - ASOF JOIN, not a manual LEFT JOIN + QUALIFY ROW_NUMBER(): the latter
+ *   forces DuckDB's planner to materialize the full (option, futures)
+ *   inequality cross-product per shared expiry before filtering it down --
+ *   confirmed via EXPLAIN ANALYZE on real data to produce over 1 BILLION
+ *   intermediate rows from 4.58M options x 673K futures, accounting for the
+ *   large majority of the query's wall-clock time. ASOF JOIN is a genuine
+ *   sort-merge built for exactly this "nearest match at-or-before" pattern
+ *   and is dramatically faster for identical semantics (~15x faster in a
+ *   direct comparison on this dataset: ~18s -> ~1.2s for the join alone).
+ *
+ * - The futures side is deduplicated to one row per (instrument, timestamp)
+ *   before the ASOF join, keeping the highest trade_seq on ties. This is
+ *   necessary, not cosmetic: ~12.5% of (instrument, timestamp) pairs in the
+ *   real futures dataset have multiple trades at the exact same recorded
+ *   timestamp (same-microsecond fills). The previous manual join's
+ *   `ORDER BY futures_timestamp DESC` had no secondary sort key, so its
+ *   tie-break was DuckDB-implementation-defined and undocumented; DuckDB's
+ *   native ASOF JOIN operator also has no documented tie-break behavior and
+ *   (per DuckDB's own ASOF-join grammar) supports only a single inequality
+ *   predicate, so it cannot express a secondary sort key itself. Resolving
+ *   ties deterministically via trade_seq (the highest, i.e. most recently
+ *   executed, trade at that timestamp) BEFORE the join is the documented
+ *   DuckDB-idiomatic pattern for this and makes the choice explicit rather
+ *   than accidental.
+ *
+ * - A staleness cap (MAX_FUTURES_STALENESS_HOURS) is applied as a filter
+ *   AFTER the ASOF join, not as part of the join's ON clause: DuckDB's ASOF
+ *   JOIN implementation only accepts one inequality condition in the ON
+ *   clause (a second inequality there triggers an internal DuckDB error,
+ *   confirmed directly), so a staleness bound has to be expressed as a
+ *   post-join filter instead.
  */
 export function generateBulkGreeksEnrichmentQuery(params: {
   inputPattern: string;       // e.g., 'data/parquet-raw/BTC/*.parquet'
   futuresPattern?: string;    // e.g., 'data/parquet-raw/futures/BTC-*.parquet'
   outputPath: string;         // e.g., 'data/parquet-duckdb/BTC.parquet'
 }): string {
-  const greeksParams = {
-    // STRICT: Use futures forward price ONLY (no fallback to spot)
-    // Without futures data, Greeks will be NULL (garbage in = garbage out)
-    // This ensures Greeks are only calculated with correct Black-76 inputs
-    forwardPrice: params.futuresPattern
-      ? "futures.futures_price"
-      : "NULL",  // No futures data = no Greeks calculation
-    strike: "opt.strike",
-    timeToExpiry: "opt.time_to_expiry_years",
-    volatility: "opt.implied_volatility / 100.0", // Convert from percentage to decimal
-    optionType: "opt.option_type",
-  };
+  // d1 and the four normal-distribution values every Greek needs (N(d1),
+  // N(-d1), N'(d1)) are computed ONCE per row here, then referenced by name
+  // in the Greek formulas below -- rather than each Greek independently
+  // re-expanding D1_SQL/NORMAL_CDF_SQL/NORMAL_PDF_SQL inline (as
+  // generateDeltaSQL/generateGammaSQL/generateVegaSQL/generateThetaSQL do
+  // when used standalone). At 4.58M rows, redundantly evaluating ln/exp/sqrt
+  // 4-6x per row instead of once is real, measurable waste; DuckDB does not
+  // perform common-subexpression elimination across these syntactically
+  // separate (if textually identical) CASE expressions.
+  //
+  // The formulas themselves are unchanged from generateDeltaSQL etc. -- see
+  // those functions' doc comments for the Black-76 spec each implements.
+  //
+  // `forward_price` below is the CTE's own staleness-gated column (NULL
+  // when the matched futures trade is older than MAX_FUTURES_STALENESS_HOURS
+  // -- see the `joined` CTE), not the raw joined futures.futures_price, so
+  // `d1` (and every Greek derived from it) never gets computed against a
+  // stale forward price in the first place.
+  const forwardPrice = "forward_price";
+  const strike = "strike";
+  const timeToExpiry = "time_to_expiry_years";
+  const volatility = "implied_volatility / 100.0";
 
-  const deltaSQL = generateDeltaSQL(greeksParams);
-  const gammaSQL = generateGammaSQL(greeksParams);
-  const vegaSQL = generateVegaSQL(greeksParams);
-  const thetaSQL = generateThetaSQL(greeksParams);
+  const d1Expr = D1_SQL
+    .replace(/{forward_price}/g, forwardPrice)
+    .replace(/{strike}/g, strike)
+    .replace(/{time_to_expiry}/g, timeToExpiry)
+    .replace(/{volatility}/g, volatility);
+
+  // Precomputed-column references used by the Greek formulas below, once
+  // `d1` has been materialized as its own CTE column.
+  const cdfD1 = NORMAL_CDF_SQL.replace(/{x}/g, "d1");
+  const cdfMinusD1 = NORMAL_CDF_SQL.replace(/{x}/g, "-d1");
+  const pdfD1 = NORMAL_PDF_SQL.replace(/{x}/g, "d1");
+
+  const deltaFromD1 = `
+    CASE
+      WHEN ${timeToExpiry} <= 0 THEN
+        CASE
+          WHEN option_type = 'call' THEN
+            CASE WHEN ${forwardPrice} > ${strike} THEN 1.0 ELSE 0.0 END
+          ELSE
+            CASE WHEN ${forwardPrice} < ${strike} THEN -1.0 ELSE 0.0 END
+        END
+      WHEN option_type = 'call' THEN (${cdfD1})
+      ELSE -(${cdfMinusD1})
+    END
+  `;
+
+  const gammaFromD1 = `
+    CASE
+      WHEN ${timeToExpiry} <= 0 THEN 0.0
+      ELSE (${pdfD1}) / (${forwardPrice} * ${volatility} * sqrt(${timeToExpiry}))
+    END
+  `;
+
+  const vegaFromD1 = `
+    CASE
+      WHEN ${timeToExpiry} <= 0 THEN 0.0
+      ELSE (${forwardPrice} * (${pdfD1}) * sqrt(${timeToExpiry})) / 100.0
+    END
+  `;
+
+  const thetaFromD1 = `
+    CASE
+      WHEN ${timeToExpiry} <= 0 THEN 0.0
+      ELSE -(${forwardPrice} * (${pdfD1}) * ${volatility}) / (2.0 * sqrt(${timeToExpiry}) * 365.0)
+    END
+  `;
 
   // Build query with optional futures join
   const futuresJoin = params.futuresPattern ? `
-    -- LEFT JOIN with futures to get forward prices
-    LEFT JOIN (
-      SELECT
-        instrument_name as futures_instrument,
-        timestamp as futures_timestamp,
-        price as futures_price
+    ASOF LEFT JOIN (
+      -- Deduplicate to one row per (instrument, timestamp): see the
+      -- function-level doc comment above for why this is required before
+      -- an ASOF JOIN, not merely a performance nicety.
+      SELECT instrument_name as futures_instrument, timestamp as futures_timestamp, price as futures_price
       FROM read_parquet('${params.futuresPattern}')
+      QUALIFY ROW_NUMBER() OVER (
+        PARTITION BY instrument_name, timestamp
+        ORDER BY trade_seq DESC
+      ) = 1
     ) futures
     ON regexp_extract(opt.instrument_name, '^([A-Z]+-[0-9]{1,2}[A-Z]{3}[0-9]{2})-', 1) = futures.futures_instrument
-    AND futures.futures_timestamp <= opt.timestamp
-    QUALIFY ROW_NUMBER() OVER (
-      PARTITION BY opt.trade_id
-      ORDER BY futures.futures_timestamp DESC
-    ) = 1
+    AND opt.timestamp >= futures.futures_timestamp
   ` : '';
 
   return `
 COPY (
+  WITH raw_join AS (
+    -- Stage 1: attach the raw ASOF-matched futures trade (if any) and
+    -- whether it's within the staleness cap. No Greek math happens here.
+    SELECT
+      regexp_extract(opt.filename, '/([^/]+)\\.parquet$', 1) as instrument_name,
+      opt.trade_id,
+      opt.trade_seq,
+      opt.timestamp,
+      opt.price,
+      opt.amount,
+      opt.direction,
+      opt.tick_direction,
+      opt.index_price,
+      opt.mark_price,
+      opt.implied_volatility,
+      opt.strike,
+      opt.expiration_timestamp,
+      opt.option_type,
+      opt.time_to_expiry_years,
+      ${params.futuresPattern ? `
+      futures.futures_price as raw_futures_price,
+      (futures.futures_price IS NOT NULL
+        AND opt.timestamp - futures.futures_timestamp <= INTERVAL '${MAX_FUTURES_STALENESS_HOURS} hours'
+      ) as futures_price_fresh
+      ` : 'CAST(NULL AS DOUBLE) as raw_futures_price, false as futures_price_fresh'}
+    FROM read_parquet('${params.inputPattern}', filename=true) opt
+    ${futuresJoin}
+  ),
+  with_forward_price AS (
+    -- Stage 2: resolve the single forward_price every downstream formula
+    -- uses. Stale/missing matches collapse to NULL here, so nothing later
+    -- (d1, any Greek, is_valid) needs its own separate staleness check --
+    -- an over-stale match behaves exactly like "no futures match at all."
+    SELECT *,
+      CASE WHEN futures_price_fresh THEN raw_futures_price ELSE NULL END as forward_price
+    FROM raw_join
+  ),
+  with_d1 AS (
+    -- Stage 3: d1 computed exactly once per row from the resolved
+    -- forward_price. Every Greek below (and the is_valid NaN/Inf check)
+    -- reuses this column instead of each independently re-deriving
+    -- ln/power/sqrt -- at 4.58M rows, evaluating those transcendental
+    -- functions 4-6x per row instead of once is real, measurable waste
+    -- that DuckDB does not eliminate on its own across separate CASE
+    -- expressions.
+    SELECT *, (${d1Expr}) as d1
+    FROM with_forward_price
+  )
   SELECT
-    -- Extract instrument name from filename
-    regexp_extract(opt.filename, '/([^/]+)\\.parquet$', 1) as instrument_name,
+    instrument_name,
+    trade_id,
+    trade_seq,
+    timestamp,
+    price,
+    amount,
+    direction,
+    tick_direction,
+    index_price,
+    mark_price,
+    implied_volatility,
+    strike,
+    expiration_timestamp,
+    option_type,
+    time_to_expiry_years,
+    forward_price as futures_price,
 
-    -- Original trade data
-    opt.trade_id,
-    opt.trade_seq,
-    opt.timestamp,
-    opt.price,
-    opt.amount,
-    opt.direction,
-    opt.tick_direction,
-    opt.index_price,
-    opt.mark_price,
-    opt.implied_volatility,
-    opt.strike,
-    opt.expiration_timestamp,
-    opt.option_type,
-    opt.time_to_expiry_years,
-    ${params.futuresPattern ? 'futures.futures_price,' : ''}
-
-    -- Computed Greeks (using forward price from futures when available)
+    -- Computed Greeks. Gated on implied_volatility > 0 (not just IS NOT
+    -- NULL): IV = 0 makes volatility = 0, which sends d1's denominator
+    -- (volatility * sqrt(T)) to zero and produces NaN/Inf. Previously the
+    -- gate only checked IS NOT NULL, so an IV=0 row still had NaN/Inf
+    -- values stored in these columns (correctly excluded from is_valid via
+    -- a separate check, but inconsistent with the documented "NULL if no
+    -- futures_price" contract for these fields). Gating here means the
+    -- stored value is NULL, matching that contract, for every reason a
+    -- Greek can't be computed (no futures match, stale futures match, IV
+    -- missing or zero) -- at/past expiry is still handled inside each CASE
+    -- below since Greeks are well-defined (not NaN) at expiry.
     CASE
-      WHEN opt.implied_volatility IS NOT NULL AND opt.time_to_expiry_years > 0
-      THEN ${deltaSQL}
+      WHEN implied_volatility IS NOT NULL AND implied_volatility > 0 AND forward_price IS NOT NULL
+      THEN ${deltaFromD1}
       ELSE NULL
     END as delta,
 
     CASE
-      WHEN opt.implied_volatility IS NOT NULL AND opt.time_to_expiry_years > 0
-      THEN ${gammaSQL}
+      WHEN implied_volatility IS NOT NULL AND implied_volatility > 0 AND forward_price IS NOT NULL
+      THEN ${gammaFromD1}
       ELSE NULL
     END as gamma,
 
     CASE
-      WHEN opt.implied_volatility IS NOT NULL AND opt.time_to_expiry_years > 0
-      THEN ${vegaSQL}
+      WHEN implied_volatility IS NOT NULL AND implied_volatility > 0 AND forward_price IS NOT NULL
+      THEN ${vegaFromD1}
       ELSE NULL
     END as vega,
 
     CASE
-      WHEN opt.implied_volatility IS NOT NULL AND opt.time_to_expiry_years > 0
-      THEN ${thetaSQL}
+      WHEN implied_volatility IS NOT NULL AND implied_volatility > 0 AND forward_price IS NOT NULL
+      THEN ${thetaFromD1}
       ELSE NULL
     END as theta,
 
     -- Data quality flag for analytics filtering
-    -- STRICT: Requires futures forward price for accurate Greeks
-    -- TRUE = valid for backtesting/analysis (futures price, good IV, sufficient time, valid Greeks)
-    -- FALSE = missing futures data, IV=0, very short-dated, or NaN Greeks
+    -- STRICT: Requires a futures forward price no older than
+    -- MAX_FUTURES_STALENESS_HOURS for accurate Greeks
+    -- TRUE = valid for backtesting/analysis (fresh futures price, IV>0,
+    --        sufficient time to expiry, all four Greeks finite)
+    -- FALSE = missing/stale futures data, IV<=0, very short-dated, or
+    --         any Greek is NaN/Inf
     (
-      ${params.futuresPattern ? 'futures.futures_price IS NOT NULL AND' : 'false AND'}
-      opt.implied_volatility > 0
-      AND opt.time_to_expiry_years > 0.0027  -- > 1 day
-      AND opt.implied_volatility IS NOT NULL
-      AND opt.time_to_expiry_years > 0
-      AND CASE
-            WHEN opt.implied_volatility IS NOT NULL AND opt.time_to_expiry_years > 0
-            THEN NOT (
-              isnan(${deltaSQL}) OR isinf(${deltaSQL}) OR
-              isnan(${gammaSQL}) OR isinf(${gammaSQL})
-            )
-            ELSE false
-          END
+      forward_price IS NOT NULL
+      AND implied_volatility > 0
+      AND time_to_expiry_years > 0.0027  -- > 1 day
+      AND NOT (
+        isnan(${deltaFromD1}) OR isinf(${deltaFromD1}) OR
+        isnan(${gammaFromD1}) OR isinf(${gammaFromD1}) OR
+        isnan(${vegaFromD1}) OR isinf(${vegaFromD1}) OR
+        isnan(${thetaFromD1}) OR isinf(${thetaFromD1})
+      )
     ) as is_valid
 
-  FROM read_parquet('${params.inputPattern}', filename=true) opt
-  ${futuresJoin}
+  FROM with_d1
 ) TO '${params.outputPath}' (FORMAT PARQUET, COMPRESSION ZSTD)
 `;
 }
