@@ -57,6 +57,10 @@ data/
 - Rate limit: 15 req/s (75% of Deribit's 20 req/s)
 - Seq-based: `getTradesBySeq(instrument, startSeq, endSeq)`
 - Loop detection: tracks previousSeq to prevent infinite loops
+- Per-request retry: every endpoint method routes through a shared
+  `withRetry` helper (3x, exponential backoff) that retries HTTP 429 / JSON-RPC
+  error 10028 (rate limit) and HTTP 503 -- separate from BunQueue's job-level
+  retry below (see design-decisions.md §5 note)
 
 **ParquetStorage:**
 - `getTradeFilePath(name)` → `data/bronze/instruments/{ASSET}/{name}.parquet`
@@ -108,13 +112,14 @@ silver BTC
   ↓
 Job: enrich-duckdb
   DuckDB single SQL query:
-    Read: bronze/instruments/BTC/*.parquet (3,478 files)
+    Read: bronze/instruments/BTC/*.parquet (one file per instrument)
     LEFT JOIN: bronze/futures/BTC-*.parquet (ASOF join on timestamp)
     Compute: delta, gamma, vega, theta via Black-76 SQL
     Compute: is_valid flag
     Write: silver/BTC.parquet (single file, all instruments)
+  Reports is_valid coverage (%); throws if 0% valid (see design-decisions.md)
   ↓
-Output: silver/BTC.parquet (894k trades, 21 fields)
+Output: silver/BTC.parquet (21 fields; e.g. 4.58M trades / 14,267 instruments on a full 3-month BTC pull)
 ```
 
 ### Gold Pipeline
@@ -125,12 +130,14 @@ gold BTC
 Job: enrich-gold
   DuckDB single SQL query:
     Read: silver/BTC.parquet (single file, 21 fields)
-    Compute: days_to_expiry (integer days until expiration)
-    Compute: strike_delta (5Δ, 10Δ, 25Δ, 50Δ buckets)
-    Compute: vol_regime (low/mid/high via IV percentile)
-    Write: gold/BTC.parquet (single file, all instruments)
+    LEFT JOIN: bronze/deliveries/{index}.parquet on expiry date (real settlement prices)
+    Compute: days_to_expiry, strike_delta, vol_regime, realized_vol_7day,
+      iv_percentile_90day, execution-quality metrics (Roll spread, expected
+      premium via Black-76, premium_collection_ratio), outcome_* metrics
+      (forward-looking; see docs/data-model.md warning)
+    Write: gold/BTC.parquet (single file, only rows with futures_price IS NOT NULL)
   ↓
-Output: gold/BTC.parquet (894k trades, 24 fields)
+Output: gold/BTC.parquet (38 fields; see docs/data-model.md for the full field list)
 ```
 
 ### ASOF Join (Forward Prices)
@@ -166,12 +173,23 @@ QUALIFY ROW_NUMBER() OVER (PARTITION BY opt.trade_id ORDER BY futures.timestamp 
 ## Performance
 
 - **Bronze:** 99% instruments complete in <10s (3 parallel)
-- **Silver:** 894k trades enriched in ~1.3s (650k trades/sec)
+- **Silver:** measured on a real 3-month BTC pull: 4.58M trades / 14,267
+  instruments enriched in ~47s (~97k trades/sec)
+- **Gold:** same dataset, 579,778 output rows (only trades with a matched
+  futures_price) in ~5-15s
 - **Bottleneck:** API rate limit (15 req/s) not computation
 
 ## Error Handling
 
-- **API errors:** Retry 3x with exponential backoff
+- **API errors:** every `DeribitClient` endpoint retries 3x with exponential
+  backoff on HTTP 429 / JSON-RPC 10028 / HTTP 503 (via `withRetry`), separate
+  from BunQueue's job-level retry
+- **Per-instrument fetch failures:** `fetch-trades` collects failed
+  instrument names and throws (rather than silently reporting success) if
+  any instrument failed after its own internal retries -- previously the job
+  always resolved even with hundreds of silently-dropped instruments
 - **Loop detection:** Track previousSeq, break if stuck
 - **Job failures:** Visible in queue-dashboard
-- **Crash recovery:** Re-run commands skip completed files
+- **Crash recovery:** Re-run commands skip completed files; writes are
+  atomic (temp path + rename), so an interrupted write can never leave a
+  truncated file at the path the skip-check looks at

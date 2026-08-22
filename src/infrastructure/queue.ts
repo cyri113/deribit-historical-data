@@ -173,7 +173,13 @@ export function getWorker(): Worker {
           // Fetch all instruments directly (not via child jobs)
           let totalTrades = 0;
           let completed = 0;
-          let failed = 0;
+          // Track WHICH instruments failed, not just a count -- a bare count
+          // is indistinguishable from "these instruments never existed" once
+          // the job reports success, which is exactly the silent
+          // survivorship-bias mechanism this is fixing. Named failures let a
+          // caller retry/report on the specific instruments, not just see a
+          // number in scrollback.
+          const failedInstruments: string[] = [];
 
           // Process in batches for concurrency
           const allInstruments = [...futures, ...options];
@@ -199,19 +205,40 @@ export function getWorker(): Worker {
                 }
                 completed++;
               } catch (error) {
-                failed++;
+                failedInstruments.push(instrument.instrument_name);
                 console.error(`✗ Failed to fetch ${instrument.instrument_name}:`, error instanceof Error ? error.message : error);
               }
 
-              const total = completed + failed;
+              const total = completed + failedInstruments.length;
               if (total % 100 === 0 || total === allInstruments.length) {
-                console.log(`Progress: ${total}/${allInstruments.length} instruments (${completed} ok, ${failed} failed, ${totalTrades.toLocaleString()} trades)`);
+                console.log(`Progress: ${total}/${allInstruments.length} instruments (${completed} ok, ${failedInstruments.length} failed, ${totalTrades.toLocaleString()} trades)`);
               }
             }));
           }
 
-          console.log(`✓ Downloaded ${completed}/${allInstruments.length} instruments (${failed} failed, ${totalTrades.toLocaleString()} trades)`);
-          return { instrumentsDownloaded: completed, failed, totalTrades };
+          console.log(`✓ Downloaded ${completed}/${allInstruments.length} instruments (${failedInstruments.length} failed, ${totalTrades.toLocaleString()} trades)`);
+
+          // Fail the job (not just log) when any instrument failed. Each
+          // instrument's fetch already went through DeribitClient's
+          // retry/backoff internally (see withRetry), so a failure reaching
+          // here already survived several retries and is unlikely to be
+          // purely transient -- but bunqueue's job-level retry gives it one
+          // more chance, and critically this makes the failure IMPOSSIBLE to
+          // miss: previously the job always resolved and fired "completed"
+          // even with hundreds of silently-dropped instruments, with no
+          // signal beyond a free-text console line. Already-succeeded
+          // instruments are untouched by a retry (option-fetcher.ts /
+          // future-fetcher.ts skip fetching when the output file already
+          // exists), so re-running only re-attempts the named failures.
+          if (failedInstruments.length > 0) {
+            throw new Error(
+              `fetch-trades for ${currency}: ${failedInstruments.length}/${allInstruments.length} instruments failed after retries: ` +
+              `${failedInstruments.slice(0, 20).join(", ")}${failedInstruments.length > 20 ? ` (+${failedInstruments.length - 20} more)` : ""}. ` +
+              `Already-downloaded instruments are preserved and will be skipped on re-run.`
+            );
+          }
+
+          return { instrumentsDownloaded: completed, failed: 0, failedInstruments: [], totalTrades };
         }
 
         case "fetch-future": {

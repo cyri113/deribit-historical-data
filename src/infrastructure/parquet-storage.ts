@@ -2,7 +2,7 @@ import parquet from "parquetjs";
 import { DELIVERY_PRICE_SCHEMA, HISTORICAL_VOLATILITY_SCHEMA, INSTRUMENT_SCHEMA, RAW_TRADE_SCHEMA, FUTURES_TRADE_SCHEMA } from "./schemas.ts";
 import type { DeribitTrade, DeribitDeliveryPrice, DeribitInstrument, DeribitHistoricalVolatility } from "../domain/models.ts";
 import { parseInstrumentName } from "../domain/models.ts";
-import { mkdir } from "node:fs/promises";
+import { mkdir, rename, unlink } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { join, dirname } from "node:path";
 
@@ -31,6 +31,49 @@ export class ParquetStorage {
     const dir = dirname(filePath);
     if (!existsSync(dir)) {
       await mkdir(dir, { recursive: true });
+    }
+  }
+
+  /**
+   * Write a Parquet file atomically: write to a `.tmp` sibling path, then
+   * rename into place only after the writer closes successfully.
+   *
+   * Without this, a fetch interrupted mid-write (SIGKILL, OOM, power loss,
+   * Ctrl-C) while `writer.appendRow`/`writer.close()` is still running for a
+   * large instrument (10,000+ rows) leaves a truncated/corrupt file at the
+   * exact path fetchers' skip-if-exists check looks at (`existsSync`) --
+   * that instrument is then silently treated as "already fetched" and
+   * permanently skipped on every future run, a survivorship-bias mechanism
+   * indistinguishable from a legitimately-complete file. A `rename` is
+   * atomic on the same filesystem, so a reader/skip-check never observes a
+   * partially-written final file: it's either absent (interrupted, will
+   * retry) or complete (rename only happens after `close()` succeeds).
+   *
+   * If a stale `.tmp` file from a prior interrupted run exists at this path,
+   * it's removed before starting -- it's dead partial data, not something to
+   * resume from (parquetjs has no true append/resume support; see
+   * appendTrades below).
+   */
+  private async writeAtomic(
+    filePath: string,
+    write: (tempPath: string) => Promise<void>
+  ): Promise<void> {
+    const tempPath = `${filePath}.tmp`;
+
+    if (existsSync(tempPath)) {
+      await unlink(tempPath);
+    }
+
+    try {
+      await write(tempPath);
+      await rename(tempPath, filePath);
+    } catch (error) {
+      // Clean up the partial temp file so it can't be mistaken for a
+      // resumable/complete artifact on a later run.
+      if (existsSync(tempPath)) {
+        await unlink(tempPath).catch(() => {});
+      }
+      throw error;
     }
   }
 
@@ -71,34 +114,37 @@ export class ParquetStorage {
     const expiration = instrument.instrumentType !== "perpetual" ? instrument.expiration : null;
     const optionType = instrument.instrumentType === "option" ? instrument.optionType : null;
 
-    // Write all trades to file
-    const writer = await parquet.ParquetWriter.openFile(RAW_TRADE_SCHEMA, filePath);
+    // Write all trades to file atomically (temp path, rename on success) --
+    // see writeAtomic doc comment for why this matters for this dataset.
+    await this.writeAtomic(filePath, async (tempPath) => {
+      const writer = await parquet.ParquetWriter.openFile(RAW_TRADE_SCHEMA, tempPath);
 
-    for (const trade of trades) {
-      const timeToExpiry = expiration
-        ? Math.max(0, (expiration - trade.timestamp) / (365.25 * 24 * 60 * 60 * 1000))
-        : null;
+      for (const trade of trades) {
+        const timeToExpiry = expiration
+          ? Math.max(0, (expiration - trade.timestamp) / (365.25 * 24 * 60 * 60 * 1000))
+          : null;
 
-      await writer.appendRow({
-        trade_id: trade.trade_id,
-        trade_seq: trade.trade_seq,
-        instrument_name: trade.instrument_name,
-        timestamp: trade.timestamp,
-        price: trade.price,
-        amount: trade.amount,
-        direction: trade.direction,
-        tick_direction: trade.tick_direction,
-        index_price: trade.index_price,
-        mark_price: trade.mark_price ?? null,
-        implied_volatility: trade.iv ?? null,
-        strike,
-        expiration_timestamp: expiration,
-        option_type: optionType,
-        time_to_expiry_years: timeToExpiry,
-      });
-    }
+        await writer.appendRow({
+          trade_id: trade.trade_id,
+          trade_seq: trade.trade_seq,
+          instrument_name: trade.instrument_name,
+          timestamp: trade.timestamp,
+          price: trade.price,
+          amount: trade.amount,
+          direction: trade.direction,
+          tick_direction: trade.tick_direction,
+          index_price: trade.index_price,
+          mark_price: trade.mark_price ?? null,
+          implied_volatility: trade.iv ?? null,
+          strike,
+          expiration_timestamp: expiration,
+          option_type: optionType,
+          time_to_expiry_years: timeToExpiry,
+        });
+      }
 
-    await writer.close();
+      await writer.close();
+    });
   }
 
   /**
@@ -144,34 +190,43 @@ export class ParquetStorage {
       allTrades = [...existingTrades, ...newUniqueTrades].sort((a, b) => a.trade_seq - b.trade_seq);
     }
 
-    // Write all trades to file
-    const writer = await parquet.ParquetWriter.openFile(RAW_TRADE_SCHEMA, filePath);
+    // Write all trades to file atomically. This matters even more here than
+    // in writeTrades: appendTrades rewrites the WHOLE file (existing +
+    // merged trades) at the same path parquetjs would otherwise open
+    // in-place, so an interruption mid-write wouldn't just leave a truncated
+    // new file -- without atomic replace it would DESTROY the previously-
+    // complete existing data it just read via readTrades() above, replacing
+    // it with a partial rewrite. Writing to a temp path and renaming only on
+    // success means an interruption leaves the original file untouched.
+    await this.writeAtomic(filePath, async (tempPath) => {
+      const writer = await parquet.ParquetWriter.openFile(RAW_TRADE_SCHEMA, tempPath);
 
-    for (const trade of allTrades) {
-      const timeToExpiry = expiration
-        ? Math.max(0, (expiration - trade.timestamp) / (365.25 * 24 * 60 * 60 * 1000))
-        : null;
+      for (const trade of allTrades) {
+        const timeToExpiry = expiration
+          ? Math.max(0, (expiration - trade.timestamp) / (365.25 * 24 * 60 * 60 * 1000))
+          : null;
 
-      await writer.appendRow({
-        trade_id: trade.trade_id,
-        trade_seq: trade.trade_seq,
-        instrument_name: trade.instrument_name,
-        timestamp: trade.timestamp,
-        price: trade.price,
-        amount: trade.amount,
-        direction: trade.direction,
-        tick_direction: trade.tick_direction,
-        index_price: trade.index_price,
-        mark_price: trade.mark_price ?? null,
-        implied_volatility: trade.iv ?? null,
-        strike,
-        expiration_timestamp: expiration,
-        option_type: optionType,
-        time_to_expiry_years: timeToExpiry,
-      });
-    }
+        await writer.appendRow({
+          trade_id: trade.trade_id,
+          trade_seq: trade.trade_seq,
+          instrument_name: trade.instrument_name,
+          timestamp: trade.timestamp,
+          price: trade.price,
+          amount: trade.amount,
+          direction: trade.direction,
+          tick_direction: trade.tick_direction,
+          index_price: trade.index_price,
+          mark_price: trade.mark_price ?? null,
+          implied_volatility: trade.iv ?? null,
+          strike,
+          expiration_timestamp: expiration,
+          option_type: optionType,
+          time_to_expiry_years: timeToExpiry,
+        });
+      }
 
-    await writer.close();
+      await writer.close();
+    });
   }
 
   /**
@@ -244,24 +299,26 @@ export class ParquetStorage {
     const filePath = this.getFuturesFilePath(instrumentName);
     await this.ensureDir(filePath);
 
-    const writer = await parquet.ParquetWriter.openFile(FUTURES_TRADE_SCHEMA, filePath);
+    await this.writeAtomic(filePath, async (tempPath) => {
+      const writer = await parquet.ParquetWriter.openFile(FUTURES_TRADE_SCHEMA, tempPath);
 
-    for (const trade of trades) {
-      await writer.appendRow({
-        trade_id: trade.trade_id,
-        trade_seq: trade.trade_seq,
-        instrument_name: trade.instrument_name,
-        timestamp: trade.timestamp,
-        price: trade.price, // This is the forward price!
-        amount: trade.amount,
-        direction: trade.direction,
-        tick_direction: trade.tick_direction,
-        index_price: trade.index_price,
-        mark_price: trade.mark_price ?? null,
-      });
-    }
+      for (const trade of trades) {
+        await writer.appendRow({
+          trade_id: trade.trade_id,
+          trade_seq: trade.trade_seq,
+          instrument_name: trade.instrument_name,
+          timestamp: trade.timestamp,
+          price: trade.price, // This is the forward price!
+          amount: trade.amount,
+          direction: trade.direction,
+          tick_direction: trade.tick_direction,
+          index_price: trade.index_price,
+          mark_price: trade.mark_price ?? null,
+        });
+      }
 
-    await writer.close();
+      await writer.close();
+    });
   }
 
   /**

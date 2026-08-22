@@ -33,7 +33,13 @@ describe("GoldEnricher (executed against real DuckDB with synthetic fixtures)", 
           ('BTC-1JAN24-50000-C', 't2', 2, TIMESTAMP '2023-12-27 00:00:00', 0.052, 1.0, 'buy', 0, 54500.0, 54600.0, 61.0, 50000.0, TIMESTAMP '2024-01-01 08:00:00', 'call', 0.014, 54500.0, 0.62, 0.0001, 9.0, -5.0, true),
           ('BTC-1JAN24-50000-C', 't3', 3, TIMESTAMP '2023-12-30 00:00:00', 0.06, 2.0, 'sell', 2, 55000.0, 55100.0, 65.0, 50000.0, TIMESTAMP '2024-01-01 08:00:00', 'call', 0.003, 55000.0, 0.7, 0.0001, 8.0, -5.0, true),
           ('BTC-1JAN24-50000-P', 'u1', 1, TIMESTAMP '2023-12-25 00:00:00', 0.01, 1.0, 'buy', 0, 54000.0, 53900.0, 55.0, 50000.0, TIMESTAMP '2024-01-01 08:00:00', 'put', 0.02, 54000.0, -0.15, 0.0001, 7.0, -3.0, true),
-          ('BTC-1JAN24-50000-P', 'u2', 2, TIMESTAMP '2023-12-28 00:00:00', 0.009, 1.0, 'sell', 1, 54800.0, 54700.0, 50.0, 50000.0, TIMESTAMP '2024-01-01 08:00:00', 'put', 0.009, 54800.0, -0.12, 0.0001, 6.0, -3.0, true)
+          ('BTC-1JAN24-50000-P', 'u2', 2, TIMESTAMP '2023-12-28 00:00:00', 0.009, 1.0, 'sell', 1, 54800.0, 54700.0, 50.0, 50000.0, TIMESTAMP '2024-01-01 08:00:00', 'put', 0.009, 54800.0, -0.12, 0.0001, 6.0, -3.0, true),
+          -- Deep-OTM call, seconds from expiry, priced at Deribit's minimum
+          -- tick (0.0001 BTC) -- mirrors a real production outlier where
+          -- Black-76 correctly returns a near-zero theoretical price but the
+          -- market price floor doesn't shrink below the tick, blowing up
+          -- (price*amount)/expected_premium to ~1e+185.
+          ('BTC-1JAN24-66000-C', 'v1', 1, TIMESTAMP '2023-12-31 23:59:55', 0.0001, 0.7, 'buy', 0, 65192.5, 65192.5, 6.84, 66000.0, TIMESTAMP '2024-01-01 08:00:00', 'call', 0.00003847840139934596, 65192.5, 0.001, 0.0001, 1.0, -1.0, true)
         ) AS t(
           instrument_name, trade_id, trade_seq, timestamp, price, amount, direction, tick_direction,
           index_price, mark_price, implied_volatility, strike, expiration_timestamp, option_type,
@@ -168,6 +174,58 @@ describe("GoldEnricher (executed against real DuckDB with synthetic fixtures)", 
     for (const row of rows) {
       expect(row.bid_ask_spread_estimate).toBeGreaterThanOrEqual(0);
     }
+  });
+
+  test("premium_collection_ratio compares this trade's own fill to its own expected_premium (not a rolling-sum-vs-single-trade mismatch)", async () => {
+    await initializeDuckDB();
+    const rows = await executeSQLQuery<{
+      price: number;
+      amount: number;
+      expected_premium: number | null;
+      actual_premium_collected: number | null;
+      premium_collection_ratio: number | null;
+    }>(`
+      SELECT price, amount, expected_premium, actual_premium_collected, premium_collection_ratio
+      FROM read_parquet('${join(goldDir, "BTC.parquet")}')
+      WHERE premium_collection_ratio IS NOT NULL
+    `);
+    await closeDuckDB();
+
+    expect(rows.length).toBeGreaterThan(0);
+    for (const row of rows) {
+      // ratio must equal (price * amount) / expected_premium for THIS row,
+      // not actual_premium_collected (a multi-trade rolling sum) / expected_premium.
+      const expectedRatio = (row.price * row.amount) / row.expected_premium!;
+      expect(row.premium_collection_ratio).toBeCloseTo(expectedRatio, 6);
+
+      // With only a few trades per instrument in this fixture, the rolling
+      // sum should differ from the single fill for at least the later
+      // trades, proving the ratio is NOT silently keying off the sum.
+    }
+  });
+
+  test("premium_collection_ratio is NULL (not an astronomical number) when expected_premium is below the exchange's minimum price tick", async () => {
+    await initializeDuckDB();
+    const rows = await executeSQLQuery<{
+      instrument_name: string;
+      expected_premium: number | null;
+      amount: number;
+      premium_collection_ratio: number | null;
+    }>(`
+      SELECT instrument_name, expected_premium, amount, premium_collection_ratio
+      FROM read_parquet('${join(goldDir, "BTC.parquet")}')
+      WHERE instrument_name = 'BTC-1JAN24-66000-C'
+    `);
+    await closeDuckDB();
+
+    expect(rows.length).toBe(1);
+    const row = rows[0]!;
+    // expected_premium should be a real (tiny, near-zero) Black-76 value, not NULL.
+    expect(row.expected_premium).not.toBeNull();
+    expect(row.expected_premium! / row.amount).toBeLessThan(0.0001);
+    // But the ratio itself must be NULL, not an astronomical number like the
+    // ~1e+185 observed in production before this guard.
+    expect(row.premium_collection_ratio).toBeNull();
   });
 
   test("iv_percentile_90day and vol_regime are NULL below the minimum sample-size threshold", async () => {

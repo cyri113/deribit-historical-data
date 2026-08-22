@@ -425,10 +425,35 @@ COPY (
   -- Compute premium collection ratio (requires expected_premium first)
   premium_metrics AS (
     SELECT *,
-      -- Premium collection ratio: actual / expected
+      -- Premium collection ratio: THIS TRADE's actual fill (price * amount)
+      -- vs. its Black-76 theoretical fair value (expected_premium), both
+      -- single-trade quantities. 1.0 = filled at exactly fair value; >1.0 =
+      -- collected more than theoretical (favorable fill); <1.0 = less.
+      --
+      -- Previously this divided actual_premium_collected (a 7-day ROLLING
+      -- SUM of price*amount across many trades for the instrument) by
+      -- expected_premium (a SINGLE trade's theoretical price) -- a sum
+      -- divided by a single value, so the ratio's magnitude depended on how
+      -- many trades happened to be in the trailing window and had no
+      -- "1.0 = fair value" interpretation (observed ratios in the hundreds
+      -- to low thousands on real data). Fixed to compare like-for-like:
+      -- this trade's own fill vs. this trade's own theoretical value.
+      --
+      -- Guard: Deribit's minimum tradeable price tick for BTC options is
+      -- 0.0001 BTC -- the market price floor doesn't shrink below that even
+      -- as true fair value approaches zero for deep-OTM, seconds-to-expiry
+      -- options. Black-76 correctly returns a near-zero (e.g. 1e-190)
+      -- theoretical price for those, so price/expected_premium explodes to
+      -- absurd magnitudes (observed up to 1e+185 on real data) despite the
+      -- formula being arithmetically correct -- these aren't a meaningful
+      -- "efficiency" signal, just division by a number smaller than the
+      -- exchange's own price granularity. NULL out the ratio whenever the
+      -- theoretical per-contract price is below that tick size, since no
+      -- ratio computed against it can be economically meaningful.
       CASE
-        WHEN expected_premium IS NOT NULL AND expected_premium > 0
-        THEN actual_premium_collected / expected_premium
+        WHEN expected_premium IS NOT NULL AND amount IS NOT NULL AND amount > 0
+          AND (expected_premium / amount) >= 0.0001
+        THEN (price * amount) / expected_premium
         ELSE NULL
       END as premium_collection_ratio
     FROM execution_metrics

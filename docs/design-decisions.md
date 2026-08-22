@@ -80,15 +80,28 @@ async fetchInstrument(instrumentName: string) {
 **Crash Recovery**:
 ```
 [CRASH mid-fetch of BTC-25DEC24-50000-C]
-→ Parquet file NOT created (atomic write)
-→ Re-run: No Parquet exists → fetch again ✅
-→ No corrupted files, no cleanup needed
+→ Parquet file NOT created at its final path (atomic write via temp+rename)
+→ Re-run: No Parquet exists at the final path → fetch again ✅
+→ No corrupted files, no cleanup needed (stale .tmp auto-removed on next write)
 ```
+
+**Implementation note**: `ParquetStorage.writeTrades`/`appendTrades`/
+`writeFuturesTrades` write to a `{path}.tmp` sibling and `rename()` into the
+final path only after the writer closes successfully (`writeAtomic` in
+`parquet-storage.ts`). This was a real gap for a while: the writer used to
+open the `ParquetWriter` directly at the final path, so a crash/SIGKILL/OOM
+mid-write could leave a truncated file exactly where `existsSync` checks
+look -- silently and permanently treated as "already complete" on every
+future run (a survivorship-bias mechanism for a historical dataset).
+`appendTrades` was worse, since it rewrites the *entire* file (existing +
+merged trades) in place, so an interruption could destroy previously-good
+data, not just fail to add new data. Fixed by routing all three through
+`writeAtomic`.
 
 **Trade-offs**:
 - ✅ Simpler pipeline (1 write vs 2 writes + cleanup)
 - ✅ No JSONL disk usage (save ~140GB temporary space)
-- ✅ Atomic writes (Parquet only created on success)
+- ✅ Atomic writes (Parquet only created/replaced on success, via temp+rename)
 - ❌ Can't resume partial fetch (but <10s per instrument, acceptable)
 
 ---
@@ -151,6 +164,17 @@ if (existsSync(parquetPath)) {
 | Background jobs | ❌ | ✅ |
 | Cron scheduling | ❌ | ✅ |
 | Code to maintain | 650 lines | 100 lines |
+
+**Note -- two separate retry layers**: this table's "Job retry" is BunQueue
+retrying an entire failed *job* (e.g. re-running `fetch-trades` for a
+currency). That's distinct from `DeribitClient`'s own retry/backoff on
+individual HTTP requests (429/503) inside `withRetry` in
+`deribit-client.ts`, which every endpoint method now routes through. Both
+matter: without the per-request layer, a single transient rate-limit hit
+mid-pagination would throw out of the fetch immediately rather than backing
+off and retrying that one request, and (before the `fetch-trades` handler
+was fixed to re-throw on any per-instrument failure) the job-level layer
+never even got a chance to retry since the job always reported "completed."
 
 **Commands**:
 ```bash

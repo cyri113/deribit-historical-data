@@ -37,6 +37,7 @@ data/
 | index_price | double | Spot index price |
 | mark_price | double | Mark price |
 | implied_volatility | double | **Percentage (65 = 65%, not 0.65)** |
+| futures_price | double | Always NULL in bronze (declared in `RAW_TRADE_SCHEMA` but never written by the option fetcher) — the real forward price is computed later in Silver via the ASOF join to `bronze/futures/`. Present here only as schema dead weight; ignore this column when reading bronze directly. |
 | strike | double | Strike price |
 | expiration_timestamp | bigint | Unix milliseconds |
 | option_type | string | "call" or "put" |
@@ -46,6 +47,32 @@ data/
 
 **Metadata**: Extracted from filename via `parseInstrumentName()`
 - `BTC-29MAY26-70000-C` → strike=70000, expiration=2026-05-29, type=call, currency=BTC
+
+**`bronze/futures/{expiry}.parquet`** (dated futures, one file per expiry — e.g. `BTC-29MAY26.parquet`):
+
+| Field | Type | Description |
+|-------|------|-------------|
+| trade_id | string | Unique trade ID |
+| trade_seq | bigint | Monotonic sequence |
+| instrument_name | string | e.g. "BTC-29MAY26" |
+| timestamp | bigint | Unix milliseconds |
+| price | double | Futures trade price — this is the forward price ASOF-joined into Silver's `futures_price` |
+| amount | double | Contract size |
+| direction | string | "buy" or "sell" |
+| tick_direction | int | Price movement direction |
+| index_price | double | Spot index price |
+| mark_price | double | Mark price |
+
+**`bronze/deliveries/{index}.parquet`** (settlement prices, one file per index — e.g. `btc_usd.parquet`):
+
+| Field | Type | Description |
+|-------|------|-------------|
+| index_name | string | e.g. "btc_usd" |
+| date | string | Settlement calendar date, `YYYY-MM-DD` |
+| delivery_price | double | Official Deribit settlement/delivery index price for that date |
+| timestamp | bigint | Unix milliseconds for `date` |
+
+Used by Gold to compute `outcome_settlement_price` / `outcome_assignment_inferred` — joined by matching an option's `expiration_timestamp` calendar date to `date` here (Deribit options settle 08:00 UTC against this index).
 
 ---
 
@@ -86,7 +113,7 @@ Each option trade matched to nearest prior futures trade by timestamp.
 
 ---
 
-## Gold Schema (Silver + Trading Metrics + Execution Quality + Outcome Metrics)
+## Gold Schema (38 fields = Silver 21 + Trading Metrics 7 + Execution Quality 6 + Outcome Metrics 4)
 
 **File**: `gold/BTC.parquet` (analytics-ready, all instruments in single file)
 
@@ -121,7 +148,7 @@ bias.
 | price_vs_mark_deviation | double | Calculated | `(price - mark_price) / mark_price` at the trade's own timestamp — NOT execution slippage (both values are concurrent; there is no pre-trade reference price in trade-only data). Measures deviation from Deribit's fair-value mark, which can reflect genuine urgency/skew or mark-price lag in fast IV moves |
 | expected_premium | double | Black-76 | Theoretical price at entry via `generatePriceSQL` — F=futures_price, K=strike, T=time_to_expiry_years, σ=implied_volatility/100 — converted to BTC-denominated units (÷ futures_price, matching Deribit's inverse-option `price` convention) and scaled by `amount`; NULL if futures_price, implied_volatility, or amount missing, or time_to_expiry_years ≤ 0 |
 | actual_premium_collected | double | Calculated | Sum of `price * amount` for this instrument in the trailing 7-calendar-day window |
-| premium_collection_ratio | double | Calculated | `actual_premium_collected / expected_premium` — note the numerator is a 7-day rolling sum across many trades while the denominator is a single trade's theoretical price, so this ratio's absolute scale is not "1.0 = fair value" and is only meaningful for relative/directional comparison |
+| premium_collection_ratio | double | Calculated | `(price * amount) / expected_premium` for this trade — both single-trade quantities, so 1.0 = filled at exactly the Black-76 fair value; >1.0 = collected more than theoretical, <1.0 = less. NULL if the theoretical per-contract price (`expected_premium / amount`) is below Deribit's minimum price tick (0.0001 BTC) — for deep-OTM, seconds-to-expiry options Black-76 can return a near-zero theoretical price (e.g. 1e-190) while the market still prices at the tick floor, producing an arithmetically-correct but economically meaningless ratio otherwise (observed up to ~1e+185 on real data before this guard). (Previously divided the 7-day rolling sum `actual_premium_collected` by a single trade's `expected_premium`, a scale mismatch that produced ratios in the hundreds-to-thousands with no "1.0 = fair value" interpretation — fixed to compare like-for-like.) |
 
 **Outcome metrics (forward-looking — see warning above):**
 
@@ -202,6 +229,17 @@ GROUP BY 1, 2
        if exists(bronze/futures/{expiry}.parquet) → skip
        else:
          fetch trades → write bronze/futures/{expiry}.parquet
+   ↓
+   Job: fetch-deliveries (runs by default; skip with --skip-deliveries)
+     - API getAllDeliveryPrices(btc_usd / eth_usd index)
+     - write bronze/deliveries/{index}.parquet (date, delivery_price)
+     - Required for gold's outcome_settlement_price / outcome_assignment_inferred;
+       without it those fields are NULL (see Gold Schema warning above)
+   ↓
+   Job: fetch-volatility (runs by default; skip with --skip-volatility)
+     - API getHistoricalVolatility(currency)
+     - write bronze/volatility/{currency}.parquet (not currently joined into
+       silver/gold -- available for ad hoc analysis)
 
 2. silver BTC
    ↓
@@ -212,6 +250,9 @@ GROUP BY 1, 2
        Compute: delta, gamma, vega, theta via Black-76 SQL
        Compute: is_valid flag
        Write: silver/BTC.parquet (single file)
+     - Reports is_valid coverage (%) after writing; throws if 0% valid
+       (almost always means futures data is missing/incomplete for this
+       currency -- see is_valid section above)
    ↓
    Output: silver/BTC.parquet (all instruments, all trades, 21 fields)
 
@@ -220,10 +261,14 @@ GROUP BY 1, 2
    Job: enrich-gold
      - Single DuckDB SQL query:
        Read: silver/BTC.parquet (single file)
-       Compute: days_to_expiry, strike_delta, vol_regime
+       LEFT JOIN: bronze/deliveries/{index}.parquet on expiry date (if present)
+       Compute: days_to_expiry, strike_delta, vol_regime, realized_vol_7day,
+         iv_percentile_90day, execution-quality metrics, outcome_* metrics
        Write: gold/BTC.parquet (single file)
    ↓
-   Output: gold/BTC.parquet (all instruments, all trades, 24 fields)
+   Output: gold/BTC.parquet (only trades with a matched futures_price --
+     see Silver's ASOF join -- with entry-time + outcome fields; see Gold
+     Schema above for the full field list)
 
 4. pipeline BTC
    ↓
@@ -234,12 +279,19 @@ GROUP BY 1, 2
 
 ## Storage Sizes
 
-| Data | Typical Size | Example |
-|------|--------------|---------|
-| Single expiry (100 options) | 10-50 MB | bronze/instruments/BTC/ |
-| 3 months expired (3,478 options) | 500 MB - 2 GB | bronze/instruments/BTC/ |
-| Enriched (all instruments) | ~same as bronze | silver/BTC.parquet |
+Measured on a real BTC pull (14,267 expired instruments, 4,580,450 trades):
+
+| Data | Size | Example |
+|------|------|---------|
+| Bronze (all instruments) | ~2.2 GB across 14,267 files | bronze/instruments/BTC/ |
+| Silver (all trades, 21 fields) | 196 MB, single file | silver/BTC.parquet |
+| Gold (only trades with a matched futures_price -- ~13% of silver, 38 fields) | 72 MB, single file | gold/BTC.parquet |
 | Queue state | 1-10 MB | queue.db |
+
+Gold is smaller than Silver despite having more columns because it only
+keeps rows where Silver's ASOF join found a forward price (`futures_price
+IS NOT NULL`) -- required for the volatility/premium window calculations.
+On this dataset that kept 579,778 of 4,580,450 Silver rows (~13%).
 
 ---
 

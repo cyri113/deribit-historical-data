@@ -60,68 +60,22 @@ export class DeribitClient {
   }
 
   /**
-   * Make a JSON-RPC request to Deribit API
+   * Run a single HTTP+parse attempt, with rate-limiting, and classify the
+   * result as retryable (429 / JSON-RPC 10028 / HTTP 503) or fatal. Shared by
+   * every endpoint method below so retry/backoff isn't reimplemented (or
+   * silently skipped) per-method.
+   *
+   * @param fn - performs the fetch and returns the parsed/validated response.
+   *   Must throw DeribitRateLimitError or DeribitAPIError(code=503) for
+   *   conditions that should be retried; any other throw is treated as fatal.
    */
-  private async request<T>(
-    method: string,
-    params: Record<string, unknown> = {}
-  ): Promise<T> {
-    const id = this.requestId++;
-
-    const payload = {
-      jsonrpc: "2.0",
-      id,
-      method,
-      params,
-    };
-
+  private async withRetry<T>(fn: () => Promise<T>): Promise<T> {
     let lastError: Error | null = null;
 
     for (let attempt = 0; attempt <= this.maxRetries; attempt++) {
       try {
-        // Wait for rate limiter
         await this.rateLimiter.acquire();
-
-        const response = await fetch(`${this.baseUrl}/public/${method}`, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify(payload),
-          signal: AbortSignal.timeout(60000), // 60 second timeout
-        });
-
-        if (!response.ok) {
-          if (response.status === 429) {
-            throw new DeribitRateLimitError(
-              `Rate limit exceeded (HTTP 429)`
-            );
-          }
-          throw new DeribitAPIError(
-            `HTTP error: ${response.status} ${response.statusText}`,
-            response.status
-          );
-        }
-
-        const data = await response.json();
-
-        // Check for JSON-RPC error
-        if (data.error) {
-          const error = data.error;
-          // Error code 10028 = too_many_requests
-          if (error.code === 10028) {
-            throw new DeribitRateLimitError(
-              `Rate limit exceeded (error 10028): ${error.message}`
-            );
-          }
-          throw new DeribitAPIError(
-            error.message ?? "Unknown API error",
-            error.code,
-            error.data
-          );
-        }
-
-        return data as T;
+        return await fn();
       } catch (error) {
         lastError = error instanceof Error ? error : new Error(String(error));
 
@@ -149,6 +103,81 @@ export class DeribitClient {
   }
 
   /**
+   * Make a JSON-RPC request to Deribit API
+   */
+  private async request<T>(
+    method: string,
+    params: Record<string, unknown> = {}
+  ): Promise<T> {
+    return this.withRetry(async () => {
+      const id = this.requestId++;
+
+      const payload = {
+        jsonrpc: "2.0",
+        id,
+        method,
+        params,
+      };
+
+      const response = await fetch(`${this.baseUrl}/public/${method}`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(payload),
+        signal: AbortSignal.timeout(60000), // 60 second timeout
+      });
+
+      if (!response.ok) {
+        if (response.status === 429) {
+          throw new DeribitRateLimitError(
+            `Rate limit exceeded (HTTP 429)`
+          );
+        }
+        throw new DeribitAPIError(
+          `HTTP error: ${response.status} ${response.statusText}`,
+          response.status
+        );
+      }
+
+      const data = await response.json();
+
+      // Check for JSON-RPC error
+      if (data.error) {
+        const error = data.error;
+        // Error code 10028 = too_many_requests
+        if (error.code === 10028) {
+          throw new DeribitRateLimitError(
+            `Rate limit exceeded (error 10028): ${error.message}`
+          );
+        }
+        throw new DeribitAPIError(
+          error.message ?? "Unknown API error",
+          error.code,
+          error.data
+        );
+      }
+
+      return data as T;
+    });
+  }
+
+  /**
+   * Classify a non-ok GET response the same way `request()` does for
+   * JSON-RPC POST calls, so every raw-fetch endpoint below retries on the
+   * same conditions (429, 503) instead of throwing immediately.
+   */
+  private throwForResponse(response: Response): never {
+    if (response.status === 429) {
+      throw new DeribitRateLimitError(`Rate limit exceeded (HTTP 429)`);
+    }
+    throw new DeribitAPIError(
+      `HTTP error: ${response.status} ${response.statusText}`,
+      response.status
+    );
+  }
+
+  /**
    * Fetch historical delivery prices for an index
    *
    * @param indexName - e.g., "btc_usd"
@@ -161,35 +190,31 @@ export class DeribitClient {
     offset: number = 0,
     count: number = 100
   ): Promise<{ data: DeribitDeliveryPrice[]; recordsTotal: number }> {
-    // Wait for rate limiter
-    await this.rateLimiter.acquire();
+    return this.withRetry(async () => {
+      // Build query params
+      const params = new URLSearchParams({
+        index_name: indexName,
+        offset: String(offset),
+        count: String(count),
+      });
 
-    // Build query params
-    const params = new URLSearchParams({
-      index_name: indexName,
-      offset: String(offset),
-      count: String(count),
+      const url = `${this.baseUrl}/public/get_delivery_prices?${params}`;
+
+      const response = await fetch(url, {
+        signal: AbortSignal.timeout(60000), // 60 second timeout
+      });
+
+      if (!response.ok) {
+        this.throwForResponse(response);
+      }
+
+      const data = await response.json();
+      const validated = DeribitDeliveryPricesResponseSchema.parse(data);
+      return {
+        data: validated.result.data,
+        recordsTotal: validated.result.records_total,
+      };
     });
-
-    const url = `${this.baseUrl}/public/get_delivery_prices?${params}`;
-
-    const response = await fetch(url, {
-      signal: AbortSignal.timeout(60000), // 60 second timeout
-    });
-
-    if (!response.ok) {
-      throw new DeribitAPIError(
-        `HTTP error: ${response.status} ${response.statusText}`,
-        response.status
-      );
-    }
-
-    const data = await response.json();
-    const validated = DeribitDeliveryPricesResponseSchema.parse(data);
-    return {
-      data: validated.result.data,
-      recordsTotal: validated.result.records_total,
-    };
   }
 
   /**
@@ -235,35 +260,31 @@ export class DeribitClient {
     kind?: "future" | "option" | "spot",
     expired: boolean = false
   ): Promise<DeribitInstrument[]> {
-    // Wait for rate limiter
-    await this.rateLimiter.acquire();
+    return this.withRetry(async () => {
+      // Build query params
+      const params = new URLSearchParams({
+        currency,
+        expired: String(expired),
+      });
 
-    // Build query params
-    const params = new URLSearchParams({
-      currency,
-      expired: String(expired),
+      if (kind) {
+        params.set("kind", kind);
+      }
+
+      const url = `${this.historyBaseUrl}/public/get_instruments?${params}`;
+
+      const response = await fetch(url, {
+        signal: AbortSignal.timeout(60000), // 60 second timeout
+      });
+
+      if (!response.ok) {
+        this.throwForResponse(response);
+      }
+
+      const data = await response.json();
+      const validated = DeribitInstrumentsResponseSchema.parse(data);
+      return validated.result;
     });
-
-    if (kind) {
-      params.set("kind", kind);
-    }
-
-    const url = `${this.historyBaseUrl}/public/get_instruments?${params}`;
-
-    const response = await fetch(url, {
-      signal: AbortSignal.timeout(60000), // 60 second timeout
-    });
-
-    if (!response.ok) {
-      throw new DeribitAPIError(
-        `HTTP error: ${response.status} ${response.statusText}`,
-        response.status
-      );
-    }
-
-    const data = await response.json();
-    const validated = DeribitInstrumentsResponseSchema.parse(data);
-    return validated.result;
   }
 
   /**
@@ -275,30 +296,26 @@ export class DeribitClient {
   async getHistoricalVolatility(
     currency: string
   ): Promise<DeribitHistoricalVolatility[]> {
-    // Wait for rate limiter
-    await this.rateLimiter.acquire();
+    return this.withRetry(async () => {
+      // Build query params
+      const params = new URLSearchParams({
+        currency,
+      });
 
-    // Build query params
-    const params = new URLSearchParams({
-      currency,
+      const url = `${this.baseUrl}/public/get_historical_volatility?${params}`;
+
+      const response = await fetch(url, {
+        signal: AbortSignal.timeout(60000), // 60 second timeout
+      });
+
+      if (!response.ok) {
+        this.throwForResponse(response);
+      }
+
+      const data = await response.json();
+      const validated = DeribitHistoricalVolatilityResponseSchema.parse(data);
+      return validated.result;
     });
-
-    const url = `${this.baseUrl}/public/get_historical_volatility?${params}`;
-
-    const response = await fetch(url, {
-      signal: AbortSignal.timeout(60000), // 60 second timeout
-    });
-
-    if (!response.ok) {
-      throw new DeribitAPIError(
-        `HTTP error: ${response.status} ${response.statusText}`,
-        response.status
-      );
-    }
-
-    const data = await response.json();
-    const validated = DeribitHistoricalVolatilityResponseSchema.parse(data);
-    return validated.result;
   }
 
   /**
@@ -309,42 +326,47 @@ export class DeribitClient {
    * @returns Last trade_seq, 0 if no trades, null if could not be determined
    */
   async getLastTradeSeq(instrumentName: string): Promise<number | null> {
+    // Sentinel used to short-circuit withRetry's retry loop for the
+    // legitimate "no trades" case (404/400) without misclassifying it as a
+    // transient failure to retry, while still getting retry/backoff for
+    // genuinely transient errors (429/503/network) on the same call.
+    const NO_TRADES = Symbol("no-trades");
+
     try {
-      await this.rateLimiter.acquire();
+      const result = await this.withRetry(async () => {
+        // Fetch one trade in descending order to get the latest trade_seq
+        const params = new URLSearchParams({
+          instrument_name: instrumentName,
+          count: "1",
+          include_old: "true",
+        });
 
-      // Fetch one trade in descending order to get the latest trade_seq
-      const params = new URLSearchParams({
-        instrument_name: instrumentName,
-        count: "1",
-        include_old: "true",
-      });
+        const url = `${this.historyBaseUrl}/public/get_last_trades_by_instrument?${params}`;
 
-      const url = `${this.historyBaseUrl}/public/get_last_trades_by_instrument?${params}`;
+        const response = await fetch(url, {
+          signal: AbortSignal.timeout(60000), // 60 second timeout
+        });
 
-      const response = await fetch(url, {
-        signal: AbortSignal.timeout(60000), // 60 second timeout
-      });
-
-      if (!response.ok) {
-        if (response.status === 404 || response.status === 400) {
-          // 404: Instrument exists but has no trades
-          // 400: Instrument doesn't exist or invalid name
-          return 0;
+        if (!response.ok) {
+          if (response.status === 404 || response.status === 400) {
+            // 404: Instrument exists but has no trades
+            // 400: Instrument doesn't exist or invalid name
+            return NO_TRADES;
+          }
+          this.throwForResponse(response);
         }
-        throw new DeribitAPIError(
-          `HTTP error: ${response.status} ${response.statusText}`,
-          response.status
-        );
-      }
 
-      const data = await response.json();
-      const validated = DeribitTradesResponseSchema.parse(data);
+        const data = await response.json();
+        const validated = DeribitTradesResponseSchema.parse(data);
 
-      if (validated.result.trades.length === 0) {
-        return 0;
-      }
+        if (validated.result.trades.length === 0) {
+          return NO_TRADES;
+        }
 
-      return validated.result.trades[0]!.trade_seq;
+        return validated.result.trades[0]!.trade_seq;
+      });
+
+      return result === NO_TRADES ? 0 : result;
     } catch (error) {
       console.error(`Failed to get last_seq for ${instrumentName}:`, error);
       return null;
@@ -367,43 +389,40 @@ export class DeribitClient {
     endSeq: number,
     count: number = 10000
   ): Promise<{ trades: DeribitTrade[]; hasMore: boolean }> {
-    await this.rateLimiter.acquire();
+    return this.withRetry(async () => {
+      const params = new URLSearchParams({
+        instrument_name: instrumentName,
+        start_seq: String(startSeq),
+        end_seq: String(endSeq),
+        count: String(count),
+        include_old: "true",
+      });
 
-    const params = new URLSearchParams({
-      instrument_name: instrumentName,
-      start_seq: String(startSeq),
-      end_seq: String(endSeq),
-      count: String(count),
-      include_old: "true",
+      const url = `${this.historyBaseUrl}/public/get_last_trades_by_instrument?${params}`;
+
+      console.log(`📡 API Request: ${url}`);
+
+      const response = await fetch(url, {
+        signal: AbortSignal.timeout(60000), // 60 second timeout
+      });
+
+      if (!response.ok) {
+        this.throwForResponse(response);
+      }
+
+      const data = await response.json();
+      const validated = DeribitTradesResponseSchema.parse(data);
+
+      const firstSeq = validated.result.trades.length > 0 ? validated.result.trades[0].trade_seq : null;
+      const lastSeq = validated.result.trades.length > 0 ? validated.result.trades[validated.result.trades.length - 1].trade_seq : null;
+
+      console.log(`📨 API Response: ${instrumentName} | received ${validated.result.trades.length} trades | first_seq=${firstSeq} | last_seq=${lastSeq} | has_more=${validated.result.has_more}`);
+
+      return {
+        trades: validated.result.trades,
+        hasMore: validated.result.has_more,
+      };
     });
-
-    const url = `${this.historyBaseUrl}/public/get_last_trades_by_instrument?${params}`;
-
-    console.log(`📡 API Request: ${url}`);
-
-    const response = await fetch(url, {
-      signal: AbortSignal.timeout(60000), // 60 second timeout
-    });
-
-    if (!response.ok) {
-      throw new DeribitAPIError(
-        `HTTP error: ${response.status} ${response.statusText}`,
-        response.status
-      );
-    }
-
-    const data = await response.json();
-    const validated = DeribitTradesResponseSchema.parse(data);
-
-    const firstSeq = validated.result.trades.length > 0 ? validated.result.trades[0].trade_seq : null;
-    const lastSeq = validated.result.trades.length > 0 ? validated.result.trades[validated.result.trades.length - 1].trade_seq : null;
-
-    console.log(`📨 API Response: ${instrumentName} | received ${validated.result.trades.length} trades | first_seq=${firstSeq} | last_seq=${lastSeq} | has_more=${validated.result.has_more}`);
-
-    return {
-      trades: validated.result.trades,
-      hasMore: validated.result.has_more,
-    };
   }
 
   /**
