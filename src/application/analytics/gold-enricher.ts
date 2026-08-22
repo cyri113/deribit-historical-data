@@ -4,11 +4,18 @@ import { join } from "node:path";
 import { mkdirSync, existsSync } from "node:fs";
 
 export interface GoldEnricherConfig {
-  inputDir?: string;   // Default: ./data/silver
-  outputDir?: string;  // Default: ./data/gold
-  maxMemory?: string;  // Default: 4GB
-  threads?: number;    // Default: CPU cores
+  inputDir?: string;    // Default: ./data/silver
+  outputDir?: string;   // Default: ./data/gold
+  deliveryDir?: string; // Default: ./data/bronze/deliveries
+  maxMemory?: string;   // Default: 4GB
+  threads?: number;     // Default: CPU cores
 }
+
+/** Maps a bronze currency code to its Deribit settlement index name. */
+const DELIVERY_INDEX_BY_CURRENCY: Record<string, string> = {
+  BTC: "btc_usd",
+  ETH: "eth_usd",
+};
 
 export interface GoldEnrichmentResult {
   currency: string;
@@ -32,12 +39,14 @@ export interface GoldEnrichmentResult {
 export class GoldEnricher {
   private inputDir: string;
   private outputDir: string;
+  private deliveryDir: string;
   private maxMemory: string;
   private threads?: number;
 
   constructor(config: GoldEnricherConfig = {}) {
     this.inputDir = config.inputDir ?? "./data/silver";
     this.outputDir = config.outputDir ?? "./data/gold";
+    this.deliveryDir = config.deliveryDir ?? "./data/bronze/deliveries";
     this.maxMemory = config.maxMemory ?? "4GB";
     this.threads = config.threads;
   }
@@ -83,10 +92,37 @@ export class GoldEnricher {
       }
 
       console.log(`Found ${inputTradeCount.toLocaleString()} trades in silver layer`);
+
+      // Check for real settlement/delivery prices (used for assignment_inferred).
+      // Without these, assignment_inferred would have to guess expiry price from
+      // the last-traded option's stale forward price -- so we require the real
+      // data and leave assignment fields NULL rather than fabricate a proxy.
+      const deliveryIndex = DELIVERY_INDEX_BY_CURRENCY[currency];
+      const deliveryFile = deliveryIndex ? join(this.deliveryDir, `${deliveryIndex}.parquet`) : undefined;
+      let hasDeliveryData = false;
+      if (deliveryFile && existsSync(deliveryFile)) {
+        const deliveryCheck = await executeSQLQuery<{ count: bigint | number }>(
+          `SELECT COUNT(*) as count FROM read_parquet('${deliveryFile}')`
+        );
+        const deliveryCount = typeof deliveryCheck[0]?.count === 'bigint'
+          ? Number(deliveryCheck[0].count)
+          : (deliveryCheck[0]?.count ?? 0);
+        hasDeliveryData = deliveryCount > 0;
+      }
+      if (hasDeliveryData) {
+        console.log(`✓ Found settlement prices at ${deliveryFile} — assignment_inferred will use real delivery prices`);
+      } else {
+        console.log(`⚠️  No settlement/delivery data found for ${currency} — outcome_assignment_inferred, outcome_days_to_assignment, and outcome_settlement_price will be NULL (run \`bronze ${currency}\` delivery fetch to populate)`);
+      }
+
       console.log(`\nComputing trading metrics...`);
 
       // Generate and execute gold enrichment SQL
-      const sql = this.generateGoldEnrichmentQuery(inputFile, outputFile);
+      const sql = this.generateGoldEnrichmentQuery(
+        inputFile,
+        outputFile,
+        hasDeliveryData ? deliveryFile : undefined
+      );
       await executeSQLStatement(sql);
 
       // Verify output
@@ -121,7 +157,7 @@ export class GoldEnricher {
   /**
    * Generate DuckDB SQL for gold layer enrichment
    */
-  private generateGoldEnrichmentQuery(inputPath: string, outputPath: string): string {
+  private generateGoldEnrichmentQuery(inputPath: string, outputPath: string, deliveryPath?: string): string {
     // Black-76 theoretical price for expected_premium, using the same inputs
     // Silver used for Greeks (futures_price as forward, IV/100 as decimal vol).
     // Output is a fraction of the forward price, matching Deribit's inverse-option
@@ -135,30 +171,97 @@ export class GoldEnricher {
       optionType: "option_type",
     });
 
+    // Roll (1984) implied spread estimator: 2*sqrt(-Cov(ΔP_t, ΔP_t-1)), defined
+    // only when consecutive trade-price changes are negatively autocorrelated
+    // (the bid/ask bounce assumption). Trade-only data has no quotes, so this
+    // is the closest defensible spread proxy available; it is NULL whenever
+    // the covariance is non-negative (no detectable bounce) rather than
+    // silently emitting a fabricated number, and requires >= 5 observations.
+    const rollSpreadSQL = `
+      CASE
+        WHEN roll.n_obs >= 5 AND roll.cov_dp < 0
+        THEN 2 * sqrt(-roll.cov_dp)
+        ELSE NULL
+      END
+    `;
+
+    // Minimum trades required in the trailing 90-day window before
+    // iv_percentile_90day / vol_regime are considered statistically
+    // meaningful. Below this, percentile values from a histogram this coarse
+    // are dominated by which bucket the trade happens to land in rather than
+    // genuine rank information (e.g. with 3 trades, the only achievable
+    // percentiles are ~{0.17, 0.5, 0.83} regardless of true distribution).
+    const MIN_IV_PERCENTILE_SAMPLE = 20;
+
     return `
 COPY (
   WITH silver_data AS (
-    SELECT * FROM read_parquet('${inputPath}')
+    SELECT *,
+      -- Currency extracted once here and reused everywhere below, instead of
+      -- repeating SUBSTRING(instrument_name, 1, 3) at each window/join site.
+      SUBSTRING(instrument_name, 1, 3) as currency
+    FROM read_parquet('${inputPath}')
   ),
-  -- Compute price returns for realized volatility
+  ${deliveryPath ? `
+  -- Real Deribit settlement/delivery prices (daily index price, keyed by
+  -- calendar date). Deribit options settle at 08:00 UTC against this index,
+  -- so joining on the expiry's calendar date gives the true settlement price
+  -- -- unlike the previous approach of reusing the last-traded option's
+  -- attached futures price, which could be stale by hours or days for
+  -- illiquid contracts and is not Deribit's actual settlement mechanism.
+  delivery_prices AS (
+    SELECT
+      CAST(date AS DATE) as delivery_date,
+      delivery_price
+    FROM read_parquet('${deliveryPath}')
+  ),
+  ` : ''}
+  -- Compute price returns for realized volatility, over a genuine trailing
+  -- 7-calendar-day window per currency (see time-windowed CTEs below for why
+  -- "N PRECEDING rows" is NOT used here).
   price_returns AS (
     SELECT *,
       LN(futures_price / LAG(futures_price) OVER (
-        PARTITION BY SUBSTRING(instrument_name, 1, 3)
+        PARTITION BY currency
         ORDER BY timestamp
-        ROWS BETWEEN 168 PRECEDING AND CURRENT ROW  -- 7 days of hourly data
       )) as log_return
     FROM silver_data
     WHERE futures_price IS NOT NULL
   ),
-  -- Compute 7-day realized volatility (annualized)
-  realized_vols AS (
+  -- Time-windowed (not row-count-windowed) trailing aggregates.
+  --
+  -- The original implementation used ROWS BETWEEN 168 PRECEDING AND CURRENT ROW
+  -- as a proxy for "7 days," reasoning that trades arrive roughly hourly. That
+  -- assumption fails badly for illiquid instruments/eras: a single option
+  -- instrument (trade_volume_7day, actual_premium_collected) often trades far
+  -- less than once per hour, so "168 PRECEDING" can span weeks or months of
+  -- calendar time instead of 7 days -- worse the further back in Deribit's
+  -- history (2020-2021 options liquidity) or the less popular the strike.
+  -- Conversely in a very liquid modern regime, 168 trades can occur within
+  -- minutes, making the window far *narrower* than 7 days.
+  --
+  -- Fix: use DuckDB's genuine time-based RANGE frame (supported directly on
+  -- TIMESTAMP-typed ORDER BY columns), which always spans exactly the stated
+  -- calendar interval regardless of trade density.
+  time_windowed AS (
     SELECT *,
       STDDEV(log_return) OVER (
-        PARTITION BY SUBSTRING(instrument_name, 1, 3)
+        PARTITION BY currency
         ORDER BY timestamp
-        ROWS BETWEEN 168 PRECEDING AND CURRENT ROW  -- 7 days
-      ) * SQRT(365 * 24) as realized_vol_7day  -- Annualize hourly vol
+        RANGE BETWEEN INTERVAL 7 DAYS PRECEDING AND CURRENT ROW
+      ) * SQRT(365 * 24) as realized_vol_7day,  -- Annualize (returns are ~hourly-cadence on average)
+
+      COUNT(*) OVER (
+        PARTITION BY instrument_name
+        ORDER BY timestamp
+        RANGE BETWEEN INTERVAL 7 DAYS PRECEDING AND CURRENT ROW
+      ) as trade_volume_7day,
+
+      SUM(price * amount) OVER (
+        PARTITION BY instrument_name
+        ORDER BY timestamp
+        RANGE BETWEEN INTERVAL 7 DAYS PRECEDING AND CURRENT ROW
+      ) as actual_premium_collected
     FROM price_returns
   ),
   -- Compute IV percentiles within a genuine trailing-90-calendar-day window per currency.
@@ -177,6 +280,12 @@ COPY (
   -- volume, at the cost of resolution being bucketed to 0.5 IV points -- negligible for
   -- a low/mid/high tercile classification.
   --
+  -- The 999.5 cap: Deribit IV quotes essentially never exceed ~1000% in practice
+  -- even for extreme 0DTE prints; this is a defensive upper bound against
+  -- parsing/data errors blowing up the bucket count, not a real distributional
+  -- claim. Values are clamped (not dropped) into the top bucket so they still
+  -- count toward the percentile as "highest observed."
+  --
   -- KNOWN LIMITATION: the window is inclusive of the trade's own calendar day
   -- (b.day <= a.day below), and daily buckets don't distinguish trades within
   -- the same day by time of day. So a trade at 02:00 on day D is still ranked
@@ -189,11 +298,11 @@ COPY (
   -- (low/mid/high) classification.
   daily_iv_hist AS (
     SELECT
-      SUBSTRING(instrument_name, 1, 3) as currency,
+      currency,
       date_trunc('day', timestamp) as day,
       CAST(LEAST(GREATEST(implied_volatility, 0), 999.5) * 2 AS INTEGER) as iv_bin,
       COUNT(*) as bin_count
-    FROM realized_vols
+    FROM time_windowed
     WHERE implied_volatility IS NOT NULL
     GROUP BY 1, 2, 3
   ),
@@ -212,42 +321,87 @@ COPY (
   ),
   iv_percentiles AS (
     SELECT rv.*,
-      -- Midpoint-of-tie percentile (matches PERCENT_RANK's tie behavior), bounded to [0, 1]
+      -- Midpoint-of-tie percentile (matches PERCENT_RANK's tie behavior), bounded to [0, 1].
+      -- Requires at least MIN_IV_PERCENTILE_SAMPLE trades in the trailing 90-day
+      -- window (not just > 1): with only a handful of trades, the percentile is
+      -- almost entirely determined by which coarse bucket a trade lands in, not
+      -- genuine distributional rank -- especially likely in thinly-traded
+      -- currencies/eras (e.g. early Deribit history). Below the threshold, both
+      -- iv_percentile_90day and (downstream) vol_regime are NULL rather than a
+      -- falsely-confident low/mid/high label.
       CASE
-        WHEN rv.implied_volatility IS NULL OR h.window_total IS NULL OR h.window_total <= 1 THEN NULL
+        WHEN rv.implied_volatility IS NULL OR h.window_total IS NULL OR h.window_total < ${MIN_IV_PERCENTILE_SAMPLE} THEN NULL
         ELSE LEAST(1.0, GREATEST(0.0,
           ((h.cum_lt + h.cum_le) / 2.0) / h.window_total
         ))
-      END as iv_percentile_90day
-    FROM realized_vols rv
+      END as iv_percentile_90day,
+      h.window_total as iv_percentile_sample_size
+    FROM time_windowed rv
     LEFT JOIN rolling_iv_hist h
-      ON h.currency = SUBSTRING(rv.instrument_name, 1, 3)
+      ON h.currency = rv.currency
       AND h.day = date_trunc('day', rv.timestamp)
       AND h.iv_bin = CAST(LEAST(GREATEST(rv.implied_volatility, 0), 999.5) * 2 AS INTEGER)
   ),
-  -- Compute execution quality metrics
-  execution_metrics AS (
+  -- Roll (1984) spread estimator inputs: consecutive trade-price deltas per
+  -- instrument (dp), and their own lag (dp_lag) -- computed in separate CTEs
+  -- since DuckDB disallows nesting one window function inside another.
+  price_deltas AS (
     SELECT *,
-      -- Trade volume: 7-day rolling count
-      COUNT(*) OVER (
-        PARTITION BY instrument_name
-        ORDER BY timestamp
-        ROWS BETWEEN 168 PRECEDING AND CURRENT ROW
-      ) as trade_volume_7day,
-
-      -- Bid-ask spread estimate: infer from tick_direction clustering
-      STDDEV(tick_direction) OVER (
+      price - LAG(price) OVER (PARTITION BY instrument_name ORDER BY timestamp) as dp
+    FROM iv_percentiles
+  ),
+  price_delta_lags AS (
+    SELECT *,
+      LAG(dp) OVER (PARTITION BY instrument_name ORDER BY timestamp) as dp_lag
+    FROM price_deltas
+  ),
+  roll_covariance AS (
+    SELECT *,
+      COVAR_POP(dp, dp_lag) OVER (
         PARTITION BY instrument_name
         ORDER BY timestamp
         ROWS BETWEEN 20 PRECEDING AND CURRENT ROW
-      ) * price * 0.01 as bid_ask_spread_estimate,
+      ) as cov_dp,
+      COUNT(dp) OVER (
+        PARTITION BY instrument_name
+        ORDER BY timestamp
+        ROWS BETWEEN 20 PRECEDING AND CURRENT ROW
+      ) as n_obs
+    FROM price_delta_lags
+  ),
+  -- Compute execution quality metrics
+  execution_metrics AS (
+    SELECT roll.* EXCLUDE (dp, dp_lag, cov_dp, n_obs),
 
-      -- Slippage: entry_price vs mark_price
+      -- Bid-ask spread estimate: Roll (1984) implied spread from the serial
+      -- covariance of trade-price changes. NULL (not a fabricated number)
+      -- whenever the bid/ask-bounce assumption doesn't hold or there's
+      -- insufficient data.
+      --
+      -- Previously this computed STDDEV(tick_direction) * price * 0.01, where
+      -- tick_direction is a categorical uptick/downtick code (0-3), not a
+      -- continuous price signal -- taking its standard deviation measures
+      -- direction-flip frequency, not spread, and the 0.01 multiplier had no
+      -- stated basis. That was a fabricated signal dressed as microstructure
+      -- data; replaced with a real, if limited, estimator.
+      ${rollSpreadSQL} as bid_ask_spread_estimate,
+
+      -- Deviation of trade price from Deribit's concurrent mark price.
+      --
+      -- Renamed from "slippage_per_contract": true slippage requires a
+      -- pre-trade reference price (e.g. mark/mid at order submission) versus
+      -- the fill price, to capture execution latency cost. Here price and
+      -- mark_price are simultaneous (both attributes of the same trade
+      -- record), so this measures how far a print traded from Deribit's fair
+      -- value at that instant -- which can reflect genuine urgency/skew or
+      -- mark-price lag during fast IV moves, not necessarily execution cost.
+      -- Trade-only data (no order-submission timestamps) cannot support a
+      -- true slippage metric.
       CASE
         WHEN mark_price IS NOT NULL AND mark_price > 0
         THEN (price - mark_price) / mark_price
         ELSE NULL
-      END as slippage_per_contract,
+      END as price_vs_mark_deviation,
 
       -- Expected premium: Black-76 theoretical price at entry, in the same
       -- BTC-denominated units as \`price\` (Deribit inverse-option convention:
@@ -264,15 +418,9 @@ COPY (
           AND time_to_expiry_years > 0 AND amount IS NOT NULL
         THEN ${expectedPremiumPriceSQL} * amount
         ELSE NULL
-      END as expected_premium,
+      END as expected_premium
 
-      -- Actual premium collected: 7-day rolling sum
-      SUM(price * amount) OVER (
-        PARTITION BY instrument_name
-        ORDER BY timestamp
-        ROWS BETWEEN 168 PRECEDING AND CURRENT ROW
-      ) as actual_premium_collected
-    FROM iv_percentiles
+    FROM roll_covariance roll
   ),
   -- Compute premium collection ratio (requires expected_premium first)
   premium_metrics AS (
@@ -285,56 +433,88 @@ COPY (
       END as premium_collection_ratio
     FROM execution_metrics
   ),
-  -- Compute outcome metrics (forward-looking)
-  outcome_metrics AS (
-    SELECT *,
-      -- days_to_expiry: Compute early for use in assignment logic
-      CAST((epoch_ms(expiration_timestamp) - epoch_ms(timestamp)) / (1000.0 * 86400.0) AS INTEGER) as days_to_expiry,
-
-      -- realized_move_7day: 7-day forward price return
-      (LEAD(futures_price, 168) OVER (
-        PARTITION BY SUBSTRING(instrument_name, 1, 3)
-        ORDER BY timestamp
-      ) - futures_price) / NULLIF(futures_price, 0) as realized_move_7day
-    FROM premium_metrics
-  ),
-  -- Get futures price at expiration for each instrument
-  expiration_prices AS (
+  -- ============================================================
+  -- OUTCOME METRICS -- forward-looking by construction. These describe
+  -- what happened AFTER a trade (or at/after its expiry) and must never be
+  -- used as an entry-time filter/feature in a backtest -- they are not
+  -- knowable at the trade's timestamp. All outcome fields are prefixed
+  -- "outcome_" in the final output specifically so they cannot be mistaken
+  -- for entry-time features by column name alone.
+  -- ============================================================
+  -- outcome_forward_return_7day source: the earliest trade at least 7
+  -- calendar days after each trade, per currency, found via ASOF JOIN
+  -- (picks the nearest match satisfying ">= entry + 7 days", i.e. the first
+  -- price point on/after the forward date -- exact calendar-time lookup,
+  -- not a row-count proxy).
+  forward_prices AS (
     SELECT
+      a.trade_id,
+      a.futures_price as entry_futures_price,
+      b.futures_price as forward_futures_price
+    FROM premium_metrics a
+    ASOF JOIN premium_metrics b
+      ON a.currency = b.currency
+      AND b.timestamp >= a.timestamp + INTERVAL 7 DAYS
+  ),
+  outcome_metrics AS (
+    SELECT pm.*,
+      -- days_to_expiry: Compute early for use in assignment logic. This is
+      -- NOT forward-looking itself (expiration_timestamp is known at entry
+      -- from the instrument's contract spec), but is grouped with outcome
+      -- fields below because days_to_assignment depends on it.
+      CAST((epoch_ms(pm.expiration_timestamp) - epoch_ms(pm.timestamp)) / (1000.0 * 86400.0) AS INTEGER) as days_to_expiry,
+
+      -- outcome_forward_return_7day: 7-calendar-day FORWARD price return --
+      -- explicitly uses the future. Renamed from "realized_move_7day"
+      -- because that name was easy to confuse with the legitimate trailing
+      -- "realized_vol_7day" entry feature above; this field is the opposite
+      -- (forward-looking) despite the similar name.
+      (fp.forward_futures_price - fp.entry_futures_price) / NULLIF(fp.entry_futures_price, 0) as outcome_forward_return_7day
+    FROM premium_metrics pm
+    LEFT JOIN forward_prices fp USING (trade_id)
+  ),
+  ${deliveryPath ? `
+  -- Real settlement price per instrument, from Deribit's delivery-price
+  -- index on the option's expiry date (not a proxy from the last-traded
+  -- option's stale attached futures price -- see delivery_prices CTE above).
+  expiration_prices AS (
+    SELECT DISTINCT
       instrument_name,
-      LAST(futures_price) OVER (
-        PARTITION BY instrument_name
-        ORDER BY timestamp
-        ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
-      ) as futures_price_at_expiry
+      d.delivery_price as outcome_settlement_price
+    FROM outcome_metrics o
+    JOIN delivery_prices d
+      ON d.delivery_date = CAST(o.expiration_timestamp AS DATE)
+  ),
+  ` : `
+  expiration_prices AS (
+    SELECT DISTINCT instrument_name, CAST(NULL AS DOUBLE) as outcome_settlement_price
     FROM outcome_metrics
   ),
-  -- Compute assignment inference (check ITM at expiration for all trades)
+  `}
+  -- Compute assignment inference (check ITM at real settlement price)
   assignment_metrics AS (
     SELECT o.*,
-      e.futures_price_at_expiry,
-      -- assignment_inferred: Check if ITM at expiration (for all trades)
+      e.outcome_settlement_price,
+      -- outcome_assignment_inferred: ITM at real settlement, NULL if no
+      -- settlement price is available (never falls back to a proxy).
       CASE
-        WHEN e.futures_price_at_expiry IS NOT NULL THEN
-          CASE
-            WHEN o.option_type = 'call' AND e.futures_price_at_expiry > o.strike THEN TRUE
-            WHEN o.option_type = 'put' AND e.futures_price_at_expiry < o.strike THEN TRUE
-            ELSE FALSE
-          END
-        ELSE NULL
-      END as assignment_inferred
+        WHEN e.outcome_settlement_price IS NULL THEN NULL
+        WHEN o.option_type = 'call' AND e.outcome_settlement_price > o.strike THEN TRUE
+        WHEN o.option_type = 'put' AND e.outcome_settlement_price < o.strike THEN TRUE
+        ELSE FALSE
+      END as outcome_assignment_inferred
     FROM outcome_metrics o
     LEFT JOIN expiration_prices e USING (instrument_name)
   ),
-  -- Compute days_to_assignment (requires assignment_inferred)
+  -- Compute days_to_assignment (requires outcome_assignment_inferred)
   final_metrics AS (
     SELECT *,
-      -- days_to_assignment: Days from entry to assignment (if assigned)
+      -- outcome_days_to_assignment: Days from entry to assignment (if assigned)
       CASE
-        WHEN assignment_inferred = TRUE
+        WHEN outcome_assignment_inferred = TRUE
         THEN days_to_expiry
         ELSE NULL
-      END as days_to_assignment
+      END as outcome_days_to_assignment
     FROM assignment_metrics
   )
   SELECT
@@ -376,7 +556,9 @@ COPY (
       ELSE 'deep-itm'
     END as strike_delta,
 
-    -- vol_regime: IV percentile classification (low/mid/high vol environment)
+    -- vol_regime: IV percentile classification (low/mid/high vol environment).
+    -- NULL whenever iv_percentile_90day is NULL, including the insufficient-
+    -- sample-size case (see iv_percentile_sample_size).
     CASE
       WHEN implied_volatility IS NULL OR iv_percentile_90day IS NULL THEN NULL
       WHEN iv_percentile_90day < 0.33 THEN 'low'
@@ -386,48 +568,56 @@ COPY (
 
     -- Market condition metrics (at entry)
 
-    -- realized_vol_7day: 7-day realized volatility (annualized, in percentage)
+    -- realized_vol_7day: trailing 7-calendar-day realized volatility (annualized, in percentage)
     realized_vol_7day,
 
-    -- iv_percentile_90day: Current IV rank vs 90-day history (0-1)
+    -- iv_percentile_90day: Current IV rank vs trailing 90-calendar-day history (0-1)
     iv_percentile_90day,
+
+    -- iv_percentile_sample_size: trade count backing iv_percentile_90day/vol_regime;
+    -- use this to apply a stricter cutoff than the pipeline's built-in minimum if needed
+    iv_percentile_sample_size,
 
     -- iv_minus_rv_gap: IV - RV spread (volatility risk premium indicator)
     (implied_volatility - realized_vol_7day) as iv_minus_rv_gap,
 
-    -- Execution quality metrics
+    -- Execution quality metrics (at entry)
 
-    -- trade_volume_7day: Count of trades in 7-day rolling window
+    -- trade_volume_7day: Count of trades in trailing 7-calendar-day window
     trade_volume_7day,
 
-    -- bid_ask_spread_estimate: Inferred spread from tick_direction clustering
+    -- bid_ask_spread_estimate: Roll (1984) implied spread; NULL if inestimable
     bid_ask_spread_estimate,
 
-    -- slippage_per_contract: Entry price vs mark price (execution quality)
-    slippage_per_contract,
+    -- price_vs_mark_deviation: trade price vs Deribit's concurrent mark price
+    price_vs_mark_deviation,
 
-    -- expected_premium: Delta-weighted premium from Greeks at entry
+    -- expected_premium: Black-76 theoretical price at entry
     expected_premium,
 
-    -- actual_premium_collected: Sum of filled premium in 7-day window
+    -- actual_premium_collected: Sum of filled premium in trailing 7-calendar-day window
     actual_premium_collected,
 
     -- premium_collection_ratio: Actual / expected premium (efficiency metric)
     premium_collection_ratio,
 
-    -- Outcome metrics (what happened)
+    -- ============================================================
+    -- OUTCOME METRICS (what happened) -- forward-looking. DO NOT use these
+    -- as entry-time filters/features in a backtest; they are not knowable at
+    -- the trade's timestamp. All prefixed "outcome_" for this reason.
+    -- ============================================================
 
-    -- futures_price_at_expiry: Underlying price at expiration
-    futures_price_at_expiry,
+    -- outcome_settlement_price: real Deribit settlement/delivery price at expiration
+    outcome_settlement_price,
 
-    -- realized_move_7day: 7-day forward price return
-    realized_move_7day,
+    -- outcome_forward_return_7day: 7-calendar-day FORWARD price return from entry
+    outcome_forward_return_7day,
 
-    -- assignment_inferred: Binary flag for option assignment
-    assignment_inferred,
+    -- outcome_assignment_inferred: ITM-at-settlement flag, from real settlement price
+    outcome_assignment_inferred,
 
-    -- days_to_assignment: Holding period until assignment (if assigned)
-    days_to_assignment
+    -- outcome_days_to_assignment: Holding period until assignment (if assigned)
+    outcome_days_to_assignment
 
   FROM final_metrics
 ) TO '${outputPath}' (FORMAT PARQUET);

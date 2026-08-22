@@ -172,7 +172,14 @@ export class DuckDBEnricher {
 
       console.log(`Found ${fileCount} files, ${instrumentCount} instruments, ${inputTradeCount.toLocaleString()} trades`);
 
-      // Check if futures data exists
+      // Check if futures data exists. Greeks require a forward price (STRICT:
+      // no spot-price fallback -- see generateBulkGreeksEnrichmentQuery). If
+      // futures data is entirely missing, every row in this currency's output
+      // will have is_valid = false (Greeks all NULL), which previously only
+      // logged a message inaccurately claiming a spot-price fallback would be
+      // used -- there is no such fallback, so a partial/interrupted
+      // `fetch-dated-futures` run could silently produce a fully-invalid
+      // silver dataset with no hard failure.
       const futuresPattern = join(this.inputDir, "futures", `${currency}-*.parquet`);
       const futuresCheckQuery = `SELECT COUNT(*) as count FROM read_parquet('${futuresPattern}')`;
       let hasFuturesData = false;
@@ -183,10 +190,10 @@ export class DuckDBEnricher {
         if (hasFuturesData) {
           console.log(`✓ Found ${futuresCount.toLocaleString()} futures trades for forward pricing`);
         } else {
-          console.log(`⚠️  No futures data found - using spot index price (less accurate)`);
+          console.log(`⚠️  No futures data found for ${currency} — Greeks cannot be computed (no forward price; STRICT mode has no spot-price fallback). Every trade will have is_valid = false. Run \`bronze ${currency}\` to fetch futures data first.`);
         }
       } catch {
-        console.log(`⚠️  No futures data found - using spot index price (less accurate)`);
+        console.log(`⚠️  No futures data found for ${currency} — Greeks cannot be computed (no forward price; STRICT mode has no spot-price fallback). Every trade will have is_valid = false. Run \`bronze ${currency}\` to fetch futures data first.`);
       }
 
       console.log(`\nEnriching ALL data in single vectorized SQL query...`);
@@ -207,6 +214,17 @@ export class DuckDBEnricher {
         ? Number(outputCount[0].count)
         : (outputCount[0]?.count ?? 0);
 
+      // Report is_valid coverage explicitly -- a near-zero validity rate
+      // (e.g. futures data silently missing entirely) must be impossible to
+      // miss, not just a log line buried above the "Enrichment Complete"
+      // banner.
+      const validCountQuery = `SELECT COUNT(*) FILTER (WHERE is_valid) as valid_count FROM read_parquet('${outputFile}')`;
+      const validCount = await executeSQLQuery<{ valid_count: bigint | number }>(validCountQuery);
+      const validTradeCount = typeof validCount[0]?.valid_count === 'bigint'
+        ? Number(validCount[0].valid_count)
+        : (validCount[0]?.valid_count ?? 0);
+      const validPct = outputTradeCount > 0 ? (validTradeCount / outputTradeCount) * 100 : 0;
+
       const duration = Date.now() - overallStart;
       const throughput = Math.round(outputTradeCount / (duration / 1000));
 
@@ -214,8 +232,17 @@ export class DuckDBEnricher {
       console.log(`Output file: ${outputFile}`);
       console.log(`Instruments: ${instrumentCount}`);
       console.log(`Total trades: ${outputTradeCount.toLocaleString()}`);
+      console.log(`Valid trades (is_valid=true): ${validTradeCount.toLocaleString()} (${validPct.toFixed(1)}%)`);
       console.log(`Duration: ${(duration / 1000).toFixed(2)}s`);
       console.log(`Throughput: ${throughput.toLocaleString()} trades/sec\n`);
+
+      if (outputTradeCount > 0 && validTradeCount === 0) {
+        throw new Error(
+          `Silver enrichment for ${currency} produced 0 valid trades out of ${outputTradeCount.toLocaleString()} ` +
+          `(is_valid is false for every row). This almost always means futures forward-price data was missing or ` +
+          `incomplete for this currency. Run \`bronze ${currency}\` to fetch futures data, then re-run \`silver ${currency}\`.`
+        );
+      }
 
       // Return single result for the currency
       return [{
