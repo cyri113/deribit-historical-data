@@ -59,8 +59,8 @@ data/
 - Loop detection: tracks previousSeq to prevent infinite loops
 - Per-request retry: every endpoint method routes through a shared
   `withRetry` helper (3x, exponential backoff) that retries HTTP 429 / JSON-RPC
-  error 10028 (rate limit) and HTTP 503 -- separate from BunQueue's job-level
-  retry below (see design-decisions.md §5 note)
+  error 10028 (rate limit) and any HTTP 5xx server error -- separate from
+  BunQueue's job-level retry below (see design-decisions.md §5 note)
 
 **ParquetStorage:**
 - `getTradeFilePath(name)` → `data/bronze/instruments/{ASSET}/{name}.parquet`
@@ -182,8 +182,8 @@ QUALIFY ROW_NUMBER() OVER (PARTITION BY opt.trade_id ORDER BY futures.timestamp 
 ## Error Handling
 
 - **API errors:** every `DeribitClient` endpoint retries 3x with exponential
-  backoff on HTTP 429 / JSON-RPC 10028 / HTTP 503 (via `withRetry`), separate
-  from BunQueue's job-level retry
+  backoff on HTTP 429 / JSON-RPC 10028 / any HTTP 5xx (via `withRetry`),
+  separate from BunQueue's job-level retry
 - **Per-instrument fetch failures:** `fetch-trades` collects failed
   instrument names and throws (rather than silently reporting success) if
   any instrument failed after its own internal retries -- previously the job

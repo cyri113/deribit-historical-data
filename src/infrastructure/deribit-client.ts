@@ -14,7 +14,20 @@ export class DeribitAPIError extends Error {
   constructor(
     message: string,
     public code?: number,
-    public data?: unknown
+    public data?: unknown,
+    /**
+     * True when `code` is an HTTP status code (transport-level failure --
+     * the request never reached/completed at the JSON-RPC layer). False (or
+     * omitted) when `code` is a Deribit JSON-RPC protocol error code (e.g.
+     * 10028) or absent entirely. This distinction matters for retry
+     * classification: a 5xx HTTP status means the server itself failed and
+     * is worth retrying, but Deribit's JSON-RPC error codes are a separate,
+     * unrelated numeric space -- treating a JSON-RPC code as if it were an
+     * HTTP status (e.g. by checking `code >= 500` without this flag) risks
+     * misclassifying a legitimate protocol error as a transient one if
+     * Deribit ever assigns a JSON-RPC code in the 500-599 range.
+     */
+    public isHttpStatus?: boolean
   ) {
     super(message);
     this.name = "DeribitAPIError";
@@ -60,13 +73,37 @@ export class DeribitClient {
   }
 
   /**
+   * Whether a thrown error represents a transient condition worth retrying:
+   * rate limiting (429 / JSON-RPC 10028), or any 5xx server error. A 5xx
+   * means the server itself failed (crash, overload, upstream timeout) --
+   * not that the request was invalid -- so it's the same class of "try
+   * again" as 503, just not limited to that one status code.
+   *
+   * 4xx (other than 429) is NOT retried: those indicate a malformed/invalid
+   * request, which will fail identically on every retry, and immediately
+   * surfacing them (rather than burning `maxRetries` attempts and delay)
+   * gives a faster, clearer error signal.
+   */
+  private isRetryable(error: unknown): boolean {
+    if (error instanceof DeribitRateLimitError) return true;
+    if (
+      error instanceof DeribitAPIError &&
+      error.isHttpStatus &&
+      typeof error.code === "number"
+    ) {
+      return error.code >= 500 && error.code < 600;
+    }
+    return false;
+  }
+
+  /**
    * Run a single HTTP+parse attempt, with rate-limiting, and classify the
-   * result as retryable (429 / JSON-RPC 10028 / HTTP 503) or fatal. Shared by
-   * every endpoint method below so retry/backoff isn't reimplemented (or
-   * silently skipped) per-method.
+   * result as retryable (see isRetryable) or fatal. Shared by every endpoint
+   * method below so retry/backoff isn't reimplemented (or silently skipped)
+   * per-method.
    *
    * @param fn - performs the fetch and returns the parsed/validated response.
-   *   Must throw DeribitRateLimitError or DeribitAPIError(code=503) for
+   *   Must throw DeribitRateLimitError or DeribitAPIError(code=5xx) for
    *   conditions that should be retried; any other throw is treated as fatal.
    */
   private async withRetry<T>(fn: () => Promise<T>): Promise<T> {
@@ -80,10 +117,7 @@ export class DeribitClient {
         lastError = error instanceof Error ? error : new Error(String(error));
 
         // Don't retry on non-retryable errors
-        if (
-          !(error instanceof DeribitRateLimitError) &&
-          !(error instanceof DeribitAPIError && error.code === 503)
-        ) {
+        if (!this.isRetryable(error)) {
           throw error;
         }
 
@@ -136,7 +170,9 @@ export class DeribitClient {
         }
         throw new DeribitAPIError(
           `HTTP error: ${response.status} ${response.statusText}`,
-          response.status
+          response.status,
+          undefined,
+          true // isHttpStatus: code is an HTTP status, not a JSON-RPC error code
         );
       }
 
@@ -151,6 +187,9 @@ export class DeribitClient {
             `Rate limit exceeded (error 10028): ${error.message}`
           );
         }
+        // isHttpStatus omitted (false): this is a Deribit JSON-RPC protocol
+        // error code, a different numeric space from HTTP status codes --
+        // must never be treated as retryable by a `code >= 500` check.
         throw new DeribitAPIError(
           error.message ?? "Unknown API error",
           error.code,
@@ -165,7 +204,7 @@ export class DeribitClient {
   /**
    * Classify a non-ok GET response the same way `request()` does for
    * JSON-RPC POST calls, so every raw-fetch endpoint below retries on the
-   * same conditions (429, 503) instead of throwing immediately.
+   * same conditions (429, 5xx) instead of throwing immediately.
    */
   private throwForResponse(response: Response): never {
     if (response.status === 429) {
@@ -173,7 +212,9 @@ export class DeribitClient {
     }
     throw new DeribitAPIError(
       `HTTP error: ${response.status} ${response.statusText}`,
-      response.status
+      response.status,
+      undefined,
+      true // isHttpStatus: code is an HTTP status, not a JSON-RPC error code
     );
   }
 

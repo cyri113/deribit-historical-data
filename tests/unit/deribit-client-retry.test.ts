@@ -11,6 +11,15 @@ import { RateLimiter } from "../../src/infrastructure/rate-limiter.ts";
 // automatic recovery -- a real survivorship-bias mechanism for a historical
 // dataset. Fixed by routing every endpoint through a shared `withRetry`
 // helper. These tests mock `fetch` to verify retry actually happens now.
+//
+// Follow-up regression: the initial fix only retried HTTP 429 and exactly
+// HTTP 503, not the general 5xx class -- a real production run hit HTTP 500
+// from getInstruments and failed immediately instead of retrying. Fixed to
+// retry any 5xx, while structurally distinguishing HTTP status codes from
+// Deribit's separate JSON-RPC error-code numeric space (via
+// DeribitAPIError.isHttpStatus) so a JSON-RPC protocol error can never be
+// misclassified as a retryable HTTP 5xx just because its numeric code
+// happens to fall in 500-599.
 
 describe("DeribitClient retry/backoff (regression: endpoints bypassing retry logic)", () => {
   const originalFetch = global.fetch;
@@ -88,6 +97,71 @@ describe("DeribitClient retry/backoff (regression: endpoints bypassing retry log
 
     expect(result).toEqual([]);
     expect(callCount).toBe(2);
+  });
+
+  test("getInstruments retries on HTTP 500 (regression: real production failure -- only 429/503 were retried initially, not the general 5xx class)", async () => {
+    let callCount = 0;
+    global.fetch = (async () => {
+      callCount++;
+      if (callCount < 3) {
+        return new Response("Internal Server Error", { status: 500 });
+      }
+      return jsonResponse({ jsonrpc: "2.0", id: 1, result: [] });
+    }) as typeof fetch;
+
+    const client = makeClient();
+    const result = await client.getInstruments("BTC", "option", true);
+
+    expect(result).toEqual([]);
+    expect(callCount).toBe(3);
+  });
+
+  test("retries any 5xx status (502, 504), not just 500/503 specifically", async () => {
+    for (const status of [502, 504]) {
+      let callCount = 0;
+      global.fetch = (async () => {
+        callCount++;
+        if (callCount < 2) {
+          return new Response("Gateway Error", { status });
+        }
+        return jsonResponse({ jsonrpc: "2.0", id: 1, result: [] });
+      }) as typeof fetch;
+
+      const client = makeClient();
+      const result = await client.getInstruments("BTC");
+
+      expect(result).toEqual([]);
+      expect(callCount).toBe(2);
+    }
+  });
+
+  test("a DeribitAPIError with a 5xx-range code is NOT retried unless isHttpStatus is set (structural HTTP-status vs JSON-RPC-code distinction)", async () => {
+    // Deribit's JSON-RPC error codes are a separate numeric space from HTTP
+    // status codes (documented codes cluster in -32000..-32700 and
+    // 10000-13999; none currently sit in 500-599). isHttpStatus makes the
+    // distinction structural rather than relying on that coincidence never
+    // changing. Every live GET-based endpoint (getInstruments, etc.) always
+    // sets isHttpStatus=true on its DeribitAPIError (via throwForResponse),
+    // so this exercises the underlying classification directly rather than
+    // through a live endpoint -- there's currently no reachable code path
+    // that constructs a DeribitAPIError with a 5xx code and isHttpStatus
+    // unset (the JSON-RPC-error branch that would is unreachable dead code,
+    // see `request()`), but the classification itself must still be correct
+    // in case that ever changes.
+    const { DeribitAPIError, DeribitRateLimitError } = await import(
+      "../../src/infrastructure/deribit-client.ts"
+    );
+    const client = makeClient() as any;
+
+    const httpStatusError = new DeribitAPIError("server error", 500, undefined, true);
+    const jsonRpcCodeError = new DeribitAPIError("protocol error", 500, undefined, false);
+    const jsonRpcCodeErrorOmitted = new DeribitAPIError("protocol error", 500);
+
+    expect(client.isRetryable(httpStatusError)).toBe(true);
+    expect(client.isRetryable(jsonRpcCodeError)).toBe(false);
+    expect(client.isRetryable(jsonRpcCodeErrorOmitted)).toBe(false);
+    expect(client.isRetryable(new DeribitRateLimitError("rate limited"))).toBe(true);
+    expect(client.isRetryable(new DeribitAPIError("bad request", 400, undefined, true))).toBe(false);
   });
 
   test("getDeliveryPrices retries on HTTP 429", async () => {

@@ -168,7 +168,7 @@ if (existsSync(parquetPath)) {
 **Note -- two separate retry layers**: this table's "Job retry" is BunQueue
 retrying an entire failed *job* (e.g. re-running `fetch-trades` for a
 currency). That's distinct from `DeribitClient`'s own retry/backoff on
-individual HTTP requests (429/503) inside `withRetry` in
+individual HTTP requests (429/any 5xx) inside `withRetry` in
 `deribit-client.ts`, which every endpoint method now routes through. Both
 matter: without the per-request layer, a single transient rate-limit hit
 mid-pagination would throw out of the fetch immediately rather than backing
